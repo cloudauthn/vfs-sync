@@ -203,13 +203,29 @@ learned from peers.
 <hash> <timestamp> <parent>,<parent>
 ```
 
-Negotiation is then a set intersection — `mine ∩ theirs`, most recent wins — instead of walking
-the DAG object by object. It is the only mechanism used, for peers that have met before and for
-first encounters alike; the empty intersection *is* the first-encounter case, and it needs no
-special path.
+The index makes negotiation cheap — parents are read from one flat file instead of fetching commit
+objects one at a time — but the base is still decided by **ancestry**, not by the index alone. The
+base is the newest commit both heads descend from:
 
-This is the same idea as git's commit-graph: it speeds up negotiation without changing the data
-model.
+1. Walk parents from each head to collect its ancestor set, using the index for the links.
+2. Intersect them, keeping only commits both peers hold on disk.
+3. Drop any candidate another candidate descends from. What remains is the frontier.
+4. If the frontier has more than one member — criss-cross histories can do that — order by
+   timestamp, then hash. Any of them is a valid base; the rule only has to be one both peers
+   compute identically, so an edge merges the same way from either direction.
+
+An empty intersection *is* the first-encounter case, and needs no special path: the base is the
+empty tree.
+
+The distinction between "commit both peers know about" and "commit both peers descend from" is not
+academic. After one sync each peer holds the other's first commit, and those are ancestors of
+neither head. Picking one as the base hands `mergeTrees` a tree in which the file being renamed
+never existed — with no ancestor path to compare against, the location decision falls through to an
+mtime tie-break, and the rename is silently dropped. Timestamps cannot stand in for ancestry here,
+because a sync commits both sides inside the same millisecond as a matter of course.
+
+The same rule settles which commit both peers adopt when their trees already agree but their heads
+differ: a descendant beats its own ancestor, since it contains that history already.
 
 ---
 
@@ -218,8 +234,8 @@ model.
 What `sync(a, b)` does, in order:
 
 1. **Commit both sides.** Nothing changed means no commit, so a quiet loop does not grow history.
-2. **Find the common ancestor** by intersecting both `known-commits.log` indexes. No intersection
-   means the base is the empty tree.
+2. **Find the common ancestor**: the newest commit both heads descend from, walked over the
+   `known-commits.log` indexes. No common ancestor means the base is the empty tree.
 3. **Exchange missing commits.** Each side sends the commits the other lacks, with their trees, so
    both keep a complete index. Blobs stay where they are for now.
 4. **Merge** the two trees against the base — see [conflicts.md](./conflicts.md).

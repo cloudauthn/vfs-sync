@@ -1,4 +1,4 @@
-import { EMPTY_TREE, type VFSStore } from './store.js';
+import { EMPTY_TREE, type KnownCommit, type VFSStore } from './store.js';
 import { canStream } from './stream.js';
 import { mergeTrees } from './merge.js';
 import type { ConflictCopyPolicy, ConflictNameInfo, ConflictReport } from './merge.js';
@@ -12,7 +12,7 @@ export interface SyncOptions {
 }
 
 export interface SyncResult {
-  /** Most recent commit both peers already knew, `null` on a first encounter. */
+  /** Most recent commit both heads descend from, `null` on a first encounter. */
   base: Hash | null;
   /** The commit both peers point at once the sync finishes. */
   head: Hash | null;
@@ -38,18 +38,11 @@ export async function sync(a: VFSNode, b: VFSNode, options: SyncOptions = {}): P
   const aHead = await a.head();
   const bHead = await b.head();
 
-  // 1. common ancestor: a set intersection over the known-commits index
+  // 1. common ancestor: the newest commit both heads descend from
   const aKnown = await a.store.known();
   const bKnown = await b.store.known();
-  let base: Hash | null = null;
-  let baseTimestamp = -Infinity;
-  for (const [hash, entry] of aKnown) {
-    if (!bKnown.has(hash)) continue;
-    if (entry.timestamp > baseTimestamp || (entry.timestamp === baseTimestamp && hash < (base ?? ''))) {
-      base = hash;
-      baseTimestamp = entry.timestamp;
-    }
-  }
+  const graph = new Map([...aKnown, ...bKnown]);
+  const base = mergeBase(graph, (hash) => aKnown.has(hash) && bKnown.has(hash), aHead, bHead);
 
   // 2. exchange the commits each side is missing, so both keep a complete index
   await copyCommits(a, b, [...aKnown.keys()].filter((h) => !bKnown.has(h)));
@@ -165,6 +158,76 @@ export async function syncUntilStable(
   return rounds;
 }
 
+/**
+ * Every commit reachable from `head` through parent links, `head` included. A
+ * commit missing from the index ends that branch of the walk instead of
+ * throwing: an incomplete index can only make the base older, never wrong.
+ */
+function ancestorsOf(graph: Map<Hash, KnownCommit>, head: Hash): Set<Hash> {
+  const seen = new Set<Hash>([head]);
+  const stack: Hash[] = [head];
+  while (stack.length > 0) {
+    const entry = graph.get(stack.pop() as Hash);
+    if (!entry) continue;
+    for (const parent of entry.parents) {
+      if (seen.has(parent)) continue;
+      seen.add(parent);
+      stack.push(parent);
+    }
+  }
+  return seen;
+}
+
+/**
+ * Newest commit both heads descend from.
+ *
+ * Ancestry has to be walked rather than inferred from timestamps. Two peers
+ * commit inside the same millisecond routinely, and "newest commit both peers
+ * know about" is not the same thing as "newest commit both peers descend from":
+ * after one sync each peer knows the other's first commit, which is an ancestor
+ * of neither head. Using one of those as the base means resolving changes
+ * against a tree this pair never shared — the entry is simply absent from it, so
+ * `mergeTrees` has no ancestor path to compare against and a rename decays into
+ * an mtime coin-flip.
+ *
+ * `shared` keeps candidates to commits both peers have on disk, since the base
+ * tree has to be readable locally.
+ */
+function mergeBase(
+  graph: Map<Hash, KnownCommit>,
+  shared: (hash: Hash) => boolean,
+  aHead: Hash | null,
+  bHead: Hash | null,
+): Hash | null {
+  if (!aHead || !bHead) return null;
+
+  const inB = ancestorsOf(graph, bHead);
+  const common = [...ancestorsOf(graph, aHead)].filter((hash) => inB.has(hash) && shared(hash));
+  if (common.length <= 1) return common[0] ?? null;
+
+  // A candidate that another candidate descends from carries no information the
+  // descendant does not already carry. What survives is the frontier.
+  const redundant = new Set<Hash>();
+  for (const candidate of common) {
+    for (const parent of graph.get(candidate)?.parents ?? []) {
+      for (const hash of ancestorsOf(graph, parent)) redundant.add(hash);
+    }
+  }
+  const frontier = common.filter((hash) => !redundant.has(hash));
+
+  // Criss-cross histories can leave more than one candidate on the frontier.
+  // Any of them is a valid base; the ordering only has to be one both peers
+  // compute identically, so an edge merges the same way whichever side
+  // initiates it. (A frontier can only come back empty if the index contains a
+  // parent cycle, which means it is corrupt — fall back rather than fail.)
+  const pool = frontier.length > 0 ? frontier : common;
+  return (
+    [...pool].sort(
+      (x, y) => (graph.get(y)?.timestamp ?? 0) - (graph.get(x)?.timestamp ?? 0) || (x < y ? -1 : 1),
+    )[0] ?? null
+  );
+}
+
 async function treeOf(store: VFSStore, commitHash: Hash): Promise<Tree> {
   return store.getTree((await store.getCommit(commitHash)).tree);
 }
@@ -173,9 +236,18 @@ async function commitTree(store: VFSStore, commitHash: Hash): Promise<Hash> {
   return (await store.getCommit(commitHash)).tree;
 }
 
-/** Deterministic on both peers: newest timestamp, hash as tiebreak. */
+/**
+ * Which of two commits both peers adopt when their content already agrees.
+ *
+ * A descendant beats its own ancestor — it contains that history already, so
+ * taking the ancestor would throw commits away. Otherwise newest wins, with the
+ * hash as tiebreak: a rule applied to the same inputs on both sides, so both
+ * reach the same answer without another round trip.
+ */
 async function newerCommit(node: VFSNode, left: Hash, right: Hash): Promise<Hash> {
   const known = await node.store.known();
+  if (ancestorsOf(known, left).has(right)) return left;
+  if (ancestorsOf(known, right).has(left)) return right;
   const leftAt = known.get(left)?.timestamp ?? (await node.store.getCommit(left)).timestamp;
   const rightAt = known.get(right)?.timestamp ?? (await node.store.getCommit(right)).timestamp;
   if (leftAt !== rightAt) return leftAt > rightAt ? left : right;
