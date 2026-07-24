@@ -156,7 +156,7 @@ the open file selected, so the same path can be watched across filesystems. When
 (private window, sandboxed iframe) every tab falls back to memory.
 
 The published site is refreshed only by a release: `release.yml` bumps the version, publishes to
-npm, and then calls `pages.yml` with the new tag.
+npm, and then deploys the site from the tag it just pushed.
 
 ## Status
 

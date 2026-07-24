@@ -70,14 +70,43 @@ jobs:
           NEW_TAG: ${{ steps.bump_version.outputs.new_tag }}
         run: gh release create "$NEW_TAG" dist/* --title "$NEW_TAG" --generate-notes
 
-  # GitHub Pages (demo + /coverage/) is refreshed only by a release, from the
-  # tag that was just published.
+  # GitHub Pages — the demo at / and the coverage report at /coverage/ — is
+  # refreshed only by a release, and from the tag that was just published, so
+  # the site always matches the last version on npm.
   pages:
     needs: release
+    runs-on: ubuntu-latest
     permissions:
       contents: read
       pages: write
       id-token: write
-    uses: ./.github/workflows/pages.yml
-    with:
-      ref: ${{ needs.release.outputs.new_tag }}
+    concurrency:
+      group: pages
+      cancel-in-progress: false
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release.outputs.new_tag }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - run: npm ci
+
+      # Builds the demo into demo/dist and drops the HTML coverage report in
+      # demo/dist/coverage.
+      - run: npm run pages:build
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: demo/dist
+
+      - id: deployment
+        uses: actions/deploy-pages@v4
