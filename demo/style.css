@@ -163,77 +163,149 @@ button.danger:hover {
   margin-left: auto;
 }
 
-/* ------------------------------------------------------------------ peers */
+/* --------------------------------------------------------------- explorer */
 
-.peers {
-  display: flex;
-  align-items: stretch;
-  gap: 8px;
-  overflow-x: auto;
-  padding-bottom: 6px;
-}
-
-.peer {
-  flex: 1 1 0;
-  min-width: 240px;
+.explorer {
   background: var(--panel);
   border: 1px solid var(--line);
   border-radius: var(--radius);
+  overflow: hidden;
+}
+
+.tabs {
+  display: flex;
+  align-items: stretch;
+  gap: 2px;
+  padding: 6px 6px 0;
+  background: var(--panel-2);
+  border-bottom: 1px solid var(--line);
+  overflow-x: auto;
+}
+
+.tab {
+  flex: 1 1 0;
+  min-width: 150px;
   display: flex;
   flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+  padding: 9px 12px;
+  background: none;
+  border: 1px solid transparent;
+  border-bottom: none;
+  border-radius: var(--radius) var(--radius) 0 0;
+  text-align: left;
 }
 
-.peer > header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  padding: 11px 13px;
-  border-bottom: 1px solid var(--line);
+.tab:hover:not(:disabled) {
+  background: var(--panel);
 }
 
-.edge {
-  display: flex;
-  align-items: center;
-  flex: 0 0 auto;
+.tab.active {
+  background: var(--panel);
+  border-color: var(--line);
+  box-shadow: inset 0 2px 0 var(--accent);
 }
 
-.edge button {
+.tab-name {
+  font-weight: 600;
+  font-size: 13.5px;
   white-space: nowrap;
 }
 
-.files {
+.tab-meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.tab.add .tab-name {
+  color: var(--muted);
+}
+
+/* the sync handle sitting between two tabs */
+.edge {
+  align-self: center;
+  flex: 0 0 auto;
+  padding: 4px 8px;
+  margin-bottom: 6px;
+  background: none;
+  border: none;
+  color: var(--muted);
+  font-size: 15px;
+}
+
+.edge:hover {
+  color: var(--accent);
+  border: none;
+}
+
+.panel-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 13px 14px;
+  border-bottom: 1px solid var(--line);
+}
+
+.blurb {
+  margin: 5px 0 0;
+  color: var(--muted);
+  font-size: 13px;
+  max-width: 70ch;
+}
+
+.tree {
   list-style: none;
   margin: 0;
   padding: 6px;
-  flex: 1;
-  min-height: 120px;
+  min-height: 150px;
 }
 
-.files li {
+.tree .row {
   display: flex;
   align-items: center;
   gap: 2px;
   border-radius: 7px;
 }
 
-.files li:hover {
+.tree .row:hover {
   background: var(--panel-2);
 }
 
-.files li.selected {
+.tree .row.selected {
   outline: 1px solid var(--accent);
 }
 
-.files li.empty {
+.tree .row.dir .name {
   color: var(--muted);
-  font-size: 13px;
-  padding: 8px 9px;
-  justify-content: center;
 }
 
-.files li.conflict .name {
+.tree li.empty {
+  color: var(--muted);
+  font-size: 13px;
+  padding: 14px 9px;
+  text-align: center;
+}
+
+.tree .row.conflict .name {
   color: var(--conflict);
+}
+
+.panel-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 12px;
+  border-top: 1px solid var(--line);
+}
+
+.hint {
+  margin-left: auto;
+  color: var(--muted);
+  font-size: 12px;
 }
 
 button.file {
@@ -271,15 +343,6 @@ button.icon {
 
 button.icon:hover {
   color: var(--text);
-}
-
-.peer-actions {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  padding: 9px 11px;
-  border-top: 1px solid var(--line);
 }
 
 .commit {

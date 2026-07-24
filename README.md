@@ -8,8 +8,8 @@ a Node directory, or plain memory. Peers form a **mesh, not a hub-and-spoke**: a
 the peers it syncs with directly, and changes travel down a chain because every edge syncs
 independently.
 
-**[▶ Live demo](https://cloudauthn.github.io/vfs-sync/)** — three OPFS peers wired as a chain,
-with conflicts, renames and deletes you can trigger by hand.
+**[▶ Live demo](https://cloudauthn.github.io/vfs-sync/)** — a file explorer with one tab per
+backend, wired as a chain, with conflicts, renames and deletes you can trigger by hand.
 **[Coverage report](https://cloudauthn.github.io/vfs-sync/coverage/)** — both are published from
 the tag of the last release.
 
@@ -126,8 +126,12 @@ npm run demo:build   # static build in demo/dist
 npm run pages:build  # the same build plus the HTML coverage report in demo/dist/coverage
 ```
 
-Three OPFS peers wired `A ↔ B ↔ C`, with per-edge sync buttons, a file editor, an activity log,
-and an optional fourth peer backed by a real local folder.
+A tabbed file explorer: one tab per peer, each on a different backend — two OPFS folders, an
+in-memory adapter, and a real local folder you add through the File System Access API. The tabs
+are laid out as the chain `opfs-a ⇄ opfs-b ⇄ memory ⇄ local`; the `⇄` handles between them sync
+that edge alone. Below the explorer sit a file editor and an activity log. Switching tabs keeps
+the open file selected, so the same path can be watched across filesystems. When OPFS is blocked
+(private window, sandboxed iframe) every tab falls back to memory.
 
 The published site is refreshed only by a release: `release.yml` bumps the version, publishes to
 npm, and then calls `pages.yml` with the new tag.
