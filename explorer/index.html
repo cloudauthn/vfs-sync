@@ -6,7 +6,7 @@
     <title>vfs-sync explorer</title>
     <meta
       name="description"
-      content="Embeddable file explorer for @cloudauthn/vfs-sync: one tab per backend, wired as a sync chain."
+      content="Embeddable file explorer for @cloudauthn/vfs-sync: one root per backend, laid out like an OS file manager."
     />
     <style>
       :root {
@@ -31,6 +31,8 @@
         padding: 16px;
         max-width: 1180px;
         margin-inline: auto;
+        /* the app is one fixed-height window; let it take the viewport */
+        --vfs-height: calc(100vh - 32px);
       }
     </style>
   </head>

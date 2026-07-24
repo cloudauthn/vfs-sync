@@ -165,12 +165,16 @@ npm run explorer        # vite dev server, the app on its own page
 npm run explorer:build  # static build in explorer/dist, ready to serve or iframe
 ```
 
-One tab per peer, each on a different backend — two OPFS folders, an in-memory adapter, and a real
-local folder added through the File System Access API. The tabs are laid out as the chain
-`opfs-a ⇄ opfs-b ⇄ memory ⇄ local`; the `⇄` handles between them sync that edge alone. Below sit a
-file editor and an activity log. Switching tabs keeps the open file selected, so the same path can
-be watched across filesystems. When OPFS is blocked (private window, sandboxed iframe) every tab
-falls back to memory.
+It looks like an OS file manager: one tab per root, each on a different backend — two OPFS
+folders, an in-memory adapter, and a real local folder added through the File System Access API.
+Under the tabs sit two columns: the file tree on the left, and a details pane on the right showing
+size, mime type, SHA-256 checksum, tracking state (committed / modified / untracked, entry id,
+last editor) and how the same path stands on every other root — plus an inline editor for text
+files. The footer is a status bar — connection state, current head, last sync — with a target
+selector and a **Sync** button: pick another root to sync the open one against, or *All roots* to
+run the whole chain until it converges. Switching roots keeps the open file selected, so the same
+path can be compared across filesystems. When OPFS is blocked (private window, sandboxed iframe)
+every root falls back to memory.
 
 It draws itself into an element you give it, carries scoped styles, and reads nothing from the
 host page — the demo's `/explorer/` page is one `<main>` and one call:
@@ -182,19 +186,20 @@ const explorer = mountExplorer('#explorer', {
   opfsRoot: 'my-app-explorer', // where the stored peers live; one root per mount
   seed: { 'notes.md': '# Notes\n' }, // written to the first peer when it boots empty
   autoSyncMs: 3000,
-  localFolder: true, // offer the "pick a folder" tab
-  toolbar: true, // draw the sync / auto-sync / reset bar
-  activityLog: true,
+  localFolder: true, // offer the "Open folder" tab
+  toolbar: true, // draw the footer's sync controls (target, sync, auto-sync, reset)
+  activityLog: true, // offer the activity drawer the status bar opens
   onLog: (message, kind) => console.log(kind, message),
 });
 
-await explorer.syncAll();
+await explorer.syncTarget(); // the open root against the footer's target
+await explorer.syncAll(); // every edge, until the chain converges
 explorer.destroy();
 ```
 
 ## Status
 
-OPFS, File System Access, Node fs and memory adapters are implemented and tested — 209 tests, 99%
+OPFS, File System Access, Node fs and memory adapters are implemented and tested — 222 tests, 99%
 statement coverage. Every backend runs the same contract suite, streaming methods included.
 
 A Google Drive adapter is the planned next backend: `changes.list` + `pageToken` for incremental

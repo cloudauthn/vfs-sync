@@ -5,11 +5,23 @@ import {
   VFSNode,
   isFSAAvailable,
   isOPFSAvailable,
+  sha256,
+  sha256Stream,
   sync,
   syncUntilStable,
   walk,
 } from '../../src/index';
-import type { ConflictReport, Hash, MeshEdge, VFSAdapter, WalkedFile } from '../../src/index';
+import type {
+  ConflictReport,
+  Hash,
+  MeshEdge,
+  NodeConfig,
+  TreeEntry,
+  VFSAdapter,
+  VFSStat,
+  WalkedFile,
+} from '../../src/index';
+import { formatAgo, formatBytes, formatSize, formatTime, iconOf, isTextMime, mimeOf } from './format';
 import './explorer.css';
 
 export type LogKind = 'info' | 'ok' | 'warn' | 'conflict';
@@ -17,15 +29,15 @@ export type LogKind = 'info' | 'ok' | 'warn' | 'conflict';
 export interface ExplorerOptions {
   /** OPFS directory the stored peers live in. Two hosts on one origin want two roots. */
   opfsRoot?: string;
-  /** Written to the first peer when it boots empty. `null` starts from nothing. */
+  /** Written to the first root when it boots empty. `null` starts from nothing. */
   seed?: Record<string, string> | null;
   /** Interval the auto-sync switch runs at. */
   autoSyncMs?: number;
   /** Offer the tab that adds a folder from disk through the File System Access API. */
   localFolder?: boolean;
-  /** Draw the sync / auto-sync / reset bar. Turn it off to drive the app from the host. */
+  /** Draw the footer's sync controls — target, sync, auto-sync, reset. */
   toolbar?: boolean;
-  /** Draw the activity log next to the editor. */
+  /** Offer the activity drawer the status bar opens. */
   activityLog?: boolean;
   /** Every log line, so a host page can mirror it somewhere of its own. */
   onLog?: (message: string, kind: LogKind) => void;
@@ -34,11 +46,13 @@ export interface ExplorerOptions {
 export interface ExplorerHandle {
   /** The root the app drew itself into. */
   readonly element: HTMLElement;
+  /** Sync the open root against whatever the footer's target selector points at. */
+  syncTarget(): Promise<void>;
   /** Sync every edge of the chain until it stops changing. */
   syncAll(): Promise<void>;
-  /** Re-read every peer and repaint. */
+  /** Re-read every root and repaint. */
   refresh(): Promise<void>;
-  /** Stop the auto-sync timer and empty the root. */
+  /** Stop the auto-sync timer and empty the root element. */
   destroy(): void;
 }
 
@@ -48,9 +62,24 @@ const DEFAULT_SEED: Record<string, string> = {
   'docs/getting-started.md': 'Folders sync too.\n',
 };
 
+/** Above this the details pane streams the checksum instead of holding the file. */
+const STREAM_HASH_OVER = 4 * 1024 * 1024;
+/** Above this a file is not compared against the other roots byte for byte. */
+const COMPARE_LIMIT = 8 * 1024 * 1024;
+/** Above this the editor refuses to open a file, however text-like it is. */
+const EDIT_LIMIT = 512 * 1024;
+/** Sentinel target: sync the whole chain rather than one pair. */
+const ALL_ROOTS = '*';
+
 type Backend = 'OPFS' | 'memory' | 'local folder';
 
-/** One line per backend, shown above that tab's file tree. */
+const BACKEND_ICON: Record<Backend, string> = {
+  OPFS: '🗄',
+  memory: '🧠',
+  'local folder': '📁',
+};
+
+/** One line per backend, shown when a root is open with nothing selected. */
 const BLURB: Record<Backend, string> = {
   OPFS:
     'Origin Private File System — private to this origin, survives reloads, ' +
@@ -69,21 +98,52 @@ interface Peer {
   backend: Backend;
   adapter: VFSAdapter;
   node: VFSNode;
-  /** Only the local-folder peer, whose permission can lapse mid-session. */
+  /** Only the local-folder root, whose permission can lapse mid-session. */
   fsa?: FSAAdapter;
-  /** Directories this tab has folded away. */
+  /** Directories this root has folded away. */
   collapsed: Set<string>;
 }
 
-/** What one render pass needs to know about a peer. */
+/** What one render pass needs to know about a root. */
 interface Snapshot {
   files: WalkedFile[];
   head: Hash | null;
+  /** Committed state, by path — what the last commit says about each file. */
+  tracked: Map<string, TreeEntry>;
+  peers: NodeConfig['peers'];
+  bytes: number;
 }
 
 interface Selection {
   peer: string;
   path: string;
+  kind: 'file' | 'directory';
+}
+
+/** How one other root compares on the selected path. */
+interface Across {
+  key: string;
+  label: string;
+  backend: Backend;
+  state: 'same' | 'differs' | 'missing' | 'unknown';
+  detail: string;
+}
+
+/** Everything the right-hand column shows about the current selection. */
+interface Details {
+  peer: string;
+  path: string;
+  kind: 'file' | 'directory';
+  stat: VFSStat | null;
+  mime: string;
+  hash: Hash | null;
+  entry: TreeEntry | undefined;
+  across: Across[];
+  /** Loaded file text, or `null` when the file is binary or too large. */
+  text: string | null;
+  /** Directory rollup. */
+  count: number;
+  bytes: number;
 }
 
 /** A folder as the explorer draws it, rebuilt from the flat walk() listing. */
@@ -121,13 +181,25 @@ export function mountExplorer(
   const seed = options.seed === undefined ? DEFAULT_SEED : options.seed;
   const autoSyncMs = options.autoSyncMs ?? 3000;
   const wantsLocalFolder = options.localFolder ?? true;
+  const wantsControls = options.toolbar ?? true;
+  const wantsLog = options.activityLog ?? true;
 
   const peers: Peer[] = [];
   let edges: MeshEdge[] = [];
   let active = '';
+  let syncTargetKey = ALL_ROOTS;
   let selection: Selection | null = null;
+  let details: Details | null = null;
+  /** Bumped on every selection change; a stale async load drops its result. */
+  let detailToken = 0;
   let autoTimer: ReturnType<typeof setInterval> | undefined;
   let syncing = false;
+  let lastSyncAt: number | null = null;
+  let dirty = false;
+  let logOpen = false;
+  let logCount = 0;
+  let lastMessage = 'ready';
+  let lastKind: LogKind = 'info';
 
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
@@ -136,76 +208,56 @@ export function mountExplorer(
 
   const shell = el('div', 'vfs-explorer');
   const tabsEl = el('div', 'vfs-tabs');
-  const panelEl = el('div', 'vfs-panel');
+  const sidebarEl = el('div', 'vfs-sidebar');
+  const detailsEl = el('div', 'vfs-details');
+  const drawerEl = el('div', 'vfs-drawer');
+  const footerEl = el('div', 'vfs-footer');
   const logList = el('ol');
-  const contentEl = el('textarea');
-  const editorTitle = el('span', 'vfs-editor-title');
-  const saveButton = el('button', 'vfs-primary', 'Save');
+  const controlsEl = el('div', 'vfs-controls');
+  const targetSelect = el('select', 'vfs-target');
+  const syncButton = el('button', 'vfs-primary', 'Sync');
   const autoSyncBox = el('input');
 
   tabsEl.setAttribute('role', 'tablist');
-  panelEl.setAttribute('role', 'tabpanel');
-  contentEl.spellcheck = false;
-  contentEl.placeholder = 'No file selected';
   autoSyncBox.type = 'checkbox';
+  autoSyncBox.id = `vfs-auto-${Math.random().toString(36).slice(2, 8)}`;
 
-  if (options.toolbar ?? true) shell.append(buildToolbar());
+  const body = el('div', 'vfs-body');
+  body.append(sidebarEl, detailsEl);
 
-  const main = el('div', 'vfs-main');
-  main.append(tabsEl, panelEl);
-  shell.append(main);
+  drawerEl.append(buildDrawer());
+  drawerEl.hidden = true;
+  buildControls();
 
-  const workbench = el('div', 'vfs-workbench');
-  workbench.append(buildEditor());
-  if (options.activityLog ?? true) workbench.append(buildLog());
-  else workbench.classList.add('vfs-single');
-  shell.append(workbench);
-
+  shell.append(tabsEl, body, drawerEl, footerEl);
   root.replaceChildren(shell);
 
-  function buildToolbar(): HTMLElement {
-    const bar = el('div', 'vfs-toolbar');
+  function buildDrawer(): HTMLElement {
+    const head = el('div', 'vfs-drawer-head');
+    const clear = el('button', 'vfs-ghost', 'Clear');
+    clear.addEventListener('click', () => {
+      logList.replaceChildren();
+      logCount = 0;
+      renderFooter();
+    });
+    const close = el('button', 'vfs-ghost', '×');
+    close.title = 'Hide the activity log';
+    close.addEventListener('click', () => toggleLog(false));
+    const actions = el('div', 'vfs-drawer-actions');
+    actions.append(clear, close);
+    head.append(el('span', 'vfs-drawer-title', 'Activity'), actions);
 
-    const syncButton = el('button', 'vfs-primary', 'Sync the whole chain');
-    syncButton.addEventListener('click', () => void syncAll());
-
-    const label = el('label', 'vfs-switch');
-    label.append(autoSyncBox, el('span', undefined, `Auto-sync every ${autoSyncMs / 1000}s`));
-    autoSyncBox.addEventListener('change', () => setAutoSync(autoSyncBox.checked));
-
-    const resetButton = el('button', 'vfs-danger', 'Reset');
-    resetButton.addEventListener('click', () => void reset());
-
-    bar.append(syncButton, label, resetButton);
-    return bar;
-  }
-
-  function buildEditor(): HTMLElement {
-    const editor = el('div', 'vfs-editor');
-    const head = el('div', 'vfs-editor-head');
-    saveButton.disabled = true;
-    saveButton.addEventListener('click', () => void save());
-    head.append(editorTitle, saveButton);
-    editor.append(head, contentEl);
-    return editor;
-  }
-
-  function buildLog(): HTMLElement {
-    const panel = el('div', 'vfs-log');
-    const head = el('div', 'vfs-log-head');
-    const clear = el('button', undefined, 'Clear');
-    clear.addEventListener('click', () => logList.replaceChildren());
-    head.append(el('span', undefined, 'Activity'), clear);
+    const panel = el('div', 'vfs-drawer-panel');
     panel.append(head, logList);
     return panel;
   }
 
-  contentEl.addEventListener('keydown', (event) => {
-    if ((event.metaKey || event.ctrlKey) && event.key === 's') {
-      event.preventDefault();
-      void save();
-    }
-  });
+  function toggleLog(open: boolean): void {
+    logOpen = open && wantsLog;
+    drawerEl.hidden = !logOpen;
+    if (logOpen) logCount = 0;
+    renderFooter();
+  }
 
   // --------------------------------------------------------------- bootstrap
 
@@ -224,17 +276,37 @@ export function mountExplorer(
     return peer;
   }
 
+  /** Some sandboxes leave `getDirectory()` pending forever rather than reject. */
+  function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('OPFS timed out')), ms);
+      promise.then(
+        (value) => {
+          clearTimeout(timer);
+          resolve(value);
+        },
+        (error: unknown) => {
+          clearTimeout(timer);
+          reject(error instanceof Error ? error : new Error(String(error)));
+        },
+      );
+    });
+  }
+
   /** OPFS when the browser allows it, an in-memory stand-in when it does not. */
   async function addStoredPeer(suffix: string): Promise<void> {
     const key = `store-${suffix}`;
     if (isOPFSAvailable()) {
       try {
         const label = `opfs-${suffix}`;
-        const adapter = await OPFSAdapter.open({ path: `${opfsRoot}/${key}`, name: label });
+        const adapter = await withTimeout(
+          OPFSAdapter.open({ path: `${opfsRoot}/${key}`, name: label }),
+          3000,
+        );
         await addPeer(key, label, adapter, 'OPFS');
         return;
       } catch {
-        // storage blocked (private window, sandboxed iframe) — fall through
+        // storage blocked or stalled (private window, sandboxed iframe) — fall through
       }
     }
     const label = `mem-${suffix}`;
@@ -248,9 +320,10 @@ export function mountExplorer(
 
     const first = peers[0] as Peer;
     active = first.key;
+    syncTargetKey = (peers[1] as Peer).key;
 
     if (first.backend === 'memory') {
-      log('OPFS is unavailable here, so every tab runs on an in-memory adapter.', 'warn');
+      log('OPFS is unavailable here, so every root runs on an in-memory adapter.', 'warn');
     }
 
     if (seed && (await walk(first.adapter)).length === 0) {
@@ -270,115 +343,148 @@ export function mountExplorer(
     return peers.find((peer) => peer.key === active);
   }
 
-  async function render(): Promise<void> {
-    const snapshots = new Map<string, Snapshot>();
-    for (const peer of peers) {
-      snapshots.set(peer.key, { files: await walk(peer.adapter), head: await peer.node.head() });
-    }
-    renderTabs(snapshots);
-    renderPanel(snapshots);
+  function peerOf(key: string | undefined): Peer | undefined {
+    return peers.find((peer) => peer.key === key);
   }
 
-  function renderTabs(snapshots: Map<string, Snapshot>): void {
-    tabsEl.replaceChildren();
-    for (const [index, peer] of peers.entries()) {
-      if (index > 0) tabsEl.append(edgeButton(index - 1));
-      tabsEl.append(tabButton(peer, snapshots.get(peer.key)));
+  let snapshots = new Map<string, Snapshot>();
+
+  async function readSnapshot(peer: Peer): Promise<Snapshot> {
+    const files = await walk(peer.adapter);
+    const tracked = new Map<string, TreeEntry>();
+    try {
+      for (const entry of (await peer.node.headTree()).entries) {
+        if (!entry.deleted) tracked.set(entry.path, entry);
+      }
+    } catch {
+      // a root whose commit is unreadable still lists its files
     }
+    const config = await peer.node.store.readConfig();
+    return {
+      files,
+      head: await peer.node.head(),
+      tracked,
+      peers: config.peers ?? {},
+      bytes: files.reduce((total, file) => total + file.stat.size, 0),
+    };
+  }
+
+  async function render(): Promise<void> {
+    const next = new Map<string, Snapshot>();
+    for (const peer of peers) next.set(peer.key, await readSnapshot(peer));
+    snapshots = next;
+    renderTabs();
+    renderSidebar();
+    renderDetails();
+    renderFooter();
+  }
+
+  function snapshotOf(key: string): Snapshot {
+    return snapshots.get(key) ?? { files: [], head: null, tracked: new Map(), peers: {}, bytes: 0 };
+  }
+
+  // ------------------------------------------------------------------- tabs
+
+  function renderTabs(): void {
+    tabsEl.replaceChildren();
+    for (const peer of peers) tabsEl.append(tabButton(peer));
     const slot = localFolderTab();
     if (slot) tabsEl.append(slot);
   }
 
-  function tabButton(peer: Peer, snapshot: Snapshot | undefined): HTMLElement {
+  function tabButton(peer: Peer): HTMLElement {
     const button = el('button', 'vfs-tab');
     button.setAttribute('role', 'tab');
     button.setAttribute('aria-selected', String(peer.key === active));
     if (peer.key === active) button.classList.add('vfs-active');
 
-    const count = snapshot?.files.length ?? 0;
-    const head = snapshot?.head;
-    const meta = el('span', 'vfs-tab-meta');
-    meta.append(
-      el('span', 'vfs-badge', peer.backend),
-      el(
-        'span',
-        'vfs-commit',
-        `${count} file${count === 1 ? '' : 's'}${head ? ` @ ${head.slice(0, 7)}` : ''}`,
-      ),
+    const snapshot = snapshotOf(peer.key);
+    const count = snapshot.files.length;
+
+    const title = el('span', 'vfs-tab-title');
+    title.append(
+      el('span', 'vfs-tab-icon', BACKEND_ICON[peer.backend]),
+      el('span', 'vfs-tab-name', peer.label),
     );
 
-    button.append(el('span', 'vfs-tab-name', peer.label), meta);
+    const meta = el(
+      'span',
+      'vfs-tab-meta',
+      `${count} item${count === 1 ? '' : 's'} · ${formatBytes(snapshot.bytes)}`,
+    );
+
+    button.append(title, meta);
+    button.title = `${peer.backend}${snapshot.head ? ` @ ${snapshot.head.slice(0, 7)}` : ''}`;
     button.addEventListener('click', () => void activate(peer));
     return button;
   }
 
-  /** The edge between two adjacent tabs — clicking it syncs just that pair. */
-  function edgeButton(index: number): HTMLElement {
-    const button = el('button', 'vfs-edge', '⇄');
-    button.title = `Sync ${(peers[index] as Peer).label} ⇄ ${(peers[index + 1] as Peer).label}`;
-    button.addEventListener('click', () => void syncEdge(index));
-    return button;
-  }
-
-  /** Placeholder tab that turns into a real peer once a folder is granted. */
+  /** Placeholder tab that turns into a real root once a folder is granted. */
   function localFolderTab(): HTMLElement | null {
     if (!wantsLocalFolder) return null;
     if (peers.some((peer) => peer.backend === 'local folder')) return null;
 
     const button = el('button', 'vfs-tab vfs-add');
-    const meta = el('span', 'vfs-tab-meta');
-    meta.append(el('span', 'vfs-badge', 'local folder'));
-    button.append(el('span', 'vfs-tab-name', '+ pick a folder'), meta);
+    button.append(el('span', 'vfs-tab-icon', '＋'), el('span', 'vfs-tab-name', 'Open folder'));
 
     if (!isFSAAvailable()) {
       button.disabled = true;
       button.title = 'This browser has no File System Access API';
       return button;
     }
-    button.title = 'Add a folder from your disk as a fourth peer';
+    button.title = 'Open a folder from your disk as another root';
     button.addEventListener('click', () => void addLocalFolder());
     return button;
   }
 
-  function renderPanel(snapshots: Map<string, Snapshot>): void {
-    const peer = activePeer();
-    panelEl.replaceChildren();
-    if (!peer) return;
-    const snapshot = snapshots.get(peer.key) ?? { files: [], head: null };
+  // ---------------------------------------------------------------- sidebar
 
-    const head = el('div', 'vfs-panel-head');
-    const heading = el('div');
-    heading.append(el('h2', undefined, peer.label), el('p', 'vfs-blurb', BLURB[peer.backend]));
-    const commit = el(
-      'span',
-      'vfs-commit',
-      snapshot.head ? `@ ${snapshot.head.slice(0, 7)}` : 'no commits',
+  function renderSidebar(): void {
+    sidebarEl.replaceChildren();
+    const peer = activePeer();
+    if (!peer) return;
+    const snapshot = snapshotOf(peer.key);
+
+    const head = el('div', 'vfs-sidebar-head');
+    const crumbs = el('button', 'vfs-crumbs');
+    crumbs.append(
+      el('span', 'vfs-tab-icon', BACKEND_ICON[peer.backend]),
+      el('span', undefined, peer.label),
     );
-    commit.title = snapshot.head ?? '';
-    head.append(heading, commit);
-    panelEl.append(head);
+    crumbs.title = 'Show this root’s details';
+    crumbs.addEventListener('click', () => void select(peer, null));
+
+    const add = el('button', 'vfs-ghost', '＋ New');
+    add.title = 'Create a file (a / in the name creates a folder)';
+    add.addEventListener('click', () => void newFile(peer));
+
+    head.append(crumbs, add);
+    sidebarEl.append(head);
 
     const tree = el('ul', 'vfs-tree');
+    tree.setAttribute('role', 'tree');
     if (snapshot.files.length === 0) {
-      tree.append(el('li', 'vfs-empty', 'empty folder'));
+      tree.append(el('li', 'vfs-empty', 'This folder is empty'));
     } else {
       renderDir(peer, buildTree(snapshot.files), 0, tree);
     }
-    panelEl.append(tree);
+    sidebarEl.append(tree);
 
-    const actions = el('div', 'vfs-panel-actions');
-    const add = el('button', undefined, '+ new file');
-    add.addEventListener('click', () => void newFile(peer));
-    actions.append(add);
-
+    const foot = el('div', 'vfs-sidebar-foot');
+    foot.append(
+      el(
+        'span',
+        undefined,
+        `${snapshot.files.length} item${snapshot.files.length === 1 ? '' : 's'}, ${formatBytes(snapshot.bytes)}`,
+      ),
+    );
     if (peer.fsa) {
-      const grant = el('button', undefined, 're-grant access');
+      const grant = el('button', 'vfs-ghost', 'Re-grant');
+      grant.title = 'Ask for permission on this folder again';
       grant.addEventListener('click', () => void regrant(peer));
-      actions.append(grant);
+      foot.append(grant);
     }
-
-    actions.append(el('span', 'vfs-hint', 'name a file docs/readme.md to put it in a folder'));
-    panelEl.append(actions);
+    sidebarEl.append(foot);
   }
 
   /** walk() returns a flat list; the explorer wants it back in folder shape. */
@@ -401,15 +507,19 @@ export function mountExplorer(
     return treeRoot;
   }
 
-  function countFiles(dir: TreeDir): number {
-    let total = dir.files.length;
-    for (const child of dir.dirs.values()) total += countFiles(child);
-    return total;
+  function rollup(dir: TreeDir): { count: number; bytes: number } {
+    let count = dir.files.length;
+    let bytes = dir.files.reduce((total, file) => total + file.stat.size, 0);
+    for (const child of dir.dirs.values()) {
+      const sub = rollup(child);
+      count += sub.count;
+      bytes += sub.bytes;
+    }
+    return { count, bytes };
   }
 
   function renderDir(peer: Peer, dir: TreeDir, depth: number, list: HTMLUListElement): void {
-    const names = [...dir.dirs.keys()].sort();
-    for (const name of names) {
+    for (const name of [...dir.dirs.keys()].sort()) {
       const child = dir.dirs.get(name) as TreeDir;
       const collapsed = peer.collapsed.has(child.path);
       list.append(dirRow(peer, name, child, depth, collapsed));
@@ -418,8 +528,11 @@ export function mountExplorer(
     for (const file of dir.files) list.append(fileRow(peer, file, depth));
   }
 
-  function indent(row: HTMLElement, depth: number): void {
-    row.style.paddingLeft = `${depth * 16}px`;
+  function markSelected(item: HTMLElement, path: string): void {
+    if (selection?.peer === active && selection.path === path) {
+      item.classList.add('vfs-selected');
+      item.setAttribute('aria-selected', 'true');
+    }
   }
 
   function dirRow(
@@ -430,55 +543,376 @@ export function mountExplorer(
     collapsed: boolean,
   ): HTMLElement {
     const item = el('li', 'vfs-row vfs-dir');
-    indent(item, depth);
+    item.setAttribute('role', 'treeitem');
+    item.setAttribute('aria-expanded', String(!collapsed));
+    markSelected(item, dir.path);
 
-    const hidden = countFiles(dir);
-    const toggle = el('button', 'vfs-file');
-    toggle.append(
-      el('span', 'vfs-name', `${collapsed ? '▸' : '▾'} ${name}/`),
-      el('span', 'vfs-size', collapsed ? `${hidden} file${hidden === 1 ? '' : 's'}` : ''),
-    );
-    toggle.addEventListener('click', () => {
-      if (collapsed) peer.collapsed.delete(dir.path);
-      else peer.collapsed.add(dir.path);
-      void render();
+    const open = el('button', 'vfs-entry');
+    open.style.paddingLeft = `${depth * 14 + 6}px`;
+    const twisty = el('span', 'vfs-twisty', collapsed ? '▸' : '▾');
+    twisty.addEventListener('click', (event) => {
+      event.stopPropagation();
+      toggleDir(peer, dir.path, collapsed);
     });
+    open.append(twisty, el('span', 'vfs-icon-cell', collapsed ? '📁' : '📂'));
+    open.append(el('span', 'vfs-name', name));
+    open.append(el('span', 'vfs-meta', `${rollup(dir).count}`));
+    open.addEventListener('click', () => void select(peer, { path: dir.path, kind: 'directory' }));
+    open.addEventListener('dblclick', () => toggleDir(peer, dir.path, collapsed));
 
-    item.append(toggle);
+    item.append(open);
     return item;
+  }
+
+  function toggleDir(peer: Peer, path: string, collapsed: boolean): void {
+    if (collapsed) peer.collapsed.delete(path);
+    else peer.collapsed.add(path);
+    renderSidebar();
   }
 
   function fileRow(peer: Peer, file: WalkedFile, depth: number): HTMLElement {
     const item = el('li', 'vfs-row');
-    indent(item, depth);
-    if (selection?.peer === peer.key && selection.path === file.path) {
-      item.classList.add('vfs-selected');
-    }
+    item.setAttribute('role', 'treeitem');
+    markSelected(item, file.path);
     if (file.path.includes('(conflict ')) item.classList.add('vfs-conflict');
 
     const name = file.path.slice(file.path.lastIndexOf('/') + 1);
-    const open = el('button', 'vfs-file');
+    const open = el('button', 'vfs-entry');
+    open.style.paddingLeft = `${depth * 14 + 6}px`;
     open.title = file.path;
-    open.append(el('span', 'vfs-name', name), el('span', 'vfs-size', `${file.stat.size} B`));
-    open.addEventListener('click', () => void openFile(peer, file.path));
+    open.append(
+      el('span', 'vfs-twisty'),
+      el('span', 'vfs-icon-cell', iconOf(mimeOf(file.path))),
+      el('span', 'vfs-name', name),
+      el('span', 'vfs-meta', formatBytes(file.stat.size)),
+    );
+    open.addEventListener('click', () => void select(peer, { path: file.path, kind: 'file' }));
 
-    const rename = el('button', 'vfs-icon', '✎');
-    rename.title = 'Rename';
-    rename.addEventListener('click', () => void renameFile(peer, file.path));
-
-    const remove = el('button', 'vfs-icon', '×');
-    remove.title = 'Delete';
-    remove.addEventListener('click', () => void deleteFile(peer, file.path));
-
-    item.append(open, rename, remove);
+    item.append(open);
     return item;
   }
 
-  // ----------------------------------------------------------------- actions
+  // ---------------------------------------------------------------- details
+
+  function renderDetails(): void {
+    // An unsaved edit owns the pane: repainting it here — an auto-sync tick,
+    // say — would take the caret away mid-keystroke.
+    if (dirty && detailsEl.contains(document.activeElement)) return;
+    detailsEl.replaceChildren();
+    const peer = activePeer();
+    if (!peer) return;
+
+    if (!details || details.peer !== peer.key) {
+      detailsEl.append(rootDetails(peer));
+      return;
+    }
+    detailsEl.append(detailsHead(peer, details));
+    const scroll = el('div', 'vfs-details-body');
+    if (details.kind === 'directory') scroll.append(...folderSections(details));
+    else scroll.append(...fileSections(peer, details));
+    detailsEl.append(scroll);
+  }
+
+  /** Shown when no file is picked: what this root is and where it stands. */
+  function rootDetails(peer: Peer): HTMLElement {
+    const snapshot = snapshotOf(peer.key);
+    const wrap = el('div', 'vfs-details-inner');
+
+    const head = el('div', 'vfs-details-head');
+    const title = el('div', 'vfs-details-title');
+    title.append(
+      el('span', 'vfs-details-icon', BACKEND_ICON[peer.backend]),
+      el('span', 'vfs-details-name', peer.label),
+    );
+    head.append(title);
+    wrap.append(head);
+
+    const scroll = el('div', 'vfs-details-body');
+    scroll.append(el('p', 'vfs-blurb', BLURB[peer.backend]));
+    scroll.append(
+      section('Root', [
+        ['Backend', peer.backend],
+        ['Adapter name', peer.adapter.name],
+        ['Items', String(snapshot.files.length)],
+        ['Size', formatSize(snapshot.bytes)],
+      ]),
+    );
+    scroll.append(
+      section('Commit', [
+        ['Head', snapshot.head ?? 'no commits yet'],
+        ['Tracked files', String(snapshot.tracked.size)],
+      ]),
+    );
+
+    const lines = Object.entries(snapshot.peers).map(
+      ([id, info]) =>
+        [id, `${formatAgo(info.lastSync)} @ ${info.head ? info.head.slice(0, 7) : '—'}`] as [
+          string,
+          string,
+        ],
+    );
+    scroll.append(section('Sync history', lines.length ? lines : [['—', 'never synced']]));
+    scroll.append(el('p', 'vfs-hint', 'Select a file on the left to inspect it.'));
+    wrap.append(scroll);
+    return wrap;
+  }
+
+  function detailsHead(peer: Peer, detail: Details): HTMLElement {
+    const head = el('div', 'vfs-details-head');
+    const name = detail.path.slice(detail.path.lastIndexOf('/') + 1);
+
+    const title = el('div', 'vfs-details-title');
+    title.append(
+      el('span', 'vfs-details-icon', detail.kind === 'directory' ? '📂' : iconOf(detail.mime)),
+      el('span', 'vfs-details-name', name),
+    );
+    title.title = `${peer.label} / ${detail.path}`;
+
+    const actions = el('div', 'vfs-details-actions');
+    if (detail.kind === 'file') {
+      const rename = el('button', 'vfs-ghost', 'Rename');
+      rename.addEventListener('click', () => void renameFile(peer, detail.path));
+      const remove = el('button', 'vfs-ghost vfs-danger', 'Delete');
+      remove.addEventListener('click', () => void deleteFile(peer, detail.path));
+      actions.append(rename, remove);
+    }
+
+    head.append(title, actions);
+    return head;
+  }
+
+  function section(title: string, rows: Array<[string, string]>): HTMLElement {
+    const block = el('section', 'vfs-section');
+    block.append(el('h3', undefined, title));
+    const list = el('dl', 'vfs-props');
+    for (const [key, value] of rows) {
+      const term = el('dt', undefined, key);
+      const def = el('dd', undefined, value);
+      def.title = value;
+      list.append(term, def);
+    }
+    block.append(list);
+    return block;
+  }
+
+  function folderSections(detail: Details): HTMLElement[] {
+    return [
+      section('Folder', [
+        ['Path', detail.path],
+        ['Items', String(detail.count)],
+        ['Size', formatSize(detail.bytes)],
+      ]),
+      acrossSection(detail),
+    ];
+  }
+
+  function fileSections(peer: Peer, detail: Details): HTMLElement[] {
+    const stat = detail.stat;
+    const entry = detail.entry;
+    const out: HTMLElement[] = [];
+
+    out.push(
+      section('File', [
+        ['Path', detail.path],
+        ['Kind', detail.mime],
+        ['Size', stat ? formatSize(stat.size) : '—'],
+        ['Modified', stat ? `${formatTime(stat.mtime)} (${formatAgo(stat.mtime)})` : '—'],
+      ]),
+    );
+
+    const checksum = el('section', 'vfs-section');
+    checksum.append(el('h3', undefined, 'Checksum'));
+    const value = el('code', 'vfs-hash', detail.hash ?? 'computing…');
+    value.title = detail.hash ?? '';
+    checksum.append(value);
+    checksum.append(
+      el(
+        'p',
+        'vfs-hint',
+        entry && entry.hash && detail.hash && entry.hash !== detail.hash
+          ? 'SHA-256 of the file on disk — it differs from the committed blob, so this edit has not been committed yet.'
+          : 'SHA-256 of the file on disk. It is the address the blob is stored under.',
+      ),
+    );
+    out.push(checksum);
+
+    out.push(
+      section('Tracking', [
+        ['State', entry ? (entry.hash === detail.hash ? 'committed' : 'modified') : 'untracked'],
+        ['Entry id', entry?.id ?? '—'],
+        ['Logical mtime', entry ? formatTime(entry.mtime) : '—'],
+        ['Last edited by', entry?.peer ?? '—'],
+        ['Renamed from', entry?.renamedFrom ?? '—'],
+      ]),
+    );
+
+    out.push(acrossSection(detail));
+
+    if (detail.text !== null) out.push(editorSection(peer, detail));
+    else if (stat && stat.size > EDIT_LIMIT) {
+      out.push(note(`Too large to open here (${formatBytes(stat.size)}).`));
+    } else {
+      out.push(note(`No text preview for ${detail.mime}.`));
+    }
+
+    return out;
+  }
+
+  /** The same path, as it stands on every other open root. */
+  function acrossSection(detail: Details): HTMLElement {
+    const block = el('section', 'vfs-section');
+    block.append(el('h3', undefined, 'Across roots'));
+    const list = el('ul', 'vfs-across');
+    if (detail.across.length === 0) {
+      list.append(el('li', 'vfs-hint', 'No other root is open.'));
+    }
+    for (const other of detail.across) {
+      const item = el('li', `vfs-across-item vfs-state-${other.state}`);
+      item.append(
+        el('span', 'vfs-dot'),
+        el('span', 'vfs-across-name', `${BACKEND_ICON[other.backend]} ${other.label}`),
+        el('span', 'vfs-across-state', other.detail),
+      );
+      list.append(item);
+    }
+    block.append(list);
+    return block;
+  }
+
+  function note(text: string): HTMLElement {
+    const block = el('section', 'vfs-section');
+    block.append(el('p', 'vfs-hint', text));
+    return block;
+  }
+
+  function editorSection(peer: Peer, detail: Details): HTMLElement {
+    const block = el('section', 'vfs-section vfs-editor');
+    const head = el('div', 'vfs-editor-head');
+    const save = el('button', 'vfs-primary', 'Save');
+    save.disabled = !dirty;
+
+    const area = el('textarea');
+    area.spellcheck = false;
+    area.value = detail.text ?? '';
+    area.addEventListener('input', () => {
+      dirty = true;
+      save.disabled = false;
+      if (details) details.text = area.value;
+    });
+    area.addEventListener('keydown', (event) => {
+      if ((event.metaKey || event.ctrlKey) && event.key === 's') {
+        event.preventDefault();
+        void write(peer, detail.path, area.value);
+      }
+    });
+    save.addEventListener('click', () => void write(peer, detail.path, area.value));
+
+    head.append(el('h3', undefined, 'Contents'), save);
+    block.append(head, area);
+    return block;
+  }
+
+  // ----------------------------------------------------------------- footer
+
+  function renderFooter(): void {
+    footerEl.replaceChildren();
+
+    const status = el('div', 'vfs-status');
+    const state = syncing ? 'busy' : lastKind === 'warn' ? 'warn' : 'ok';
+    status.append(el('span', `vfs-dot vfs-dot-${state}`));
+
+    const peer = activePeer();
+    const snapshot = peer ? snapshotOf(peer.key) : null;
+    const bits = [
+      syncing ? 'syncing…' : lastMessage,
+      peer ? `${peer.label} · ${peer.backend}` : 'no root',
+      snapshot?.head ? `@ ${snapshot.head.slice(0, 7)}` : 'no commits',
+      lastSyncAt ? `synced ${formatAgo(lastSyncAt)}` : 'not synced yet',
+    ];
+    status.append(el('span', 'vfs-status-text', bits[0] as string));
+    for (const bit of bits.slice(1)) status.append(el('span', 'vfs-status-bit', bit));
+
+    if (wantsLog) {
+      const toggle = el('button', 'vfs-ghost', `Activity${logCount ? ` (${logCount})` : ''}`);
+      toggle.setAttribute('aria-expanded', String(logOpen));
+      toggle.addEventListener('click', () => toggleLog(!logOpen));
+      status.append(toggle);
+    }
+
+    footerEl.append(status);
+    if (wantsControls) {
+      updateControls();
+      footerEl.append(controlsEl);
+    }
+  }
 
   /**
-   * Switching tabs follows the current file when the other backend has it —
-   * which is the whole point of the app: the same path, on another filesystem.
+   * Built once and kept: the footer repaints on every log line, and rebuilding
+   * a <select> under the pointer would shut the open dropdown.
+   */
+  function buildControls(): void {
+    targetSelect.title = 'Which root to sync the open one against';
+    targetSelect.addEventListener('change', () => {
+      syncTargetKey = targetSelect.value;
+      renderFooter();
+    });
+
+    syncButton.addEventListener('click', () => void syncTarget());
+
+    const label = el('label', 'vfs-switch');
+    label.htmlFor = autoSyncBox.id;
+    label.append(autoSyncBox, el('span', undefined, `Auto ${autoSyncMs / 1000}s`));
+    autoSyncBox.addEventListener('change', () => setAutoSync(autoSyncBox.checked));
+
+    const reset = el('button', 'vfs-ghost vfs-danger', 'Reset');
+    reset.title = 'Delete every folder this explorer owns and start over';
+    reset.addEventListener('click', () => void reset$());
+
+    controlsEl.append(
+      el('span', 'vfs-controls-label', 'Sync with'),
+      targetSelect,
+      syncButton,
+      label,
+      reset,
+    );
+  }
+
+  /** Option list for the target selector — every open root except this one. */
+  function targetSignature(): string {
+    return `${active}|${peers.map((peer) => `${peer.key}:${peer.label}`).join(',')}`;
+  }
+
+  let renderedTargets = '';
+
+  function updateControls(): void {
+    const signature = targetSignature();
+    if (signature !== renderedTargets) {
+      renderedTargets = signature;
+      targetSelect.replaceChildren();
+      const all = el('option', undefined, 'All roots (chain)');
+      all.value = ALL_ROOTS;
+      targetSelect.append(all);
+      for (const peer of peers) {
+        if (peer.key === active) continue;
+        const option = el('option', undefined, `${BACKEND_ICON[peer.backend]} ${peer.label}`);
+        option.value = peer.key;
+        targetSelect.append(option);
+      }
+    }
+    if (syncTargetKey !== ALL_ROOTS && !peers.some((peer) => peer.key === syncTargetKey)) {
+      syncTargetKey = ALL_ROOTS;
+    }
+    // The open root cannot sync with itself; fall back to the whole chain.
+    targetSelect.value = syncTargetKey === active ? ALL_ROOTS : syncTargetKey;
+    syncButton.disabled = syncing || peers.length < 2;
+    syncButton.textContent = syncing ? 'Syncing…' : 'Sync';
+  }
+
+  // ---------------------------------------------------------------- actions
+
+  /**
+   * Switching roots follows the current path when the other backend has it —
+   * which is the whole point of the app: the same file, on another filesystem.
    */
   async function activate(peer: Peer): Promise<void> {
     active = peer.key;
@@ -486,30 +920,143 @@ export function mountExplorer(
       log(`${peer.label} needs its permission re-granted`, 'warn');
     }
     const path = selection?.path;
-    if (path && (await peer.adapter.stat(path))?.kind === 'file') await load(peer, path);
-    else clearSelection();
-    await render();
+    const stat = path ? await peer.adapter.stat(path) : null;
+    if (path && stat) await select(peer, { path, kind: stat.kind === 'directory' ? 'directory' : 'file' });
+    else await select(peer, null);
   }
 
-  async function openFile(peer: Peer, path: string): Promise<void> {
-    await load(peer, path);
-    await render();
+  /** Picks a path (or the root itself when `entry` is null) and repaints. */
+  async function select(
+    peer: Peer,
+    entry: { path: string; kind: 'file' | 'directory' } | null,
+  ): Promise<void> {
+    active = peer.key;
+    // Re-selecting the file being edited (after a sync, say) keeps the buffer.
+    const unsaved =
+      dirty && details && details.peer === peer.key && details.path === entry?.path
+        ? details.text
+        : null;
+    dirty = unsaved !== null;
+
+    if (!entry) {
+      selection = null;
+      details = null;
+      detailToken++;
+      await render();
+      return;
+    }
+    selection = { peer: peer.key, path: entry.path, kind: entry.kind };
+    const token = ++detailToken;
+    // Paint the row highlight straight away; the checksum arrives after.
+    renderTabs();
+    renderSidebar();
+    if (!dirty) detailsEl.replaceChildren(el('div', 'vfs-details-inner', 'Reading…'));
+    const loaded = await loadDetails(peer, selection);
+    if (token !== detailToken) return;
+    if (unsaved !== null) loaded.text = unsaved;
+    details = loaded;
+    renderDetails();
+    renderFooter();
   }
 
-  async function load(peer: Peer, path: string): Promise<void> {
-    selection = { peer: peer.key, path };
-    contentEl.value = decoder.decode(await peer.node.read(path));
-    contentEl.disabled = false;
-    saveButton.disabled = false;
-    editorTitle.textContent = `${peer.label} / ${path}`;
+  async function loadDetails(peer: Peer, current: Selection): Promise<Details> {
+    const snapshot = snapshotOf(peer.key);
+    const mime = mimeOf(current.path);
+    const detail: Details = {
+      peer: peer.key,
+      path: current.path,
+      kind: current.kind,
+      stat: null,
+      mime,
+      hash: null,
+      entry: snapshot.tracked.get(current.path),
+      across: [],
+      text: null,
+      count: 0,
+      bytes: 0,
+    };
+
+    if (current.kind === 'directory') {
+      const inside = snapshot.files.filter((file) => file.path.startsWith(`${current.path}/`));
+      detail.count = inside.length;
+      detail.bytes = inside.reduce((total, file) => total + file.stat.size, 0);
+      detail.across = peers
+        .filter((other) => other.key !== peer.key)
+        .map((other) => {
+          const files = snapshotOf(other.key).files.filter((file) =>
+            file.path.startsWith(`${current.path}/`),
+          );
+          if (files.length === 0) {
+            return { ...tag(other), state: 'missing' as const, detail: 'not here' };
+          }
+          const same = files.length === inside.length;
+          return {
+            ...tag(other),
+            state: same ? ('same' as const) : ('differs' as const),
+            detail: `${files.length} item${files.length === 1 ? '' : 's'}`,
+          };
+        });
+      return detail;
+    }
+
+    detail.stat = await peer.adapter.stat(current.path);
+    if (!detail.stat) return detail;
+
+    detail.hash = await hashOf(peer, current.path, detail.stat.size);
+    if (isTextMime(mime) && detail.stat.size <= EDIT_LIMIT) {
+      detail.text = decoder.decode(await peer.node.read(current.path));
+    }
+
+    for (const other of peers) {
+      if (other.key === peer.key) continue;
+      detail.across.push(await compare(other, current.path, detail));
+    }
+    return detail;
   }
 
-  async function save(): Promise<void> {
-    const peer = peers.find((p) => p.key === selection?.peer);
-    if (!selection || !peer) return;
-    await peer.node.write(selection.path, encoder.encode(contentEl.value));
-    log(`saved ${selection.path} on ${peer.label}`);
+  function tag(peer: Peer): { key: string; label: string; backend: Backend } {
+    return { key: peer.key, label: peer.label, backend: peer.backend };
+  }
+
+  async function compare(other: Peer, path: string, detail: Details): Promise<Across> {
+    const stat = await other.adapter.stat(path);
+    if (!stat || stat.kind !== 'file') {
+      return { ...tag(other), state: 'missing', detail: 'not here' };
+    }
+    if (stat.size > COMPARE_LIMIT || detail.hash === null) {
+      const same = stat.size === detail.stat?.size;
+      return {
+        ...tag(other),
+        state: 'unknown',
+        detail: same ? `same size, ${formatAgo(stat.mtime)}` : formatBytes(stat.size),
+      };
+    }
+    const hash = await hashOf(other, path, stat.size);
+    if (hash === detail.hash) return { ...tag(other), state: 'same', detail: 'identical' };
+    const newer = detail.stat && stat.mtime > detail.stat.mtime;
+    return {
+      ...tag(other),
+      state: 'differs',
+      detail: `${newer ? 'newer' : 'older'} · ${formatAgo(stat.mtime)}`,
+    };
+  }
+
+  /** Small files hash from bytes; big ones stream so nothing is held whole. */
+  async function hashOf(peer: Peer, path: string, size: number): Promise<Hash | null> {
+    try {
+      if (size > STREAM_HASH_OVER) return await sha256Stream(await peer.node.readStream(path));
+      return await sha256(await peer.node.read(path));
+    } catch {
+      return null;
+    }
+  }
+
+  async function write(peer: Peer, path: string, text: string): Promise<void> {
+    await peer.node.write(path, encoder.encode(text));
+    dirty = false;
+    log(`saved ${path} on ${peer.label}`, 'ok');
     await render();
+    await select(peer, { path, kind: 'file' });
   }
 
   async function newFile(peer: Peer): Promise<void> {
@@ -517,7 +1064,8 @@ export function mountExplorer(
     if (!name) return;
     await peer.node.write(name, encoder.encode(''));
     log(`created ${name} on ${peer.label}`);
-    await openFile(peer, name);
+    await render();
+    await select(peer, { path: name, kind: 'file' });
   }
 
   async function renameFile(peer: Peer, path: string): Promise<void> {
@@ -527,79 +1075,61 @@ export function mountExplorer(
     // intent and travels as a rename rather than as delete + create.
     await peer.node.rename(path, name);
     log(`renamed ${path} → ${name} on ${peer.label}`);
-    if (selection?.peer === peer.key && selection.path === path) {
-      selection = { peer: peer.key, path: name };
-    }
     await render();
+    await select(peer, { path: name, kind: 'file' });
   }
 
   async function deleteFile(peer: Peer, path: string): Promise<void> {
+    if (!confirm(`Delete ${path} from ${peer.label}?`)) return;
     await peer.node.delete(path);
-    if (selection?.peer === peer.key && selection.path === path) clearSelection();
     log(`deleted ${path} on ${peer.label}`);
     await render();
-  }
-
-  function clearSelection(): void {
-    selection = null;
-    contentEl.value = '';
-    contentEl.disabled = true;
-    saveButton.disabled = true;
-    editorTitle.textContent = 'Select a file to edit';
+    await select(peer, null);
   }
 
   // -------------------------------------------------------------------- sync
 
-  async function syncEdge(index: number): Promise<void> {
-    const edge = edges[index];
-    if (!edge || syncing) return;
+  /** Syncs the open root against the footer's target — or the whole chain. */
+  async function syncTarget(): Promise<void> {
+    if (syncTargetKey === ALL_ROOTS || syncTargetKey === active) return syncAll();
+    const a = activePeer();
+    const b = peerOf(syncTargetKey);
+    if (!a || !b || syncing) return;
     syncing = true;
+    renderFooter();
     try {
-      const result = await sync(edge.a, edge.b);
-      report(`${edge.a.name} ⇄ ${edge.b.name}`, result.changed, result.conflicts, result.transferred);
+      const result = await sync(a.node, b.node);
+      const moved = result.transferred.toA + result.transferred.toB;
+      if (!result.changed) log(`${a.label} ⇄ ${b.label}: already in sync`);
+      else log(`${a.label} ⇄ ${b.label}: merged, ${moved} blob(s) moved`, 'ok');
+      for (const conflict of result.conflicts) logConflict(conflict);
+      lastSyncAt = Date.now();
     } catch (error) {
       log(String(error), 'warn');
     } finally {
       syncing = false;
-      await refreshSelection();
-      await render();
+      await reselect();
     }
   }
 
   async function syncAll(): Promise<void> {
     if (syncing || edges.length === 0) return;
     syncing = true;
+    renderFooter();
     try {
       const rounds = await syncUntilStable(edges);
       const changed = rounds.flat().filter((r) => r.result.changed);
       const conflicts = rounds.flat().flatMap((r) => r.result.conflicts);
-      if (changed.length === 0) {
-        log('already in sync');
-      } else {
-        log(`converged in ${rounds.length} round(s), ${changed.length} edge update(s)`, 'ok');
-      }
+      if (changed.length === 0) log('every root already in sync');
+      else log(`converged in ${rounds.length} round(s), ${changed.length} edge update(s)`, 'ok');
       for (const conflict of conflicts) logConflict(conflict);
+      lastSyncAt = Date.now();
     } catch (error) {
       log(String(error), 'warn');
     } finally {
       syncing = false;
-      await refreshSelection();
-      await render();
+      await reselect();
     }
-  }
-
-  function report(
-    edge: string,
-    changed: boolean,
-    conflicts: ConflictReport[],
-    transferred: { toA: number; toB: number },
-  ): void {
-    if (!changed) {
-      log(`${edge}: nothing to do`);
-      return;
-    }
-    log(`${edge}: merged (${transferred.toA + transferred.toB} blob(s) moved)`, 'ok');
-    for (const conflict of conflicts) logConflict(conflict);
   }
 
   function logConflict(conflict: ConflictReport): void {
@@ -612,18 +1142,19 @@ export function mountExplorer(
     );
   }
 
-  /** The selected file may have been rewritten or removed by a sync. */
-  async function refreshSelection(): Promise<void> {
-    const peer = peers.find((p) => p.key === selection?.peer);
+  /** A sync may have rewritten or removed whatever was selected. */
+  async function reselect(): Promise<void> {
+    await render();
+    const peer = peerOf(selection?.peer);
     if (!selection || !peer) return;
     const stat = await peer.adapter.stat(selection.path);
-    if (!stat) return clearSelection();
-    contentEl.value = decoder.decode(await peer.node.read(selection.path));
+    if (!stat) await select(peer, null);
+    else await select(peer, { path: selection.path, kind: selection.kind });
   }
 
   function setAutoSync(on: boolean): void {
     if (autoTimer) clearInterval(autoTimer);
-    autoTimer = on ? setInterval(() => void syncAll(), autoSyncMs) : undefined;
+    autoTimer = on ? setInterval(() => void syncTarget(), autoSyncMs) : undefined;
     autoSyncBox.checked = on;
   }
 
@@ -638,7 +1169,7 @@ export function mountExplorer(
       }
       const label = adapter.name || 'local';
       const peer = await addPeer(`local-${peers.length}`, label, adapter, 'local folder', adapter);
-      log(`added ${label} as a peer at the end of the chain`, 'ok');
+      log(`opened ${label} as another root`, 'ok');
       await activate(peer);
     } catch (error) {
       if ((error as DOMException)?.name !== 'AbortError') log(String(error), 'warn');
@@ -656,7 +1187,7 @@ export function mountExplorer(
    * Starts over in place. An embedded app cannot reload the host page, so it
    * drops the OPFS folder and boots a fresh chain into the same element.
    */
-  async function reset(): Promise<void> {
+  async function reset$(): Promise<void> {
     if (!confirm('Delete every folder this explorer owns and start over?')) return;
     if (isOPFSAvailable()) {
       try {
@@ -669,26 +1200,38 @@ export function mountExplorer(
     peers.length = 0;
     edges = [];
     active = '';
-    clearSelection();
+    selection = null;
+    details = null;
+    lastSyncAt = null;
+    setAutoSync(false);
     tabsEl.replaceChildren();
-    panelEl.replaceChildren();
+    sidebarEl.replaceChildren();
+    detailsEl.replaceChildren();
     log('reset', 'ok');
     await boot();
   }
 
   function log(message: string, kind: LogKind = 'info'): void {
     options.onLog?.(message, kind);
+    lastMessage = message;
+    lastKind = kind;
+    if (!logOpen) logCount++;
     const item = el('li', `vfs-${kind}`);
-    item.append(el('time', undefined, new Date().toLocaleTimeString()), el('span', undefined, message));
+    item.append(
+      el('time', undefined, new Date().toLocaleTimeString()),
+      el('span', undefined, message),
+    );
     logList.prepend(item);
     while (logList.childElementCount > 100) logList.lastElementChild?.remove();
+    renderFooter();
   }
 
-  clearSelection();
+  renderFooter();
   void boot();
 
   return {
     element: shell,
+    syncTarget,
     syncAll,
     refresh: render,
     destroy(): void {

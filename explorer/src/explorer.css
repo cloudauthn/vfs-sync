@@ -2,10 +2,11 @@
  * Everything is scoped under .vfs-explorer and every rule names its own
  * element, so the app can be dropped into a page whose styles it knows
  * nothing about. Colours come from --vfs-* custom properties: set them on any
- * ancestor to theme the app from the host.
+ * ancestor to theme the app from the host, and --vfs-height to resize it.
  */
 
 .vfs-explorer {
+  --vfs-chrome: #10151c;
   --vfs-panel: #161b22;
   --vfs-panel-2: #1c232d;
   --vfs-line: #2a323d;
@@ -18,13 +19,22 @@
   --vfs-radius: 10px;
   --vfs-mono: ui-monospace, SFMono-Regular, Menlo, monospace;
 
+  display: flex;
+  flex-direction: column;
+  height: var(--vfs-height, 660px);
+  min-height: 420px;
+  overflow: hidden;
   color: var(--vfs-text);
-  font: 15px/1.55 ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+  background: var(--vfs-panel);
+  border: 1px solid var(--vfs-line);
+  border-radius: var(--vfs-radius);
+  font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
   color-scheme: dark;
 }
 
 @media (prefers-color-scheme: light) {
   .vfs-explorer {
+    --vfs-chrome: #e8ecf1;
     --vfs-panel: #ffffff;
     --vfs-panel-2: #f0f3f7;
     --vfs-line: #d9e0e8;
@@ -44,20 +54,23 @@
   box-sizing: border-box;
 }
 
-.vfs-explorer h2 {
+.vfs-explorer h3 {
   margin: 0;
-  font-size: 15px;
+  font-size: 11px;
   font-weight: 650;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--vfs-muted);
 }
 
 .vfs-explorer button {
   font: inherit;
-  font-size: 13px;
+  font-size: 12.5px;
   color: var(--vfs-text);
   background: var(--vfs-panel-2);
   border: 1px solid var(--vfs-line);
-  border-radius: 8px;
-  padding: 6px 11px;
+  border-radius: 7px;
+  padding: 4px 10px;
   cursor: pointer;
 }
 
@@ -77,80 +90,55 @@
   font-weight: 600;
 }
 
-.vfs-explorer button.vfs-danger:hover {
-  border-color: var(--vfs-conflict);
-  color: var(--vfs-conflict);
-}
-
-/* --------------------------------------------------------------- toolbar */
-
-.vfs-explorer .vfs-toolbar {
-  display: flex;
-  gap: 12px;
-  align-items: center;
-  flex-wrap: wrap;
-  padding: 12px;
-  background: var(--vfs-panel);
-  border: 1px solid var(--vfs-line);
-  border-radius: var(--vfs-radius);
-  margin-bottom: 18px;
-}
-
-.vfs-explorer .vfs-switch {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 13px;
+.vfs-explorer button.vfs-ghost {
+  background: none;
+  border-color: transparent;
   color: var(--vfs-muted);
 }
 
-.vfs-explorer .vfs-badge {
-  font-size: 11px;
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-  color: var(--vfs-muted);
+.vfs-explorer button.vfs-ghost:hover:not(:disabled) {
+  color: var(--vfs-text);
   background: var(--vfs-panel-2);
-  border: 1px solid var(--vfs-line);
-  border-radius: 999px;
-  padding: 2px 9px;
+  border-color: var(--vfs-line);
 }
 
-/* -------------------------------------------------------------- explorer */
-
-.vfs-explorer .vfs-main {
-  background: var(--vfs-panel);
-  border: 1px solid var(--vfs-line);
-  border-radius: var(--vfs-radius);
-  overflow: hidden;
+.vfs-explorer button.vfs-danger:hover:not(:disabled) {
+  color: var(--vfs-conflict);
+  border-color: var(--vfs-conflict);
 }
+
+/* ------------------------------------------------------------------ tabs */
 
 .vfs-explorer .vfs-tabs {
   display: flex;
   align-items: stretch;
-  gap: 2px;
+  gap: 1px;
   padding: 6px 6px 0;
-  background: var(--vfs-panel-2);
+  background: var(--vfs-chrome);
   border-bottom: 1px solid var(--vfs-line);
   overflow-x: auto;
+  scrollbar-width: thin;
 }
 
 .vfs-explorer .vfs-tab {
-  flex: 1 1 0;
-  min-width: 150px;
+  flex: 0 1 190px;
+  min-width: 130px;
   display: flex;
   flex-direction: column;
   align-items: flex-start;
-  gap: 4px;
-  padding: 9px 12px;
+  gap: 1px;
+  padding: 7px 12px 8px;
   background: none;
   border: 1px solid transparent;
   border-bottom: none;
-  border-radius: var(--vfs-radius) var(--vfs-radius) 0 0;
+  border-radius: 8px 8px 0 0;
   text-align: left;
+  white-space: nowrap;
 }
 
 .vfs-explorer .vfs-tab:hover:not(:disabled) {
-  background: var(--vfs-panel);
+  background: color-mix(in srgb, var(--vfs-panel) 60%, transparent);
+  border-color: transparent;
 }
 
 .vfs-explorer .vfs-tab.vfs-active {
@@ -159,80 +147,169 @@
   box-shadow: inset 0 2px 0 var(--vfs-accent);
 }
 
-.vfs-explorer .vfs-tab-name {
-  font-weight: 600;
-  font-size: 13.5px;
-  white-space: nowrap;
-}
-
-.vfs-explorer .vfs-tab-meta {
+.vfs-explorer .vfs-tab-title {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 7px;
   min-width: 0;
 }
 
-.vfs-explorer .vfs-tab.vfs-add .vfs-tab-name {
-  color: var(--vfs-muted);
-}
-
-/* the sync handle sitting between two tabs */
-.vfs-explorer .vfs-edge {
-  align-self: center;
-  flex: 0 0 auto;
-  padding: 4px 8px;
-  margin-bottom: 6px;
-  background: none;
-  border: none;
-  color: var(--vfs-muted);
-  font-size: 15px;
-}
-
-.vfs-explorer .vfs-edge:hover {
-  color: var(--vfs-accent);
-  border: none;
-}
-
-.vfs-explorer .vfs-panel-head {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 13px 14px;
-  border-bottom: 1px solid var(--vfs-line);
-}
-
-.vfs-explorer .vfs-blurb {
-  margin: 5px 0 0;
-  color: var(--vfs-muted);
+.vfs-explorer .vfs-tab-name {
+  font-weight: 600;
   font-size: 13px;
-  max-width: 70ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
-.vfs-explorer .vfs-tree {
-  list-style: none;
-  margin: 0;
-  padding: 6px;
-  min-height: 150px;
+.vfs-explorer .vfs-tab-icon {
+  font-size: 13px;
+  line-height: 1;
 }
 
-.vfs-explorer .vfs-row {
-  display: flex;
+.vfs-explorer .vfs-tab-meta {
+  font-size: 11px;
+  color: var(--vfs-muted);
+  padding-left: 20px;
+}
+
+.vfs-explorer .vfs-tab.vfs-add {
+  flex: 0 0 auto;
+  align-self: center;
+  flex-direction: row;
   align-items: center;
-  gap: 2px;
+  gap: 6px;
+  margin-bottom: 6px;
   border-radius: 7px;
+  color: var(--vfs-muted);
 }
 
-.vfs-explorer .vfs-row:hover {
+/* ------------------------------------------------------------------ body */
+
+.vfs-explorer .vfs-body {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: minmax(190px, 290px) minmax(0, 1fr);
+}
+
+.vfs-explorer .vfs-sidebar {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  border-right: 1px solid var(--vfs-line);
   background: var(--vfs-panel-2);
 }
 
+.vfs-explorer .vfs-sidebar-head,
+.vfs-explorer .vfs-sidebar-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 8px;
+  font-size: 11.5px;
+  color: var(--vfs-muted);
+}
+
+.vfs-explorer .vfs-sidebar-head {
+  border-bottom: 1px solid var(--vfs-line);
+}
+
+.vfs-explorer .vfs-sidebar-foot {
+  border-top: 1px solid var(--vfs-line);
+}
+
+.vfs-explorer .vfs-crumbs {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: none;
+  border: none;
+  padding: 3px 6px;
+  font-weight: 600;
+  font-size: 12.5px;
+  color: var(--vfs-text);
+  min-width: 0;
+}
+
+.vfs-explorer .vfs-crumbs:hover {
+  background: var(--vfs-panel);
+  border-color: transparent;
+}
+
+.vfs-explorer .vfs-tree {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  list-style: none;
+  margin: 0;
+  padding: 4px 4px 10px;
+  scrollbar-width: thin;
+}
+
+.vfs-explorer .vfs-row {
+  border-radius: 6px;
+}
+
+.vfs-explorer .vfs-row:hover {
+  background: color-mix(in srgb, var(--vfs-accent) 12%, transparent);
+}
+
 .vfs-explorer .vfs-row.vfs-selected {
-  outline: 1px solid var(--vfs-accent);
+  background: color-mix(in srgb, var(--vfs-accent) 22%, transparent);
+  box-shadow: inset 0 0 0 1px var(--vfs-accent);
+}
+
+.vfs-explorer button.vfs-entry {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: none;
+  border: none;
+  border-radius: 6px;
+  padding: 4px 8px 4px 6px;
+  text-align: left;
+  min-width: 0;
+}
+
+.vfs-explorer button.vfs-entry:hover {
+  border-color: transparent;
+}
+
+.vfs-explorer .vfs-twisty {
+  flex: 0 0 12px;
+  color: var(--vfs-muted);
+  font-size: 10px;
+  text-align: center;
+}
+
+.vfs-explorer .vfs-icon-cell {
+  flex: 0 0 auto;
+  font-size: 12px;
+  line-height: 1;
+}
+
+.vfs-explorer .vfs-name {
+  flex: 1;
+  min-width: 0;
+  font-family: var(--vfs-mono);
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.vfs-explorer .vfs-meta {
+  flex: 0 0 auto;
+  font-size: 10.5px;
+  color: var(--vfs-muted);
+  font-variant-numeric: tabular-nums;
 }
 
 .vfs-explorer .vfs-row.vfs-dir .vfs-name {
-  color: var(--vfs-muted);
+  font-family: inherit;
+  font-size: 12.5px;
 }
 
 .vfs-explorer .vfs-row.vfs-conflict .vfs-name {
@@ -241,159 +318,401 @@
 
 .vfs-explorer li.vfs-empty {
   color: var(--vfs-muted);
-  font-size: 13px;
-  padding: 14px 9px;
+  font-size: 12px;
+  padding: 18px 10px;
   text-align: center;
 }
 
-.vfs-explorer .vfs-panel-actions {
+/* --------------------------------------------------------------- details */
+
+.vfs-explorer .vfs-details,
+.vfs-explorer .vfs-details-inner {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  flex: 1;
+  overflow: hidden;
+}
+
+.vfs-explorer .vfs-details-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 9px 12px;
+  border-bottom: 1px solid var(--vfs-line);
+}
+
+.vfs-explorer .vfs-details-title {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 9px 12px;
-  border-top: 1px solid var(--vfs-line);
-}
-
-.vfs-explorer .vfs-hint {
-  margin-left: auto;
-  color: var(--vfs-muted);
-  font-size: 12px;
-}
-
-.vfs-explorer button.vfs-file {
-  flex: 1;
-  display: flex;
-  justify-content: space-between;
-  gap: 10px;
-  background: none;
-  border: none;
-  text-align: left;
-  padding: 7px 9px;
   min-width: 0;
 }
 
-.vfs-explorer button.vfs-file .vfs-name {
-  font-family: var(--vfs-mono);
-  font-size: 12.5px;
+.vfs-explorer .vfs-details-icon {
+  font-size: 16px;
+  line-height: 1;
+}
+
+.vfs-explorer .vfs-details-name {
+  font-weight: 650;
+  font-size: 13.5px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.vfs-explorer button.vfs-file .vfs-size {
-  color: var(--vfs-muted);
-  font-size: 11px;
+.vfs-explorer .vfs-details-actions {
+  display: flex;
+  gap: 4px;
   flex: 0 0 auto;
 }
 
-.vfs-explorer button.vfs-icon {
-  background: none;
-  border: none;
-  color: var(--vfs-muted);
-  padding: 4px 7px;
+.vfs-explorer .vfs-details-body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  scrollbar-width: thin;
 }
 
-.vfs-explorer button.vfs-icon:hover {
-  color: var(--vfs-text);
+.vfs-explorer .vfs-section {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
 }
 
-.vfs-explorer .vfs-commit {
-  font-family: var(--vfs-mono);
-  font-size: 11px;
-  color: var(--vfs-muted);
-}
-
-/* ------------------------------------------------------------- workbench */
-
-.vfs-explorer .vfs-workbench {
+.vfs-explorer .vfs-props {
   display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 16px;
-  margin-top: 18px;
+  grid-template-columns: minmax(90px, max-content) minmax(0, 1fr);
+  gap: 3px 14px;
+  margin: 0;
+  font-size: 12.5px;
 }
 
-.vfs-explorer .vfs-workbench.vfs-single {
-  grid-template-columns: 1fr;
+.vfs-explorer .vfs-props dt {
+  color: var(--vfs-muted);
 }
 
-@media (max-width: 860px) {
-  .vfs-explorer .vfs-workbench {
-    grid-template-columns: 1fr;
+.vfs-explorer .vfs-props dd {
+  margin: 0;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.vfs-explorer .vfs-hash {
+  font-family: var(--vfs-mono);
+  font-size: 11.5px;
+  line-height: 1.45;
+  word-break: break-all;
+  background: var(--vfs-panel-2);
+  border: 1px solid var(--vfs-line);
+  border-radius: 7px;
+  padding: 7px 9px;
+  color: var(--vfs-accent);
+}
+
+.vfs-explorer .vfs-blurb,
+.vfs-explorer .vfs-hint {
+  margin: 0;
+  color: var(--vfs-muted);
+  font-size: 12px;
+  max-width: 68ch;
+}
+
+/* the same path, as it stands on the other roots */
+
+.vfs-explorer .vfs-across {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.vfs-explorer .vfs-across-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12.5px;
+  padding: 4px 8px;
+  border-radius: 6px;
+  background: var(--vfs-panel-2);
+}
+
+.vfs-explorer .vfs-across-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.vfs-explorer .vfs-across-state {
+  color: var(--vfs-muted);
+  font-size: 11.5px;
+}
+
+.vfs-explorer .vfs-dot {
+  flex: 0 0 auto;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--vfs-muted);
+}
+
+.vfs-explorer .vfs-state-same .vfs-dot,
+.vfs-explorer .vfs-dot-ok {
+  background: var(--vfs-ok);
+}
+
+.vfs-explorer .vfs-state-differs .vfs-dot,
+.vfs-explorer .vfs-dot-warn {
+  background: var(--vfs-warn);
+}
+
+.vfs-explorer .vfs-state-missing .vfs-dot {
+  background: var(--vfs-conflict);
+}
+
+.vfs-explorer .vfs-dot-busy {
+  background: var(--vfs-accent);
+  animation: vfs-pulse 1s ease-in-out infinite;
+}
+
+@keyframes vfs-pulse {
+  50% {
+    opacity: 0.25;
   }
 }
 
-.vfs-explorer .vfs-editor,
-.vfs-explorer .vfs-log {
-  background: var(--vfs-panel);
-  border: 1px solid var(--vfs-line);
-  border-radius: var(--vfs-radius);
-  display: flex;
-  flex-direction: column;
-  min-height: 260px;
+@media (prefers-reduced-motion: reduce) {
+  .vfs-explorer .vfs-dot-busy {
+    animation: none;
+  }
 }
 
-.vfs-explorer .vfs-editor-head,
-.vfs-explorer .vfs-log-head {
+/* ---------------------------------------------------------------- editor */
+
+.vfs-explorer .vfs-editor {
+  flex: 1;
+  min-height: 200px;
+}
+
+.vfs-explorer .vfs-editor-head {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 10px;
-  padding: 10px 13px;
-  border-bottom: 1px solid var(--vfs-line);
-  font-size: 13px;
-}
-
-.vfs-explorer .vfs-editor-title {
-  font-family: var(--vfs-mono);
-  font-size: 12.5px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 
 .vfs-explorer textarea {
   flex: 1;
+  min-height: 170px;
   resize: vertical;
-  border: none;
-  background: none;
+  background: var(--vfs-panel-2);
   color: inherit;
-  padding: 12px 13px;
+  border: 1px solid var(--vfs-line);
+  border-radius: 8px;
+  padding: 10px 11px;
   font-family: var(--vfs-mono);
-  font-size: 13px;
+  font-size: 12.5px;
   line-height: 1.6;
   outline: none;
 }
 
-.vfs-explorer .vfs-log ol {
+.vfs-explorer textarea:focus {
+  border-color: var(--vfs-accent);
+}
+
+/* ---------------------------------------------------------------- drawer */
+
+.vfs-explorer .vfs-drawer[hidden] {
+  display: none;
+}
+
+.vfs-explorer .vfs-drawer {
+  border-top: 1px solid var(--vfs-line);
+  background: var(--vfs-panel-2);
+  max-height: 190px;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.vfs-explorer .vfs-drawer-panel {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.vfs-explorer .vfs-drawer-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 5px 8px 5px 12px;
+  border-bottom: 1px solid var(--vfs-line);
+}
+
+.vfs-explorer .vfs-drawer-title {
+  font-size: 11px;
+  font-weight: 650;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--vfs-muted);
+}
+
+.vfs-explorer .vfs-drawer-actions {
+  display: flex;
+  gap: 2px;
+}
+
+.vfs-explorer .vfs-drawer ol {
   list-style: none;
   margin: 0;
-  padding: 6px 0;
-  flex: 1;
+  padding: 5px 0;
   overflow-y: auto;
-  max-height: 320px;
+  min-height: 0;
+  scrollbar-width: thin;
 }
 
-.vfs-explorer .vfs-log li {
+.vfs-explorer .vfs-drawer li {
   display: flex;
   gap: 10px;
-  padding: 4px 13px;
-  font-size: 12.5px;
+  padding: 2px 12px;
+  font-size: 12px;
 }
 
-.vfs-explorer .vfs-log time {
+.vfs-explorer .vfs-drawer time {
   color: var(--vfs-muted);
   font-variant-numeric: tabular-nums;
   flex: 0 0 auto;
 }
 
-.vfs-explorer .vfs-log li.vfs-ok span {
+.vfs-explorer .vfs-drawer li.vfs-ok span {
   color: var(--vfs-ok);
 }
 
-.vfs-explorer .vfs-log li.vfs-warn span {
+.vfs-explorer .vfs-drawer li.vfs-warn span {
   color: var(--vfs-warn);
 }
 
-.vfs-explorer .vfs-log li.vfs-conflict span {
+.vfs-explorer .vfs-drawer li.vfs-conflict span {
   color: var(--vfs-conflict);
+}
+
+/* ---------------------------------------------------------------- footer */
+
+.vfs-explorer .vfs-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 5px 10px;
+  background: var(--vfs-chrome);
+  border-top: 1px solid var(--vfs-line);
+  font-size: 11.5px;
+  color: var(--vfs-muted);
+}
+
+.vfs-explorer .vfs-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  flex: 1 1 260px;
+}
+
+.vfs-explorer .vfs-status-text {
+  color: var(--vfs-text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 44ch;
+}
+
+.vfs-explorer .vfs-status-bit {
+  flex: 0 0 auto;
+  padding-left: 8px;
+  border-left: 1px solid var(--vfs-line);
+  white-space: nowrap;
+}
+
+.vfs-explorer .vfs-status button {
+  margin-left: auto;
+  flex: 0 0 auto;
+  font-size: 11.5px;
+  padding: 2px 8px;
+}
+
+.vfs-explorer .vfs-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 0 0 auto;
+}
+
+.vfs-explorer .vfs-controls-label {
+  white-space: nowrap;
+}
+
+.vfs-explorer select.vfs-target {
+  font: inherit;
+  font-size: 11.5px;
+  color: var(--vfs-text);
+  background: var(--vfs-panel-2);
+  border: 1px solid var(--vfs-line);
+  border-radius: 7px;
+  padding: 3px 6px;
+  max-width: 180px;
+}
+
+.vfs-explorer .vfs-controls button {
+  font-size: 11.5px;
+  padding: 3px 10px;
+}
+
+.vfs-explorer .vfs-switch {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+/* --------------------------------------------------------------- narrow */
+
+@media (max-width: 720px) {
+  .vfs-explorer {
+    height: var(--vfs-height, 760px);
+  }
+
+  .vfs-explorer .vfs-body {
+    grid-template-columns: 1fr;
+    grid-template-rows: minmax(120px, 40%) minmax(0, 1fr);
+  }
+
+  .vfs-explorer .vfs-sidebar {
+    border-right: none;
+    border-bottom: 1px solid var(--vfs-line);
+  }
+
+  .vfs-explorer .vfs-footer {
+    align-items: stretch;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .vfs-explorer .vfs-controls {
+    flex-wrap: wrap;
+  }
 }
