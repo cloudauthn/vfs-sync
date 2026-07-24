@@ -1,5 +1,6 @@
 import { isInside, normalizePath } from '../path.js';
-import type { VFSAdapter, VFSListEntry, VFSStat } from '../types.js';
+import { chunked, concat } from '../stream.js';
+import type { ByteRange, VFSAdapter, VFSListEntry, VFSStat } from '../types.js';
 
 export interface MemoryAdapterOptions {
   /**
@@ -69,6 +70,32 @@ export class MemoryAdapter implements VFSAdapter {
     for (const key of [...this.entries.keys()]) {
       if (key === target || key.startsWith(`${target}/`)) this.entries.delete(key);
     }
+  }
+
+  // Streaming here can never save memory — the file *is* memory. It exists so
+  // that the engine's streaming paths are exercised by the adapter the tests
+  // run on, and so range reads stay cheap.
+
+  async readRange(path: string, range: ByteRange = {}): Promise<Uint8Array> {
+    const entry = this.entries.get(normalizePath(path));
+    if (!entry) throw new Error(`ENOENT: ${path}`);
+    return entry.data.slice(range.start ?? 0, range.end ?? entry.data.byteLength);
+  }
+
+  async readStream(path: string, range: ByteRange = {}): Promise<ReadableStream<Uint8Array>> {
+    return chunked(await this.readRange(path, range));
+  }
+
+  async writeStream(path: string): Promise<WritableStream<Uint8Array>> {
+    const chunks: Uint8Array[] = [];
+    return new WritableStream<Uint8Array>({
+      write: (chunk) => {
+        chunks.push(chunk.slice());
+      },
+      close: async () => {
+        await this.write(path, concat(chunks));
+      },
+    });
   }
 
   async rename(oldPath: string, newPath: string): Promise<void> {

@@ -52,6 +52,33 @@ the file's identity and transferring no content. Renaming through the adapter di
 
 `node.name` is the adapter's label; `node.id` is the peer id.
 
+### Partial reads and streams
+
+`read`/`write` hold a whole file in memory. For files where that is not acceptable — or when only a
+few bytes are wanted — there are three more:
+
+```ts
+const stat = await node.stat('track.mp3');
+
+// [start, end), end exclusive, both optional
+const header = await node.readRange('track.mp3', { end: 10 });
+const trailer = await node.readRange('track.mp3', { start: stat.size - 128 });
+
+const reading = await node.readStream('movie.mkv');           // ReadableStream<Uint8Array>
+const writing = await node.writeStream('copy.mkv');           // WritableStream<Uint8Array>
+await reading.pipeTo(writing);
+```
+
+`readRange` is the interesting one: on OPFS, FSA and Node it seeks, so reading an ID3 tag out of a
+200 MB track costs a few hundred bytes rather than 200 MB. See
+[Reading a file header](./recipes.md#reading-a-file-header) for a worked example.
+
+Backends that do not implement these get them emulated on top of `read`/`write`, so the calls are
+always available — just not always cheap. `canStream(adapter)` tells you which you have.
+
+Writes through `writeStream` are ordinary working-folder writes: `commit()` afterwards to snapshot
+them.
+
 ### `node.scan()`
 
 Snapshots the working folder into a tree without committing. Files whose `mtime` and `size` still
@@ -238,7 +265,7 @@ the whole subtree.
 
 ```ts
 import {
-  sha256, hashJSON, canonicalJSON, randomId,
+  sha256, sha256Stream, Sha256, hashJSON, canonicalJSON, randomId,
   normalizePath, joinPath, dirname, basename, splitExtension,
   canonicalTree, EMPTY_TREE, CONTROL_DIR,
 } from '@cloudauthn/vfs-sync';
@@ -251,6 +278,36 @@ splitExtension('archive.tar.gz');       // ['archive.tar', '.gz']
 
 `sha256` needs Web Crypto, which in browsers means a secure context. It throws with an explicit
 message rather than failing obscurely if `crypto.subtle` is missing.
+
+`sha256Stream(stream)` and the `Sha256` class are the incremental form, for content too big to
+hold. They produce the identical digest — `crypto.subtle.digest` is one-shot, so streaming needs
+its own implementation, and the two are checked against each other at every block boundary in
+`test/sha256.test.ts`.
+
+```ts
+const hasher = new Sha256();
+for await (const chunk of chunks) hasher.update(chunk);
+hasher.digest();                        // same hex as sha256(whole)
+```
+
+### Stream helpers
+
+```ts
+import {
+  readRange, readStream, writeStream, canStream,
+  collect, concat, chunked, pump,
+  CHUNK_SIZE, STREAM_THRESHOLD,
+} from '@cloudauthn/vfs-sync';
+
+await readRange(adapter, 'track.mp3', { start: 0, end: 10 });
+await collect(await readStream(adapter, 'notes.md'));   // stream -> Uint8Array
+chunked(bytes, 4096);                                    // Uint8Array -> stream
+await pump(source, target, (chunk) => hasher.update(chunk));
+```
+
+These take an adapter rather than a node, and each falls back to `read`/`write` when the backend
+has no native implementation. `pump` is `pipeTo` with a per-chunk hook, and works against wrapped
+writables that are not real `WritableStream`s.
 
 ---
 

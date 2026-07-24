@@ -1,4 +1,15 @@
-import { decodeJSON, decodeText, encodeJSON, encodeText, hashJSON, randomId, sha256 } from './hash.js';
+import {
+  decodeJSON,
+  decodeText,
+  encodeJSON,
+  encodeText,
+  hashJSON,
+  randomId,
+  sha256,
+  sha256Stream,
+} from './hash.js';
+import { Sha256 } from './sha256.js';
+import { pump, readStream, writeStream } from './stream.js';
 import type { Commit, Hash, HashCache, NodeConfig, Tree, VFSAdapter } from './types.js';
 
 /** Name of the control folder that lives inside every synced folder. */
@@ -114,6 +125,65 @@ export class VFSStore {
   async putObjectAt(hash: Hash, data: Uint8Array): Promise<void> {
     if (await this.hasObject(hash)) return;
     await this.adapter.write(this.objectPath(hash), data);
+  }
+
+  /** Size on disk of a stored blob, or 0 when it is not here. */
+  async objectSize(hash: Hash): Promise<number> {
+    return (await this.adapter.stat(this.objectPath(hash)))?.size ?? 0;
+  }
+
+  async getObjectStream(hash: Hash): Promise<ReadableStream<Uint8Array>> {
+    if (!(await this.hasObject(hash))) {
+      throw new Error(`missing object ${hash} in ${this.adapter.name}`);
+    }
+    return readStream(this.adapter, this.objectPath(hash));
+  }
+
+  /**
+   * Streams a blob whose hash is already known straight to its content address,
+   * digesting on the way past. Because the destination path is known up front
+   * there is no staging file and no rename — which matters, since `rename()`
+   * falls back to copy+delete on backends without a native move, and that would
+   * put the whole blob back in memory.
+   *
+   * The digest is verified rather than trusted: a mismatch means the source
+   * lied or changed underneath us, and the half-written object is removed.
+   */
+  async putObjectStreamAt(hash: Hash, source: ReadableStream<Uint8Array>): Promise<void> {
+    if (await this.hasObject(hash)) {
+      await source.cancel().catch(() => {
+        // nothing to drain
+      });
+      return;
+    }
+    const path = this.objectPath(hash);
+    const hasher = new Sha256();
+    try {
+      await pump(source, await writeStream(this.adapter, path), (chunk) => hasher.update(chunk));
+    } catch (error) {
+      await this.adapter.delete(path);
+      throw error;
+    }
+    const actual = hasher.digest();
+    if (actual !== hash) {
+      await this.adapter.delete(path);
+      throw new Error(`object ${hash} arrived as ${actual} in ${this.adapter.name}`);
+    }
+  }
+
+  /**
+   * Stores a blob that has to be streamed, when its hash is not known yet.
+   *
+   * `open()` is called twice — once to hash, once to store — because the
+   * content address has to be known before a byte can be written to it. That
+   * trades a second read of the source for never holding the blob and never
+   * needing a staging file. Sources here are always files at a known path, so
+   * re-reading them is cheap.
+   */
+  async putObjectStream(open: () => Promise<ReadableStream<Uint8Array>>): Promise<Hash> {
+    const hash = await sha256Stream(await open());
+    if (!(await this.hasObject(hash))) await this.putObjectStreamAt(hash, await open());
+    return hash;
   }
 
   // ------------------------------------------------------------ trees

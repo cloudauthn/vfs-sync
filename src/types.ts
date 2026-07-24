@@ -18,6 +18,17 @@ export interface VFSListEntry {
 }
 
 /**
+ * Half-open byte range `[start, end)`, like `Blob.slice()` and unlike node's
+ * inclusive `createReadStream({ end })` — the adapters do that conversion.
+ */
+export interface ByteRange {
+  /** Defaults to 0. */
+  start?: number;
+  /** Exclusive. Defaults to the end of the file. */
+  end?: number;
+}
+
+/**
  * The single interface every backend implements. Paths are relative to the
  * adapter root, use `/` as separator and never start with `/`.
  */
@@ -39,6 +50,23 @@ export interface VFSAdapter {
    * the engine assigns synthetic ids instead.
    */
   fileId?(path: string): Promise<string | null>;
+
+  // ------------------------------------------------------------- streaming
+  //
+  // All three are optional. The helpers in `stream.ts` emulate whatever a
+  // backend leaves out on top of read()/write(), so an adapter that implements
+  // none of them still works — it just holds whole files in memory. Implement
+  // them when the backend can do better, which OPFS, FSA and node all can.
+
+  /**
+   * Reads `[start, end)` without touching the rest of the file. This is what
+   * makes "parse the ID3 tag of a 200 MB track" cost a few hundred bytes.
+   */
+  readRange?(path: string, range?: ByteRange): Promise<Uint8Array>;
+  /** Streams a file, optionally only a range of it. */
+  readStream?(path: string, range?: ByteRange): Promise<ReadableStream<Uint8Array>>;
+  /** Replaces a file's contents from a stream. Truncates on open. */
+  writeStream?(path: string): Promise<WritableStream<Uint8Array>>;
 }
 
 /** One file as recorded in a tree snapshot. */

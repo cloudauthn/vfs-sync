@@ -1,5 +1,5 @@
 import { basename, dirname, normalizePath } from '../path.js';
-import type { VFSAdapter, VFSListEntry, VFSStat } from '../types.js';
+import type { ByteRange, VFSAdapter, VFSListEntry, VFSStat } from '../types.js';
 
 type DirEntries = AsyncIterable<[string, FileSystemHandle]>;
 
@@ -75,6 +75,49 @@ export class HandleAdapter implements VFSAdapter {
     } finally {
       await writable.close();
     }
+  }
+
+  /**
+   * `File` is a `Blob`, and slicing one is lazy: only the requested range is
+   * ever pulled off disk. This is the cheap path for reading a header or a
+   * trailer out of a large file.
+   */
+  async readRange(path: string, range: ByteRange = {}): Promise<Uint8Array> {
+    const file = await this.getFile(path);
+    const blob = file.slice(range.start ?? 0, range.end ?? file.size);
+    return new Uint8Array(await blob.arrayBuffer());
+  }
+
+  async readStream(path: string, range: ByteRange = {}): Promise<ReadableStream<Uint8Array>> {
+    const file = await this.getFile(path);
+    const ranged =
+      range.start !== undefined || range.end !== undefined
+        ? file.slice(range.start ?? 0, range.end ?? file.size)
+        : file;
+    return ranged.stream();
+  }
+
+  /**
+   * Wraps the handle's own writable rather than returning it: the two are the
+   * same thing on a real browser, but wrapping keeps the contract to a plain
+   * `WritableStream` and works with backends whose writable is only
+   * write/close shaped.
+   */
+  async writeStream(path: string): Promise<WritableStream<Uint8Array>> {
+    const handle = await this.file(path, true);
+    if (!handle) throw new Error(`cannot write ${path}`);
+    const writable = await handle.createWritable();
+    return new WritableStream<Uint8Array>({
+      write: (chunk) => writable.write(chunk as unknown as BufferSource),
+      close: () => writable.close(),
+      abort: (reason) => writable.abort(reason),
+    });
+  }
+
+  private async getFile(path: string): Promise<File> {
+    const handle = await this.file(path);
+    if (!handle) throw new Error(`ENOENT: ${path}`);
+    return handle.getFile();
   }
 
   async delete(path: string): Promise<void> {

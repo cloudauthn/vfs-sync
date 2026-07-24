@@ -1,7 +1,9 @@
-import { promises as fs } from 'node:fs';
+import { createReadStream, createWriteStream, promises as fs } from 'node:fs';
 import * as nodePath from 'node:path';
+import { Readable, Writable } from 'node:stream';
 import { dirname, normalizePath } from '../path.js';
-import type { VFSAdapter, VFSListEntry, VFSStat } from '../types.js';
+import { chunked } from '../stream.js';
+import type { ByteRange, VFSAdapter, VFSListEntry, VFSStat } from '../types.js';
 
 /**
  * Node.js filesystem backend. Useful for CLI tooling and server-side peers,
@@ -51,6 +53,44 @@ export class NodeFsAdapter implements VFSAdapter {
     const target = this.resolve(path);
     await fs.mkdir(nodePath.dirname(target), { recursive: true });
     await fs.writeFile(target, data);
+  }
+
+  /** Positional read: seeks straight to `start`, never reads the rest. */
+  async readRange(path: string, range: ByteRange = {}): Promise<Uint8Array> {
+    const handle = await fs.open(this.resolve(path), 'r');
+    try {
+      const { size } = await handle.stat();
+      const start = Math.min(Math.max(range.start ?? 0, 0), size);
+      const end = Math.min(range.end ?? size, size);
+      const length = Math.max(0, end - start);
+      const out = new Uint8Array(length);
+      let filled = 0;
+      // A single read() can come up short on some filesystems.
+      while (filled < length) {
+        const { bytesRead } = await handle.read(out, filled, length - filled, start + filled);
+        if (bytesRead === 0) break;
+        filled += bytesRead;
+      }
+      return filled === length ? out : out.subarray(0, filled);
+    } finally {
+      await handle.close();
+    }
+  }
+
+  async readStream(path: string, range: ByteRange = {}): Promise<ReadableStream<Uint8Array>> {
+    const start = range.start ?? 0;
+    // node's `end` is inclusive, ours is not
+    if (range.end !== undefined && range.end <= start) return chunked(new Uint8Array());
+    const options: { start: number; end?: number } = { start };
+    if (range.end !== undefined) options.end = range.end - 1;
+    const stream = createReadStream(this.resolve(path), options);
+    return Readable.toWeb(stream) as unknown as ReadableStream<Uint8Array>;
+  }
+
+  async writeStream(path: string): Promise<WritableStream<Uint8Array>> {
+    const target = this.resolve(path);
+    await fs.mkdir(nodePath.dirname(target), { recursive: true });
+    return Writable.toWeb(createWriteStream(target)) as unknown as WritableStream<Uint8Array>;
   }
 
   async delete(path: string): Promise<void> {

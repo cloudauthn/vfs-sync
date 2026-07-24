@@ -1,4 +1,5 @@
 export type {
+  ByteRange,
   CachedFile,
   Commit,
   EntryKind,
@@ -13,7 +14,20 @@ export type {
   VFSStat,
 } from './types.js';
 
-export { canonicalJSON, hashJSON, randomId, sha256 } from './hash.js';
+export { canonicalJSON, hashJSON, randomId, sha256, sha256Stream } from './hash.js';
+export { Sha256 } from './sha256.js';
+export {
+  CHUNK_SIZE,
+  STREAM_THRESHOLD,
+  canStream,
+  chunked,
+  collect,
+  concat,
+  pump,
+  readRange,
+  readStream,
+  writeStream,
+} from './stream.js';
 export { basename, dirname, joinPath, normalizePath, splitExtension } from './path.js';
 export { CONTROL_DIR, EMPTY_TREE, VFSStore, canonicalTree } from './store.js';
 export type { KnownCommit } from './store.js';

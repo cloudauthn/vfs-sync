@@ -28,17 +28,21 @@ export class FakeFileHandle {
     if (supportsMove) this.move = (target, to) => fileMove(this, target, to);
   }
 
-  async getFile(): Promise<{ size: number; lastModified: number; arrayBuffer(): Promise<ArrayBuffer> }> {
-    const data = this.data;
-    return {
-      size: data.byteLength,
+  /**
+   * A real `File`, so the adapter's `slice()`/`stream()` paths run against the
+   * genuine Blob semantics rather than a hand-rolled approximation of them.
+   */
+  async getFile(): Promise<File> {
+    return new File([this.data.slice() as unknown as BlobPart], this.name, {
       lastModified: this.lastModified,
-      arrayBuffer: async () =>
-        data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) as ArrayBuffer,
-    };
+    });
   }
 
-  async createWritable(): Promise<{ write(chunk: Uint8Array): Promise<void>; close(): Promise<void> }> {
+  async createWritable(): Promise<{
+    write(chunk: Uint8Array): Promise<void>;
+    close(): Promise<void>;
+    abort(reason?: unknown): Promise<void>;
+  }> {
     const chunks: Uint8Array[] = [];
     return {
       write: async (chunk: Uint8Array) => {
@@ -54,6 +58,10 @@ export class FakeFileHandle {
         }
         this.data = merged;
         this.lastModified = this.parent.clock();
+      },
+      // A discarded writable leaves the file untouched, like the real thing.
+      abort: async () => {
+        chunks.length = 0;
       },
     };
   }

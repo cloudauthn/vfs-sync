@@ -1,6 +1,14 @@
 import { randomId, sha256 } from './hash.js';
 import { EMPTY_TREE, VFSStore, canonicalTree } from './store.js';
-import type { CachedFile, Commit, Hash, Tree, TreeEntry, VFSAdapter } from './types.js';
+import {
+  STREAM_THRESHOLD,
+  canStream,
+  pump,
+  readRange,
+  readStream,
+  writeStream,
+} from './stream.js';
+import type { ByteRange, CachedFile, Commit, Hash, Tree, TreeEntry, VFSAdapter, VFSStat } from './types.js';
 import { walk } from './walk.js';
 
 export interface VFSNodeOptions {
@@ -10,6 +18,12 @@ export interface VFSNodeOptions {
   ignore?: (path: string) => boolean;
   /** Injectable clock, mostly for tests. */
   now?: () => number;
+  /**
+   * Files at or above this many bytes are hashed and moved as streams instead
+   * of being held whole. Defaults to {@link STREAM_THRESHOLD} (4 MiB). Only
+   * takes effect on adapters that implement the streaming methods.
+   */
+  streamThreshold?: number;
 }
 
 export interface CommitOptions {
@@ -29,6 +43,8 @@ export class VFSNode {
   readonly adapter: VFSAdapter;
   readonly store: VFSStore;
   readonly id: string;
+  /** Size from which blobs take the streaming path. See {@link VFSNodeOptions}. */
+  readonly streamThreshold: number;
 
   private readonly ignore: ((path: string) => boolean) | undefined;
   private readonly now: () => number;
@@ -39,6 +55,12 @@ export class VFSNode {
     this.id = id;
     this.ignore = options.ignore;
     this.now = options.now ?? (() => Date.now());
+    this.streamThreshold = options.streamThreshold ?? STREAM_THRESHOLD;
+  }
+
+  /** True when this file should go through the streaming path. */
+  private streams(size: number): boolean {
+    return size >= this.streamThreshold && canStream(this.adapter);
   }
 
   /** Opens (creating `.vfs/` if needed) the folder behind `adapter`. */
@@ -86,6 +108,40 @@ export class VFSNode {
     return this.adapter.write(path, data);
   }
 
+  stat(path: string): Promise<VFSStat | null> {
+    return this.adapter.stat(path);
+  }
+
+  /**
+   * Reads `[start, end)` of a file without pulling in the rest — enough to
+   * parse a header or a trailer out of a file far too big to load.
+   *
+   * ```ts
+   * const header = await node.readRange('track.mp3', { end: 10 });   // ID3v2
+   * const { size } = (await node.stat('track.mp3'))!;
+   * const tail = await node.readRange('track.mp3', { start: size - 128 });
+   * ```
+   *
+   * Backends that cannot seek fall back to reading the file and slicing, so
+   * this is always correct, just not always cheap.
+   */
+  readRange(path: string, range?: ByteRange): Promise<Uint8Array> {
+    return readRange(this.adapter, path, range);
+  }
+
+  /** Streams a file, or a range of it, out of the working folder. */
+  readStream(path: string, range?: ByteRange): Promise<ReadableStream<Uint8Array>> {
+    return readStream(this.adapter, path, range);
+  }
+
+  /**
+   * Replaces a file from a stream, without ever holding it whole. `commit()`
+   * afterwards to snapshot it — the write itself does not.
+   */
+  writeStream(path: string): Promise<WritableStream<Uint8Array>> {
+    return writeStream(this.adapter, path);
+  }
+
   delete(path: string): Promise<void> {
     return this.adapter.delete(path);
   }
@@ -128,12 +184,19 @@ export class VFSNode {
     const resolved: Array<{ path: string; size: number; mtime: number; hash: Hash }> = [];
     for (const file of files) {
       const cached = cache.files[file.path];
+      const streaming = this.streams(file.stat.size);
       let hash: Hash;
       if (cached && cached.mtime === file.stat.mtime && cached.size === file.stat.size) {
         hash = cached.hash;
         if (!(await this.store.hasObject(hash))) {
-          await this.store.putObjectAt(hash, await this.adapter.read(file.path));
+          if (streaming) {
+            await this.store.putObjectStreamAt(hash, await readStream(this.adapter, file.path));
+          } else {
+            await this.store.putObjectAt(hash, await this.adapter.read(file.path));
+          }
         }
+      } else if (streaming) {
+        hash = await this.store.putObjectStream(() => readStream(this.adapter, file.path));
       } else {
         const data = await this.adapter.read(file.path);
         hash = await sha256(data);
@@ -296,7 +359,7 @@ export class VFSNode {
     const livePaths = new Set(current.entries.filter((e) => !e.deleted).map((e) => e.path));
 
     const renames: Array<{ from: string; to: string; id: string }> = [];
-    const writes: Array<{ path: string; hash: Hash }> = [];
+    const writes: Array<{ path: string; hash: Hash; size: number }> = [];
     const deletes: string[] = [];
 
     for (const entry of target.entries) {
@@ -311,7 +374,7 @@ export class VFSNode {
         renames.push({ from: before.path, to: entry.path, id: entry.id });
       }
       if (!wasLive || before.hash !== entry.hash) {
-        writes.push({ path: entry.path, hash: entry.hash as Hash });
+        writes.push({ path: entry.path, hash: entry.hash as Hash, size: entry.size });
       }
     }
 
@@ -343,7 +406,14 @@ export class VFSNode {
     }
 
     for (const write of writes) {
-      await this.adapter.write(write.path, await this.store.getObject(write.hash));
+      if (this.streams(write.size)) {
+        await pump(
+          await this.store.getObjectStream(write.hash),
+          await writeStream(this.adapter, write.path),
+        );
+      } else {
+        await this.adapter.write(write.path, await this.store.getObject(write.hash));
+      }
     }
 
     await this.refreshCache(target);

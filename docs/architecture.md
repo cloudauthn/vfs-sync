@@ -245,12 +245,32 @@ was there.
 
 ---
 
+## Large blobs
+
+A blob at or above `streamThreshold` (4 MiB by default) is never held whole, provided both adapters
+involved implement the streaming methods. Three places would otherwise buffer a file:
+
+- **Hashing on scan.** `crypto.subtle.digest` is one-shot, so above the threshold the digest comes
+  from the bundled incremental SHA-256 instead, fed a chunk at a time. Identical digest — a blob has
+  the same content address however it was hashed, which is the property peers agree on.
+- **Storing.** The content address is only known once the last byte has been hashed, so a streamed
+  blob is read twice: once to hash, once to write straight to `objects/<hash[0:2]>/<hash>`. The
+  alternative — stage under a temporary name, then rename — is worse here, because `rename()` falls
+  back to copy+delete on backends without a native move, which puts the whole blob back in memory.
+- **Transferring.** `sync` streams the blob from one store to the other, re-hashing as it arrives.
+  A truncated transfer therefore cannot land as a valid object: the digest will not match and the
+  partial file is removed.
+
+Range reads (`readRange`) are separate from all of this. They read the working folder, not the
+object store, and go straight to a `Blob.slice()` or a positional `read()` — enough to parse a
+header out of a file far too large to load.
+
 ## Not implemented
 
 **Garbage collection.** Blobs and trees unreachable from any commit are never removed from
 `objects/`. For folders with heavy churn this grows without bound.
 
-**Partial transfer.** Blobs move whole. There is no delta encoding, so a one-byte change to a
-large file transfers the whole file.
+**Delta transfer.** Streaming bounds memory, not bytes moved: a blob still travels in full, so a
+one-byte change to a large file transfers the whole file.
 
 The original design notes, in Spanish, are in [design.md](./design.md).

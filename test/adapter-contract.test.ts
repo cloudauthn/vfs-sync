@@ -6,6 +6,8 @@ import { HandleAdapter } from '../src/adapters/handle.js';
 import { MemoryAdapter } from '../src/adapters/memory.js';
 import { NodeFsAdapter } from '../src/adapters/node-fs.js';
 import { VFSNode } from '../src/vfs-node.js';
+import { sha256 } from '../src/hash.js';
+import { collect, readRange, readStream, writeStream } from '../src/stream.js';
 import { sync } from '../src/sync.js';
 import type { VFSAdapter } from '../src/types.js';
 import { FakeDirectoryHandle } from './fake-handle.js';
@@ -126,6 +128,82 @@ describe.each(backends)('$name', ({ make }) => {
     const adapter = await make();
     await adapter.write('./dir//f.txt', encoder.encode('normalised'));
     expect(decoder.decode(await adapter.read('dir/f.txt'))).toBe('normalised');
+  });
+
+  // ------------------------------------------------------------- streaming
+  //
+  // Every backend has to answer these the same way whether it implements the
+  // streaming methods natively or gets them emulated by stream.ts.
+
+  it('round-trips binary content that is not valid UTF-8', async () => {
+    const adapter = await make();
+    // a lone 0xff, an unpaired surrogate's bytes, and every byte value
+    const bytes = new Uint8Array(256);
+    for (let i = 0; i < 256; i++) bytes[i] = 255 - i;
+    await adapter.write('blob.bin', bytes);
+    expect([...(await adapter.read('blob.bin'))]).toEqual([...bytes]);
+    expect((await adapter.stat('blob.bin'))?.size).toBe(256);
+  });
+
+  it('reads a byte range without touching the rest', async () => {
+    const adapter = await make();
+    await adapter.write('track.mp3', encoder.encode('ID3xxxxxxxxxxTAGtrailer'));
+
+    expect(decoder.decode(await readRange(adapter, 'track.mp3', { end: 3 }))).toBe('ID3');
+    expect(decoder.decode(await readRange(adapter, 'track.mp3', { start: 13, end: 16 }))).toBe('TAG');
+    expect(decoder.decode(await readRange(adapter, 'track.mp3', { start: 16 }))).toBe('trailer');
+    expect(decoder.decode(await readRange(adapter, 'track.mp3'))).toBe('ID3xxxxxxxxxxTAGtrailer');
+  });
+
+  it('clamps ranges that run past either end', async () => {
+    const adapter = await make();
+    await adapter.write('short.txt', encoder.encode('abc'));
+    expect(decoder.decode(await readRange(adapter, 'short.txt', { start: 1, end: 99 }))).toBe('bc');
+    expect(await readRange(adapter, 'short.txt', { start: 99 })).toHaveLength(0);
+    expect(await readRange(adapter, 'short.txt', { start: 2, end: 2 })).toHaveLength(0);
+  });
+
+  it('streams a file in and out, in chunks, byte-exact', async () => {
+    const adapter = await make();
+    // larger than CHUNK_SIZE so the emulated and native paths both split it
+    const source = new Uint8Array(200_000);
+    for (let i = 0; i < source.length; i++) source[i] = (i * 7) & 0xff;
+
+    const target = await writeStream(adapter, 'big.bin');
+    const writer = target.getWriter();
+    for (let offset = 0; offset < source.length; offset += 8192) {
+      await writer.write(source.subarray(offset, offset + 8192));
+    }
+    await writer.close();
+
+    expect((await adapter.stat('big.bin'))?.size).toBe(source.length);
+    const read = await collect(await readStream(adapter, 'big.bin'));
+    expect(read.byteLength).toBe(source.length);
+    expect(await sha256(read)).toBe(await sha256(source));
+  });
+
+  it('streams a range', async () => {
+    const adapter = await make();
+    await adapter.write('ranged.txt', encoder.encode('0123456789'));
+    expect(decoder.decode(await collect(await readStream(adapter, 'ranged.txt', { start: 2, end: 5 })))).toBe(
+      '234',
+    );
+    expect(await collect(await readStream(adapter, 'ranged.txt', { start: 4, end: 4 }))).toHaveLength(0);
+  });
+
+  it('survives an aborted write stream', async () => {
+    const adapter = await make();
+    const target = await writeStream(adapter, 'aborted.bin');
+    const writer = target.getWriter();
+    await writer.write(encoder.encode('partial'));
+    // What an abort leaves on disk is backend-specific — a buffered backend
+    // keeps the old bytes, one that opened the file has already truncated it.
+    // What has to hold everywhere is that it does not throw and does not wedge
+    // the adapter.
+    await expect(writer.abort(new Error('cancelled'))).resolves.toBeUndefined();
+
+    await adapter.write('after.txt', encoder.encode('still working'));
+    expect(decoder.decode(await adapter.read('after.txt'))).toBe('still working');
   });
 
   it('drives a full sync as both sides of an edge', async () => {

@@ -1,4 +1,5 @@
 import { EMPTY_TREE, type VFSStore } from './store.js';
+import { canStream } from './stream.js';
 import { mergeTrees } from './merge.js';
 import type { ConflictCopyPolicy, ConflictNameInfo, ConflictReport } from './merge.js';
 import type { Commit, Hash, Tree } from './types.js';
@@ -68,10 +69,13 @@ export async function sync(a: VFSNode, b: VFSNode, options: SyncOptions = {}): P
 
   // 4. move the blobs the merged tree needs to whichever side lacks them
   const transferred = { toA: 0, toB: 0 };
+  // A blob only streams if *both* ends can: the slower peer sets the terms.
+  const threshold = Math.min(a.streamThreshold, b.streamThreshold);
   for (const entry of tree.entries) {
     if (!entry.hash) continue;
-    if (await copyObject(b.store, a.store, entry.hash)) transferred.toA++;
-    else if (await copyObject(a.store, b.store, entry.hash)) transferred.toB++;
+    const big = entry.size >= threshold;
+    if (await copyObject(b.store, a.store, entry.hash, big)) transferred.toA++;
+    else if (await copyObject(a.store, b.store, entry.hash, big)) transferred.toB++;
   }
 
   const treeHash = await a.store.putTree(tree);
@@ -188,9 +192,20 @@ async function copyCommits(from: VFSNode, to: VFSNode, hashes: Hash[]): Promise<
   }
 }
 
-async function copyObject(from: VFSStore, to: VFSStore, hash: Hash): Promise<boolean> {
+async function copyObject(
+  from: VFSStore,
+  to: VFSStore,
+  hash: Hash,
+  stream = false,
+): Promise<boolean> {
   if (await to.hasObject(hash)) return false;
   if (!(await from.hasObject(hash))) return false;
-  await to.putObjectAt(hash, await from.getObject(hash));
+  if (stream && canStream(from.adapter) && canStream(to.adapter)) {
+    // Verified on arrival, so a truncated transfer cannot land as a valid
+    // object — putObjectStreamAt re-hashes what it wrote.
+    await to.putObjectStreamAt(hash, await from.getObjectStream(hash));
+  } else {
+    await to.putObjectAt(hash, await from.getObject(hash));
+  }
   return true;
 }

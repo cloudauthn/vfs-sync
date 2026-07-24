@@ -1,3 +1,4 @@
+import { Sha256 } from './sha256.js';
 import type { Hash } from './types.js';
 
 const HEX = Array.from({ length: 256 }, (_, i) => i.toString(16).padStart(2, '0'));
@@ -62,6 +63,26 @@ export function encodeText(text: string): Uint8Array {
 
 export function decodeText(data: Uint8Array): string {
   return decoder.decode(data);
+}
+
+/**
+ * Content address of a blob that is too big to hold — same digest as
+ * {@link sha256}, computed a chunk at a time so nothing but the current chunk
+ * is ever resident. Consumes the stream.
+ */
+export async function sha256Stream(stream: ReadableStream<Uint8Array>): Promise<Hash> {
+  const hasher = new Sha256();
+  const reader = stream.getReader();
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value) hasher.update(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  return hasher.digest();
 }
 
 /** Content address of a tree or commit. */

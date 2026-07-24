@@ -214,6 +214,15 @@ export class MyAdapter implements VFSAdapter {
 
   /** Optional. Only for backends with stable native identifiers. */
   async fileId?(path: string): Promise<string | null> { /* … */ }
+
+  // Optional, all three. Omit them and the engine emulates them on top of
+  // read/write — correct, but it holds whole files.
+
+  /** Reads [start, end). `end` is exclusive. */
+  async readRange?(path: string, range?: ByteRange): Promise<Uint8Array> { /* … */ }
+  async readStream?(path: string, range?: ByteRange): Promise<ReadableStream<Uint8Array>> { /* … */ }
+  /** Truncates on open, like write(). */
+  async writeStream?(path: string): Promise<WritableStream<Uint8Array>> { /* … */ }
 }
 ```
 
@@ -227,8 +236,37 @@ The contract the engine relies on, in full:
 6. `read` throws for a missing file.
 7. `mtime` is milliseconds since the epoch and moves forward when content changes.
 
+And, if you implement the streaming three:
+
+8. Ranges clamp rather than throw: a `start` past the end yields empty, an `end` past the end
+   stops at the end, and `start >= end` yields empty.
+9. `readRange`/`readStream` throw for a missing file, exactly like `read`.
+10. `writeStream` truncates on open, and aborting the writer must not throw.
+
 `test/adapter-contract.test.ts` encodes exactly this and runs against every built-in backend. Point
 it at yours and you will know it composes with the rest.
+
+### Streaming
+
+Implementing the optional trio is what lets a backend move a file bigger than memory. The engine
+routes a blob through streams when it is at least `STREAM_THRESHOLD` (4 MiB, configurable per node
+with `streamThreshold`) **and** both ends of the transfer report `canStream`. Below that it uses
+one-shot reads, which are faster and where the memory does not matter.
+
+The built-ins map onto native primitives:
+
+| Backend | Range | Read | Write |
+| --- | --- | --- | --- |
+| OPFS / FSA | `Blob.slice()` — lazy, reads only the range | `Blob.stream()` | `createWritable()` |
+| Node | `filehandle.read()` at a position | `createReadStream({ start, end })` | `createWriteStream()` |
+| Memory | `subarray` | 64 KiB chunks | buffered |
+
+`MemoryAdapter` implements them for uniformity, not for memory: the file *is* memory. It means the
+streaming paths are exercised by the adapter the test-suite runs on.
+
+Note the `end` convention: `ByteRange` is half-open `[start, end)` like `Blob.slice()`, while
+node's `createReadStream({ end })` is inclusive. `NodeFsAdapter` does that conversion; a custom
+adapter over a node-shaped API has to as well.
 
 ### Native ids
 
