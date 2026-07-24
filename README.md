@@ -10,6 +10,8 @@ independently.
 
 **[▶ Live demo](https://cloudauthn.github.io/vfs-sync/)** — three OPFS peers wired as a chain,
 with conflicts, renames and deletes you can trigger by hand.
+**[Coverage report](https://cloudauthn.github.io/vfs-sync/coverage/)** — both are published from
+the tag of the last release.
 
 ```sh
 npm install @cloudauthn/vfs-sync
@@ -121,10 +123,14 @@ reload — [adapters.md](./docs/adapters.md#permissions-expire) covers how to ha
 ```sh
 npm run demo         # vite dev server
 npm run demo:build   # static build in demo/dist
+npm run pages:build  # the same build plus the HTML coverage report in demo/dist/coverage
 ```
 
 Three OPFS peers wired `A ↔ B ↔ C`, with per-edge sync buttons, a file editor, an activity log,
 and an optional fourth peer backed by a real local folder.
+
+The published site is refreshed only by a release: `release.yml` bumps the version, publishes to
+npm, and then calls `pages.yml` with the new tag.
 
 ## Status
 

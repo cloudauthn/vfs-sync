@@ -62,6 +62,7 @@
     "lint": "eslint .",
     "demo": "vite demo",
     "demo:build": "vite build demo",
+    "pages:build": "npm run demo:build && npm run test:coverage && rm -rf demo/dist/coverage && cp -R coverage demo/dist/coverage",
     "prepublishOnly": "npm run lint && npm test && npm run build"
   },
   "devDependencies": {

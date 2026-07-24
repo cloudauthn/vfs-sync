@@ -1,8 +1,17 @@
-name: Demo
+name: Pages
 
+# Publishes the demo at / and the coverage report at /coverage/.
+#
+# There is no push trigger on purpose: the site is only rebuilt when a release
+# bumps the version (release.yml calls this workflow), so what is published
+# always matches the last published npm version.
 on:
-  push:
-    branches: [main]
+  workflow_call:
+    inputs:
+      ref:
+        description: Commit-ish to publish (defaults to the caller's ref)
+        required: false
+        type: string
   workflow_dispatch:
 
 permissions:
@@ -12,7 +21,7 @@ permissions:
 
 concurrency:
   group: pages
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   deploy:
@@ -22,6 +31,8 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
 
       - uses: actions/setup-node@v4
         with:
@@ -30,7 +41,9 @@ jobs:
 
       - run: npm ci
 
-      - run: npm run demo:build
+      # Builds the demo into demo/dist and drops the HTML coverage report in
+      # demo/dist/coverage.
+      - run: npm run pages:build
 
       - uses: actions/configure-pages@v5
 
