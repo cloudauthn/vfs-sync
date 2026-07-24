@@ -15,12 +15,12 @@
       <div>
         <h1>vfs-sync</h1>
         <p class="tagline">
-          One file explorer, one tab per backend — OPFS, memory, and a real folder from your disk
-          through the File System Access API. The tabs are wired as a chain, so the far ends never
-          talk directly: changes reach them because every <code>⇄</code> edge runs its own sync.
+          Three peers wired as a chain: <b>A &harr; B &harr; C</b>. A and C never talk directly —
+          changes reach the far end because every edge runs its own sync.
         </p>
       </div>
       <nav>
+        <a href="./explorer/">Explorer</a>
         <a href="./coverage/">Coverage</a>
         <a href="https://github.com/cloudauthn/vfs-sync">GitHub</a>
         <a href="https://www.npmjs.com/package/@cloudauthn/vfs-sync">npm</a>
@@ -33,13 +33,12 @@
         <input type="checkbox" id="auto-sync" />
         <span>Auto-sync every 3s</span>
       </label>
+      <button id="add-local" hidden>Add a local folder as a 4th peer…</button>
       <button id="reset" class="danger">Reset</button>
+      <span id="backend" class="badge"></span>
     </section>
 
-    <main class="explorer">
-      <div class="tabs" id="tabs" role="tablist"></div>
-      <div class="panel" id="panel" role="tabpanel"></div>
-    </main>
+    <main id="peers" class="peers"></main>
 
     <section class="workbench">
       <div class="editor" id="editor">
@@ -58,10 +57,14 @@
 
     <footer>
       <p>
-        Try it: edit <code>notes.md</code> on the first tab and on the last one without syncing in
-        between, then hit <b>Sync the whole chain</b> — the newer edit wins and the other one is
-        preserved as a <code>(conflict …)</code> copy. Switching tabs keeps the open file selected,
-        so you can watch the same path appear on another filesystem.
+        Try it: edit <code>notes.md</code> on <b>A</b> and on <b>C</b> without syncing in between,
+        then hit <b>Sync the whole chain</b> — the newer edit wins and the other one is preserved
+        as a <code>(conflict …)</code> copy.
+      </p>
+      <p>
+        For a chain that spans real backends — two OPFS folders, memory, and a folder from your
+        disk — open the <a href="./explorer/">file explorer</a>, an embeddable app built on the
+        same library.
       </p>
     </footer>
 

@@ -8,10 +8,12 @@ a Node directory, or plain memory. Peers form a **mesh, not a hub-and-spoke**: a
 the peers it syncs with directly, and changes travel down a chain because every edge syncs
 independently.
 
-**[▶ Live demo](https://cloudauthn.github.io/vfs-sync/)** — a file explorer with one tab per
-backend, wired as a chain, with conflicts, renames and deletes you can trigger by hand.
-**[Coverage report](https://cloudauthn.github.io/vfs-sync/coverage/)** — both are published from
-the tag of the last release.
+**[▶ Live demo](https://cloudauthn.github.io/vfs-sync/)** — three peers wired as a chain, with
+conflicts, renames and deletes you can trigger by hand.
+**[File explorer](https://cloudauthn.github.io/vfs-sync/explorer/)** — an embeddable app with one
+tab per backend, mounted into a page of the demo.
+**[Coverage report](https://cloudauthn.github.io/vfs-sync/coverage/)** — all three are published
+from the tag of the last release.
 
 ```sh
 npm install @cloudauthn/vfs-sync
@@ -148,15 +150,47 @@ npm run demo:build   # static build in demo/dist
 npm run pages:build  # the same build plus the HTML coverage report in demo/dist/coverage
 ```
 
-A tabbed file explorer: one tab per peer, each on a different backend — two OPFS folders, an
-in-memory adapter, and a real local folder you add through the File System Access API. The tabs
-are laid out as the chain `opfs-a ⇄ opfs-b ⇄ memory ⇄ local`; the `⇄` handles between them sync
-that edge alone. Below the explorer sit a file editor and an activity log. Switching tabs keeps
-the open file selected, so the same path can be watched across filesystems. When OPFS is blocked
-(private window, sandboxed iframe) every tab falls back to memory.
+Three peers wired `A ↔ B ↔ C`, with per-edge sync buttons, a file editor, an activity log, and an
+optional fourth peer backed by a real local folder. Its `/explorer/` page embeds the app below.
 
 The published site is refreshed only by a release: `release.yml` bumps the version, publishes to
 npm, and then deploys the site from the tag it just pushed.
+
+## File explorer
+
+An app of its own, in [`explorer/`](./explorer), built on the same library:
+
+```sh
+npm run explorer        # vite dev server, the app on its own page
+npm run explorer:build  # static build in explorer/dist, ready to serve or iframe
+```
+
+One tab per peer, each on a different backend — two OPFS folders, an in-memory adapter, and a real
+local folder added through the File System Access API. The tabs are laid out as the chain
+`opfs-a ⇄ opfs-b ⇄ memory ⇄ local`; the `⇄` handles between them sync that edge alone. Below sit a
+file editor and an activity log. Switching tabs keeps the open file selected, so the same path can
+be watched across filesystems. When OPFS is blocked (private window, sandboxed iframe) every tab
+falls back to memory.
+
+It draws itself into an element you give it, carries scoped styles, and reads nothing from the
+host page — the demo's `/explorer/` page is one `<main>` and one call:
+
+```ts
+import { mountExplorer } from './explorer/src/index';
+
+const explorer = mountExplorer('#explorer', {
+  opfsRoot: 'my-app-explorer', // where the stored peers live; one root per mount
+  seed: { 'notes.md': '# Notes\n' }, // written to the first peer when it boots empty
+  autoSyncMs: 3000,
+  localFolder: true, // offer the "pick a folder" tab
+  toolbar: true, // draw the sync / auto-sync / reset bar
+  activityLog: true,
+  onLog: (message, kind) => console.log(kind, message),
+});
+
+await explorer.syncAll();
+explorer.destroy();
+```
 
 ## Status
 

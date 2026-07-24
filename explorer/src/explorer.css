@@ -1,0 +1,399 @@
+/*
+ * Everything is scoped under .vfs-explorer and every rule names its own
+ * element, so the app can be dropped into a page whose styles it knows
+ * nothing about. Colours come from --vfs-* custom properties: set them on any
+ * ancestor to theme the app from the host.
+ */
+
+.vfs-explorer {
+  --vfs-panel: #161b22;
+  --vfs-panel-2: #1c232d;
+  --vfs-line: #2a323d;
+  --vfs-text: #d7dee8;
+  --vfs-muted: #8b97a7;
+  --vfs-accent: #5aa9ff;
+  --vfs-ok: #45c98a;
+  --vfs-warn: #ffb454;
+  --vfs-conflict: #ff7b72;
+  --vfs-radius: 10px;
+  --vfs-mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  color: var(--vfs-text);
+  font: 15px/1.55 ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+  color-scheme: dark;
+}
+
+@media (prefers-color-scheme: light) {
+  .vfs-explorer {
+    --vfs-panel: #ffffff;
+    --vfs-panel-2: #f0f3f7;
+    --vfs-line: #d9e0e8;
+    --vfs-text: #1c2430;
+    --vfs-muted: #61707f;
+    --vfs-accent: #0b62d6;
+    --vfs-ok: #1a7f4b;
+    --vfs-warn: #9a5b00;
+    --vfs-conflict: #c0362c;
+    color-scheme: light;
+  }
+}
+
+.vfs-explorer *,
+.vfs-explorer *::before,
+.vfs-explorer *::after {
+  box-sizing: border-box;
+}
+
+.vfs-explorer h2 {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 650;
+}
+
+.vfs-explorer button {
+  font: inherit;
+  font-size: 13px;
+  color: var(--vfs-text);
+  background: var(--vfs-panel-2);
+  border: 1px solid var(--vfs-line);
+  border-radius: 8px;
+  padding: 6px 11px;
+  cursor: pointer;
+}
+
+.vfs-explorer button:hover:not(:disabled) {
+  border-color: var(--vfs-accent);
+}
+
+.vfs-explorer button:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.vfs-explorer button.vfs-primary {
+  background: var(--vfs-accent);
+  border-color: var(--vfs-accent);
+  color: #fff;
+  font-weight: 600;
+}
+
+.vfs-explorer button.vfs-danger:hover {
+  border-color: var(--vfs-conflict);
+  color: var(--vfs-conflict);
+}
+
+/* --------------------------------------------------------------- toolbar */
+
+.vfs-explorer .vfs-toolbar {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  flex-wrap: wrap;
+  padding: 12px;
+  background: var(--vfs-panel);
+  border: 1px solid var(--vfs-line);
+  border-radius: var(--vfs-radius);
+  margin-bottom: 18px;
+}
+
+.vfs-explorer .vfs-switch {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--vfs-muted);
+}
+
+.vfs-explorer .vfs-badge {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--vfs-muted);
+  background: var(--vfs-panel-2);
+  border: 1px solid var(--vfs-line);
+  border-radius: 999px;
+  padding: 2px 9px;
+}
+
+/* -------------------------------------------------------------- explorer */
+
+.vfs-explorer .vfs-main {
+  background: var(--vfs-panel);
+  border: 1px solid var(--vfs-line);
+  border-radius: var(--vfs-radius);
+  overflow: hidden;
+}
+
+.vfs-explorer .vfs-tabs {
+  display: flex;
+  align-items: stretch;
+  gap: 2px;
+  padding: 6px 6px 0;
+  background: var(--vfs-panel-2);
+  border-bottom: 1px solid var(--vfs-line);
+  overflow-x: auto;
+}
+
+.vfs-explorer .vfs-tab {
+  flex: 1 1 0;
+  min-width: 150px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+  padding: 9px 12px;
+  background: none;
+  border: 1px solid transparent;
+  border-bottom: none;
+  border-radius: var(--vfs-radius) var(--vfs-radius) 0 0;
+  text-align: left;
+}
+
+.vfs-explorer .vfs-tab:hover:not(:disabled) {
+  background: var(--vfs-panel);
+}
+
+.vfs-explorer .vfs-tab.vfs-active {
+  background: var(--vfs-panel);
+  border-color: var(--vfs-line);
+  box-shadow: inset 0 2px 0 var(--vfs-accent);
+}
+
+.vfs-explorer .vfs-tab-name {
+  font-weight: 600;
+  font-size: 13.5px;
+  white-space: nowrap;
+}
+
+.vfs-explorer .vfs-tab-meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.vfs-explorer .vfs-tab.vfs-add .vfs-tab-name {
+  color: var(--vfs-muted);
+}
+
+/* the sync handle sitting between two tabs */
+.vfs-explorer .vfs-edge {
+  align-self: center;
+  flex: 0 0 auto;
+  padding: 4px 8px;
+  margin-bottom: 6px;
+  background: none;
+  border: none;
+  color: var(--vfs-muted);
+  font-size: 15px;
+}
+
+.vfs-explorer .vfs-edge:hover {
+  color: var(--vfs-accent);
+  border: none;
+}
+
+.vfs-explorer .vfs-panel-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 13px 14px;
+  border-bottom: 1px solid var(--vfs-line);
+}
+
+.vfs-explorer .vfs-blurb {
+  margin: 5px 0 0;
+  color: var(--vfs-muted);
+  font-size: 13px;
+  max-width: 70ch;
+}
+
+.vfs-explorer .vfs-tree {
+  list-style: none;
+  margin: 0;
+  padding: 6px;
+  min-height: 150px;
+}
+
+.vfs-explorer .vfs-row {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  border-radius: 7px;
+}
+
+.vfs-explorer .vfs-row:hover {
+  background: var(--vfs-panel-2);
+}
+
+.vfs-explorer .vfs-row.vfs-selected {
+  outline: 1px solid var(--vfs-accent);
+}
+
+.vfs-explorer .vfs-row.vfs-dir .vfs-name {
+  color: var(--vfs-muted);
+}
+
+.vfs-explorer .vfs-row.vfs-conflict .vfs-name {
+  color: var(--vfs-conflict);
+}
+
+.vfs-explorer li.vfs-empty {
+  color: var(--vfs-muted);
+  font-size: 13px;
+  padding: 14px 9px;
+  text-align: center;
+}
+
+.vfs-explorer .vfs-panel-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 12px;
+  border-top: 1px solid var(--vfs-line);
+}
+
+.vfs-explorer .vfs-hint {
+  margin-left: auto;
+  color: var(--vfs-muted);
+  font-size: 12px;
+}
+
+.vfs-explorer button.vfs-file {
+  flex: 1;
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  background: none;
+  border: none;
+  text-align: left;
+  padding: 7px 9px;
+  min-width: 0;
+}
+
+.vfs-explorer button.vfs-file .vfs-name {
+  font-family: var(--vfs-mono);
+  font-size: 12.5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.vfs-explorer button.vfs-file .vfs-size {
+  color: var(--vfs-muted);
+  font-size: 11px;
+  flex: 0 0 auto;
+}
+
+.vfs-explorer button.vfs-icon {
+  background: none;
+  border: none;
+  color: var(--vfs-muted);
+  padding: 4px 7px;
+}
+
+.vfs-explorer button.vfs-icon:hover {
+  color: var(--vfs-text);
+}
+
+.vfs-explorer .vfs-commit {
+  font-family: var(--vfs-mono);
+  font-size: 11px;
+  color: var(--vfs-muted);
+}
+
+/* ------------------------------------------------------------- workbench */
+
+.vfs-explorer .vfs-workbench {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+  margin-top: 18px;
+}
+
+.vfs-explorer .vfs-workbench.vfs-single {
+  grid-template-columns: 1fr;
+}
+
+@media (max-width: 860px) {
+  .vfs-explorer .vfs-workbench {
+    grid-template-columns: 1fr;
+  }
+}
+
+.vfs-explorer .vfs-editor,
+.vfs-explorer .vfs-log {
+  background: var(--vfs-panel);
+  border: 1px solid var(--vfs-line);
+  border-radius: var(--vfs-radius);
+  display: flex;
+  flex-direction: column;
+  min-height: 260px;
+}
+
+.vfs-explorer .vfs-editor-head,
+.vfs-explorer .vfs-log-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px 13px;
+  border-bottom: 1px solid var(--vfs-line);
+  font-size: 13px;
+}
+
+.vfs-explorer .vfs-editor-title {
+  font-family: var(--vfs-mono);
+  font-size: 12.5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.vfs-explorer textarea {
+  flex: 1;
+  resize: vertical;
+  border: none;
+  background: none;
+  color: inherit;
+  padding: 12px 13px;
+  font-family: var(--vfs-mono);
+  font-size: 13px;
+  line-height: 1.6;
+  outline: none;
+}
+
+.vfs-explorer .vfs-log ol {
+  list-style: none;
+  margin: 0;
+  padding: 6px 0;
+  flex: 1;
+  overflow-y: auto;
+  max-height: 320px;
+}
+
+.vfs-explorer .vfs-log li {
+  display: flex;
+  gap: 10px;
+  padding: 4px 13px;
+  font-size: 12.5px;
+}
+
+.vfs-explorer .vfs-log time {
+  color: var(--vfs-muted);
+  font-variant-numeric: tabular-nums;
+  flex: 0 0 auto;
+}
+
+.vfs-explorer .vfs-log li.vfs-ok span {
+  color: var(--vfs-ok);
+}
+
+.vfs-explorer .vfs-log li.vfs-warn span {
+  color: var(--vfs-warn);
+}
+
+.vfs-explorer .vfs-log li.vfs-conflict span {
+  color: var(--vfs-conflict);
+}
