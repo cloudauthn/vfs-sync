@@ -165,16 +165,19 @@ npm run explorer        # vite dev server, the app on its own page
 npm run explorer:build  # static build in explorer/dist, ready to serve or iframe
 ```
 
-It looks like an OS file manager: one tab per root, each on a different backend — two OPFS
-folders, an in-memory adapter, and a real local folder added through the File System Access API.
-Under the tabs sit two columns: the file tree on the left, and a details pane on the right showing
-size, mime type, SHA-256 checksum, tracking state (committed / modified / untracked, entry id,
-last editor) and how the same path stands on every other root — plus an inline editor for text
-files. The footer is a status bar — connection state, current head, last sync — with a target
-selector and a **Sync** button: pick another root to sync the open one against, or *All roots* to
-run the whole chain until it converges. Switching roots keeps the open file selected, so the same
-path can be compared across filesystems. When OPFS is blocked (private window, sandboxed iframe)
-every root falls back to memory.
+It looks like an OS file manager and starts on a **new tab**: the left column browses the origin's
+OPFS — folders that already hold a `.vfs` store carry a *vfs* chip and open straight into a tab,
+plain folders expand (an *Open* action initialises them as roots), and folders can be created and
+deleted in place. The right column offers the other backends: a fresh **MemFS**, or a real folder
+from disk through the File System Access API.
+
+Each opened root is a closable tab. Under the tabs sit two columns: the file tree on the left, and
+a details pane on the right showing size, mime type, SHA-256 checksum, tracking state (committed /
+modified / untracked, entry id, last editor) and how the same path stands on every other root —
+plus an inline editor for text files. The footer is a status bar — state, current head, last sync —
+with a target selector and a **Sync** button: pick another root to sync the open one against, or
+*All roots* to run the whole chain until it converges. Switching roots keeps the open file
+selected, so the same path can be compared across filesystems.
 
 It draws itself into an element you give it, carries scoped styles, and reads nothing from the
 host page — the demo's `/explorer/` page is one `<main>` and one call:
@@ -183,11 +186,11 @@ host page — the demo's `/explorer/` page is one `<main>` and one call:
 import { mountExplorer } from './explorer/src/index';
 
 const explorer = mountExplorer('#explorer', {
-  opfsRoot: 'my-app-explorer', // where the stored peers live; one root per mount
-  seed: { 'notes.md': '# Notes\n' }, // written to the first peer when it boots empty
+  opfsRoot: '', // OPFS subfolder the browser starts at; '' is the origin root
+  seed: { 'notes.md': '# Notes\n' }, // written to the first root you open when it is brand new
   autoSyncMs: 3000,
-  localFolder: true, // offer the "Open folder" tab
-  toolbar: true, // draw the footer's sync controls (target, sync, auto-sync, reset)
+  localFolder: true, // offer the "pick a folder from your system" card
+  toolbar: true, // draw the footer's sync controls (target, sync, auto-sync)
   activityLog: true, // offer the activity drawer the status bar opens
   onLog: (message, kind) => console.log(kind, message),
 });

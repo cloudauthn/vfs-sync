@@ -15,10 +15,11 @@
       <div>
         <h1>File explorer</h1>
         <p class="tagline">
-          One root per backend — two OPFS folders, memory, and a real folder from your disk through
-          the File System Access API — laid out like an OS file manager: roots as tabs, a tree on
-          the left, and a details pane with size, mime, checksum and how the same path stands on
-          every other root. The footer picks a sync target and runs it.
+          An OS-style file manager over vfs-sync. It starts on a new tab: browse this origin's
+          OPFS on the left — folders holding a <code>.vfs</code> store open straight into tabs —
+          or open a MemFS or a real folder from your disk on the right. Every open root is a tab;
+          inside one, a tree on the left and a details pane with size, mime, checksum and how the
+          same path stands on every other root. The footer picks a sync target and runs it.
         </p>
       </div>
       <nav>
@@ -34,11 +35,12 @@
 
     <footer>
       <p>
-        Try it: edit <code>notes.md</code> on the first root and on the last one without syncing in
-        between, then set the footer's target to <b>All roots</b> and hit <b>Sync</b> — the newer
-        edit wins and the other one is preserved as a <code>(conflict …)</code> copy. Switching
-        roots keeps the open file selected, so the details pane shows the same path — size, checksum
-        and all — as another filesystem sees it.
+        Try it: create a folder on the new tab, open it as a root (the first one is seeded with a
+        few files), open a MemFS next to it, and edit <code>notes.md</code> on both without syncing
+        in between. Then set the footer's target to <b>All roots</b> and hit <b>Sync</b> — the
+        newer edit wins and the other one is preserved as a <code>(conflict …)</code> copy.
+        Switching roots keeps the open file selected, so the details pane shows the same path —
+        size, checksum and all — as another filesystem sees it.
       </p>
       <p>
         The explorer is a standalone app in <code>explorer/</code>; this page contributes a heading
@@ -46,7 +48,7 @@
       </p>
       <pre><code>import { mountExplorer } from '../../explorer/src/index';
 
-mountExplorer('#explorer', { opfsRoot: 'my-app-explorer' });</code></pre>
+mountExplorer('#explorer');</code></pre>
       <p>
         It carries its own scoped styles and reads nothing from the host page, so
         <code>npm run explorer:build</code> also gives you a static build to serve on its own and

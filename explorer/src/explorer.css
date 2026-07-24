@@ -134,9 +134,11 @@
   border-radius: 8px 8px 0 0;
   text-align: left;
   white-space: nowrap;
+  cursor: pointer;
+  user-select: none;
 }
 
-.vfs-explorer .vfs-tab:hover:not(:disabled) {
+.vfs-explorer .vfs-tab:hover {
   background: color-mix(in srgb, var(--vfs-panel) 60%, transparent);
   border-color: transparent;
 }
@@ -172,6 +174,30 @@
   padding-left: 20px;
 }
 
+.vfs-explorer .vfs-tab-close {
+  margin-left: auto;
+  padding: 0 3px;
+  border-radius: 5px;
+  color: var(--vfs-muted);
+  font-size: 13px;
+  line-height: 1.2;
+  opacity: 0;
+}
+
+.vfs-explorer .vfs-tab:hover .vfs-tab-close,
+.vfs-explorer .vfs-tab.vfs-active .vfs-tab-close {
+  opacity: 1;
+}
+
+.vfs-explorer .vfs-tab-close:hover {
+  color: var(--vfs-conflict);
+  background: var(--vfs-panel-2);
+}
+
+.vfs-explorer .vfs-tab .vfs-tab-title {
+  width: 100%;
+}
+
 .vfs-explorer .vfs-tab.vfs-add {
   flex: 0 0 auto;
   align-self: center;
@@ -181,6 +207,11 @@
   margin-bottom: 6px;
   border-radius: 7px;
   color: var(--vfs-muted);
+}
+
+.vfs-explorer .vfs-tab.vfs-add.vfs-active {
+  color: var(--vfs-text);
+  box-shadow: inset 0 0 0 1px var(--vfs-accent);
 }
 
 /* ------------------------------------------------------------------ body */
@@ -235,6 +266,17 @@
 .vfs-explorer .vfs-crumbs:hover {
   background: var(--vfs-panel);
   border-color: transparent;
+}
+
+.vfs-explorer .vfs-crumbs-static {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 6px;
+  font-weight: 600;
+  font-size: 12.5px;
+  color: var(--vfs-text);
+  min-width: 0;
 }
 
 .vfs-explorer .vfs-tree {
@@ -313,6 +355,47 @@
 }
 
 .vfs-explorer .vfs-row.vfs-conflict .vfs-name {
+  color: var(--vfs-conflict);
+}
+
+.vfs-explorer .vfs-row.vfs-inert .vfs-name {
+  color: var(--vfs-muted);
+}
+
+/* "vfs" marker on folders that already hold a sync store */
+.vfs-explorer .vfs-chip {
+  flex: 0 0 auto;
+  font-size: 10px;
+  font-weight: 650;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--vfs-accent);
+  border: 1px solid var(--vfs-accent);
+  border-radius: 999px;
+  padding: 0 6px;
+}
+
+/* per-row actions in the OPFS browser (Open / delete) */
+.vfs-explorer button.vfs-rowbtn {
+  flex: 0 0 auto;
+  background: none;
+  border: none;
+  color: var(--vfs-muted);
+  font-size: 11px;
+  padding: 2px 6px;
+  opacity: 0;
+}
+
+.vfs-explorer .vfs-row:hover button.vfs-rowbtn {
+  opacity: 1;
+}
+
+.vfs-explorer button.vfs-rowbtn:hover {
+  color: var(--vfs-text);
+  border-color: transparent;
+}
+
+.vfs-explorer button.vfs-rowbtn.vfs-danger:hover {
   color: var(--vfs-conflict);
 }
 
@@ -498,6 +581,49 @@
   .vfs-explorer .vfs-dot-busy {
     animation: none;
   }
+}
+
+/* ------------------------------------------------------- new-tab cards */
+
+.vfs-explorer .vfs-cards {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 22px;
+  max-width: 460px;
+}
+
+.vfs-explorer button.vfs-card {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 14px 16px;
+  border-radius: 10px;
+  text-align: left;
+  background: var(--vfs-panel-2);
+}
+
+.vfs-explorer .vfs-card-icon {
+  font-size: 22px;
+  line-height: 1.2;
+}
+
+.vfs-explorer .vfs-card-text {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+.vfs-explorer .vfs-card-title {
+  font-weight: 650;
+  font-size: 13.5px;
+}
+
+.vfs-explorer .vfs-card-sub {
+  color: var(--vfs-muted);
+  font-size: 12px;
+  white-space: normal;
 }
 
 /* ---------------------------------------------------------------- editor */
