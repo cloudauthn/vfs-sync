@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>vfs-sync — multi-peer folder sync demo</title>
+    <meta
+      name="description"
+      content="Live demo of @cloudauthn/vfs-sync: sync folders across OPFS, the File System Access API and memory."
+    />
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <header class="masthead">
+      <div>
+        <h1>vfs-sync</h1>
+        <p class="tagline">
+          Three peers wired as a chain: <b>A &harr; B &harr; C</b>. A and C never talk directly —
+          changes reach the far end because every edge runs its own sync.
+        </p>
+      </div>
+      <nav>
+        <a href="https://github.com/cloudauthn/vfs-sync">GitHub</a>
+        <a href="https://www.npmjs.com/package/@cloudauthn/vfs-sync">npm</a>
+      </nav>
+    </header>
+
+    <section class="toolbar">
+      <button id="sync-all" class="primary">Sync the whole chain</button>
+      <label class="switch">
+        <input type="checkbox" id="auto-sync" />
+        <span>Auto-sync every 3s</span>
+      </label>
+      <button id="add-local" hidden>Add a local folder as a 4th peer…</button>
+      <button id="reset" class="danger">Reset</button>
+      <span id="backend" class="badge"></span>
+    </section>
+
+    <main id="peers" class="peers"></main>
+
+    <section class="workbench">
+      <div class="editor" id="editor">
+        <div class="editor-head">
+          <span id="editor-title">Select a file to edit</span>
+          <button id="save" class="primary" disabled>Save</button>
+        </div>
+        <textarea id="content" spellcheck="false" disabled placeholder="No file selected"></textarea>
+      </div>
+
+      <div class="log">
+        <div class="log-head"><span>Activity</span><button id="clear-log">Clear</button></div>
+        <ol id="log-list"></ol>
+      </div>
+    </section>
+
+    <footer>
+      <p>
+        Try it: edit <code>notes.md</code> on <b>A</b> and on <b>C</b> without syncing in between,
+        then hit <b>Sync the whole chain</b> — the newer edit wins and the other one is preserved
+        as a <code>(conflict …)</code> copy.
+      </p>
+    </footer>
+
+    <script type="module" src="./main.ts"></script>
+  </body>
+</html>
