@@ -108,6 +108,56 @@ describe('mergeTrees', () => {
     });
   });
 
+  it('takes a rename from either side', () => {
+    const base = tree(entry({ id: '1', path: 'a.md', hash: 'old' }));
+    const unchanged = tree(entry({ id: '1', path: 'a.md', hash: 'old' }));
+    const renamed = tree(entry({ id: '1', path: 'moved.md', hash: 'old', mtime: 2000 }));
+
+    // B renamed, A did not
+    expect(mergeTrees(base, unchanged, renamed, options).tree.entries[0]?.path).toBe('moved.md');
+    // and the mirror image
+    expect(mergeTrees(base, renamed, unchanged, options).tree.entries[0]?.path).toBe('moved.md');
+  });
+
+  it('resolves two different renames as a location conflict', () => {
+    const base = tree(entry({ id: '1', path: 'a.md', hash: 'same' }));
+    const a = tree(entry({ id: '1', path: 'left.md', hash: 'same', mtime: 1000 }));
+    const b = tree(entry({ id: '1', path: 'right.md', hash: 'same', mtime: 2000 }));
+
+    const { tree: merged, conflicts } = mergeTrees(base, a, b, options);
+
+    expect(conflicts).toHaveLength(1);
+    expect(conflicts[0]?.kind).toBe('location');
+    expect(merged.entries[0]).toMatchObject({ path: 'right.md', renamedFrom: 'a.md' });
+    // content never diverged, so there is nothing to preserve a copy of
+    expect(conflicts[0]?.copy).toBeUndefined();
+    expect(merged.entries).toHaveLength(1);
+  });
+
+  it('reports a content conflict rather than a location one when both differ', () => {
+    const base = tree(entry({ id: '1', path: 'a.md', hash: 'old' }));
+    const a = tree(entry({ id: '1', path: 'left.md', hash: 'x', mtime: 1000 }));
+    const b = tree(entry({ id: '1', path: 'right.md', hash: 'y', mtime: 2000 }));
+
+    const { conflicts } = mergeTrees(base, a, b, options);
+    expect(conflicts).toHaveLength(1);
+    expect(conflicts[0]?.kind).toBe('content'); // the more serious of the two
+  });
+
+  it('breaks an mtime tie deterministically instead of by argument order', () => {
+    const base = tree(entry({ id: '1', path: 'a.md', hash: 'old' }));
+    const a = tree(entry({ id: '1', path: 'a.md', hash: 'aaa', mtime: 5000 }));
+    const b = tree(entry({ id: '1', path: 'a.md', hash: 'bbb', mtime: 5000 }));
+
+    const left = mergeTrees(base, a, b, options).tree.entries.find((e) => e.path === 'a.md');
+    const right = mergeTrees(base, b, a, { peerA: 'device-b', peerB: 'device-a' }).tree.entries.find(
+      (e) => e.path === 'a.md',
+    );
+
+    expect(left?.hash).toBe('bbb'); // higher hash wins the tie
+    expect(right?.hash).toBe(left?.hash);
+  });
+
   it('reports delete-versus-edit and lets the newer side win', () => {
     const base = tree(entry({ id: '1', path: 'a.md', hash: 'old' }));
     const a = tree(entry({ id: '1', path: 'a.md', hash: null, deleted: true, mtime: 3000 }));

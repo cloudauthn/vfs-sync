@@ -185,8 +185,11 @@ export function mergeTrees(base: Tree, a: Tree, b: Tree, options: MergeOptions):
     const loserPeer = loser.peer ?? (winner === 'a' ? options.peerB : options.peerA);
     const report: ConflictReport = { id: item.id, kind: conflict, path, winner, a: left, b: right };
 
+    // A location conflict puts no content at risk — the file simply lands on
+    // one of the two paths — so copying it would just duplicate the file.
+    const contentAtRisk = conflict !== 'location' && !!loser.hash;
     const keepCopy =
-      policy === 'always' ? !!loser.hash : policy === 'edits' ? !!loser.hash && !!content.hash : false;
+      policy === 'always' ? contentAtRisk : policy === 'edits' ? contentAtRisk && !!content.hash : false;
 
     if (keepCopy) {
       const copyPath = nameConflict({

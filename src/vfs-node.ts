@@ -153,6 +153,7 @@ export class VFSNode {
       else vanishedByHash.set(entry.hash, [entry]);
     }
     const pendingByTarget = new Map(cache.renames.map((r) => [r.to, r]));
+    const renamedAway = new Set(cache.renames.map((r) => r.from));
 
     const usedIds = new Set<string>();
     const entries: TreeEntry[] = [];
@@ -166,18 +167,29 @@ export class VFSNode {
         id = native;
         source = prevById.get(native);
       } else {
-        source = prevByPath.get(file.path);
-        if (!source) {
-          // explicit rename recorded by `rename()` wins over the hash heuristic
-          const pending = pendingByTarget.get(file.path);
-          source = pending ? prevByPath.get(pending.from) : undefined;
-          if (!source) source = takeVanished(vanishedByHash, file.hash, usedIds);
-        }
-        id = source?.id;
+        // 1. A rename recorded through node.rename() is the strongest signal
+        //    we have, so it outranks path continuity. It has to: in a swap
+        //    (a -> b, b -> a) both paths still exist, and trusting the path
+        //    would pin each identity to the wrong file.
+        const pending = pendingByTarget.get(file.path);
+        if (pending) source = prevByPath.get(pending.from);
+        // 2. Same path as last time — the common case. Skipped when this path
+        //    was itself renamed away, because then whatever sits here now is a
+        //    different file that merely reused the name.
+        if (!source && !renamedAway.has(file.path)) source = prevByPath.get(file.path);
+        // 3. Same content under a path we no longer see: a move made outside
+        //    the VFS, e.g. the user dragging the file in Finder.
+        if (!source) source = takeVanished(vanishedByHash, file.hash, usedIds);
+        // 4. Discovered but not yet committed: the id is already in the cache,
+        //    so scanning twice does not mint a second identity.
+        id = source?.id ?? cache.files[file.path]?.id;
+        if (!source && id) source = prevById.get(id);
       }
-      // A path discovered but not yet committed already has an id in the
-      // cache; reuse it so scanning twice does not mint a second identity.
-      id ??= cache.files[file.path]?.id;
+      // Two files must never claim one identity; the loser starts a new one.
+      if (id && usedIds.has(id)) {
+        id = undefined;
+        source = undefined;
+      }
       id ??= randomId();
       usedIds.add(id);
 
@@ -249,9 +261,15 @@ export class VFSNode {
     const treeHash = await this.store.putTree(tree);
     const head = await this.store.head();
 
-    if (!options.force && !options.parents && head) {
-      const current = await this.store.getCommit(head);
-      if (current.tree === treeHash) return null;
+    if (!options.force && !options.parents) {
+      if (head) {
+        const current = await this.store.getCommit(head);
+        if (current.tree === treeHash) return null;
+      } else if (tree.entries.length === 0) {
+        // An empty folder that has never been committed has no history to
+        // record; a root commit here would only be noise for peers to merge.
+        return null;
+      }
     }
 
     const commit: Commit = {

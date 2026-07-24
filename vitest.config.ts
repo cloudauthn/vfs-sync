@@ -7,7 +7,9 @@ export default defineConfig({
     coverage: {
       provider: 'v8',
       include: ['src/**/*.ts'],
-      exclude: ['src/adapters/opfs.ts', 'src/adapters/fsa.ts'],
+      // barrels and type-only modules carry no logic to exercise
+      exclude: ['src/index.ts', 'src/node.ts', 'src/types.ts'],
+      thresholds: { statements: 95, branches: 90, functions: 95, lines: 95 },
     },
   },
 });
