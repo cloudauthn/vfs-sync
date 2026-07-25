@@ -134,7 +134,9 @@ export function PeerSidebar({ model, peer }: { model: ExplorerModel; peer: Peer 
         </button>
       </div>
       <ul class="vfs-tree" role="tree">
-        {snapshot.files.length === 0 ? (
+        {model.treeLoading ? (
+          <li class="vfs-empty">Loading…</li>
+        ) : snapshot.files.length === 0 ? (
           <li class="vfs-empty">This folder is empty</li>
         ) : (
           treeRows(model, peer, buildTree(snapshot.files), 0)

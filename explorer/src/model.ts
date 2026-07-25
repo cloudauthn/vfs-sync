@@ -266,6 +266,8 @@ export class ExplorerModel {
   browseDetailsLoading = false;
   /** Shown while switching browse source and its folder tree is still loading. */
   newTabLoading = false;
+  /** Shown while an opened peer tab's file tree (its first walk) is loading. */
+  treeLoading = false;
   newTab: NewTabView | null = null;
 
   readonly autoSyncBoxId = `vfs-auto-${Math.random().toString(36).slice(2, 8)}`;
@@ -282,6 +284,8 @@ export class ExplorerModel {
    * from an edit made here; a change made elsewhere shows on the next reopen.
    */
   private readonly browseCache = new Map<string, VFSListEntry[]>();
+  /** Browse-tree folders whose children are still being listed, keyed `sourceKey:path`. */
+  private readonly browseLoading = new Set<string>();
 
   /** Bumped on every selection change; a stale async load drops its result. */
   private detailToken = 0;
@@ -468,6 +472,7 @@ export class ExplorerModel {
     }
     this.browseDetailsLoading = false;
     this.newTabLoading = false;
+    this.treeLoading = false;
     this.emit();
   }
 
@@ -693,10 +698,18 @@ export class ExplorerModel {
     const seq = ++this.newTabSeq;
     const view = await this.buildNewTab();
     if (seq !== this.newTabSeq) return; // a newer source switch won the race
+    // The rebuilt rows already contain every expanded folder's children, so any
+    // "Loading…" placeholders they were standing in for are now resolved.
+    this.browseLoading.clear();
     this.newTab = view;
     this.newTabLoading = false;
     this.browseDetailsLoading = false;
     this.emit();
+  }
+
+  /** True while a browse folder's children are still being listed. */
+  isBrowseLoading(source: BrowseSource, path: string): boolean {
+    return this.browseLoading.has(`${source.key}:${normalizePath(path)}`);
   }
 
   selectBrowse(source: BrowseSource, path: string, kind: 'file' | 'directory'): void {
@@ -723,8 +736,15 @@ export class ExplorerModel {
   }
 
   toggleBrowseDir(source: BrowseSource, path: string, expanded: boolean): void {
-    if (expanded) source.expanded.delete(path);
-    else source.expanded.add(path);
+    if (expanded) {
+      source.expanded.delete(path);
+    } else {
+      source.expanded.add(path);
+      // Mark it loading so a placeholder appears under it at once; the listing
+      // of its children (a request each on Drive) fills in behind that.
+      this.browseLoading.add(`${source.key}:${normalizePath(path)}`);
+    }
+    this.emit(); // flip the twisty and show the placeholder immediately
     void this.refreshNewTab();
   }
 
@@ -834,9 +854,13 @@ export class ExplorerModel {
         this.log(`${label} is not initialised as vFS`, 'warn');
         return;
       }
-      const fresh = !hasStore && (await walk(adapter)).length === 0;
       const peer = await this.addPeer(key, label, adapter, source.backend, source.fsa);
-      await this.maybeSeed(peer, fresh);
+      // Seeding is MemFS-only, so the emptiness walk is only worth taking there;
+      // every other backend skips it and opens the tab without a blocking scan.
+      if (peer.backend === 'memory') {
+        const fresh = !hasStore && (await walk(adapter)).length === 0;
+        await this.maybeSeed(peer, fresh);
+      }
       // Initialising just wrote a `.vfs` store into the folder; drop its cached
       // listing so the vFS badge shows when the browser is reopened.
       if (!hasStore) this.forgetListing(source, path);
@@ -945,9 +969,9 @@ export class ExplorerModel {
       if (!hasStore && !confirm(`${label} holds no .vfs store yet. Initialise it as a vFS root?`)) {
         return;
       }
-      const fresh = !hasStore && (await walk(adapter)).length === 0;
+      // A disk folder is never MemFS, so seeding never applies and the emptiness
+      // scan is skipped — the tab opens without a blocking walk.
       const peer = await this.addPeer(`fsav:${++this.fsaSeq}`, label, adapter, 'local folder', adapter);
-      await this.maybeSeed(peer, fresh);
       this.log(hasStore ? `opened ${label} from disk` : `initialised ${label} as vFS`, 'ok');
       await this.activate(peer);
     } catch (error) {
@@ -971,13 +995,17 @@ export class ExplorerModel {
    */
   async activate(peer: Peer): Promise<void> {
     this.active = peer.key;
-    // Switch the tab in on the spot, reusing the snapshot we already hold; no
-    // full re-render, so opening a tab never re-walks every peer.
+    // Switch the tab in on the spot. If we already hold its snapshot the tree
+    // shows at once; otherwise a "Loading…" placeholder stands in while the
+    // first walk runs, so opening a tab never blocks on the data.
+    this.treeLoading = !this.snapshots.has(peer.key);
     this.emit();
     if (peer.fsa && !(await peer.fsa.hasPermission())) {
       this.log(`${peer.label} needs its permission re-granted`, 'warn');
     }
     await this.ensureSnapshot(peer);
+    this.treeLoading = false;
+    this.emit();
     const path = this.selection?.path;
     const stat = path ? await peer.adapter.stat(path) : null;
     if (path && stat) {

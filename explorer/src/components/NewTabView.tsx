@@ -150,11 +150,15 @@ function BrowseRowItem({
 }): JSX.Element {
   const selected = model.browseSel?.source === source.key && model.browseSel.path === row.path;
   if (row.kind === 'directory') {
+    // Read the expanded state live so the twisty flips the instant it is
+    // toggled, before the (async) rebuild of the children lands.
+    const expanded = source.expanded.has(row.path);
+    const loading = model.isBrowseLoading(source, row.path);
     return (
       <li
         class={`vfs-row vfs-dir${selected ? ' vfs-selected' : ''}`}
         role="treeitem"
-        aria-expanded={row.expanded}
+        aria-expanded={expanded}
         aria-selected={selected || undefined}
       >
         <div class="vfs-entry-line">
@@ -163,18 +167,18 @@ function BrowseRowItem({
             style={{ paddingLeft: row.depth * 14 + 6 }}
             title={row.path}
             onClick={() => model.selectBrowse(source, row.path, 'directory')}
-            onDblClick={() => model.toggleBrowseDir(source, row.path, row.expanded)}
+            onDblClick={() => model.toggleBrowseDir(source, row.path, expanded)}
           >
             <span
               class="vfs-twisty"
               onClick={(event) => {
                 event.stopPropagation();
-                model.toggleBrowseDir(source, row.path, row.expanded);
+                model.toggleBrowseDir(source, row.path, expanded);
               }}
             >
-              {row.expanded ? '▾' : '▸'}
+              {expanded ? '▾' : '▸'}
             </span>
-            <span class="vfs-icon-cell">{row.expanded ? '📂' : '📁'}</span>
+            <span class="vfs-icon-cell">{expanded ? '📂' : '📁'}</span>
             <span class="vfs-name">{row.name}</span>
             <span class="vfs-meta">{`${row.childCount}`}</span>
           </button>
@@ -197,6 +201,11 @@ function BrowseRowItem({
             <span class="vfs-chip">vFS</span>
             <span class="vfs-vfsid">{row.info.storeId}</span>
           </button>
+        )}
+        {loading && (
+          <div class="vfs-tree-loading" style={{ paddingLeft: (row.depth + 1) * 14 + 24 }}>
+            Loading…
+          </div>
         )}
       </li>
     );

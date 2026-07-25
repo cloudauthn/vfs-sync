@@ -402,6 +402,12 @@
   text-align: center;
 }
 
+.vfs-explorer .vfs-tree-loading {
+  color: var(--vfs-muted);
+  font-size: 12px;
+  padding: 3px 6px;
+}
+
 /* --------------------------------------------------------------- details */
 
 .vfs-explorer .vfs-details,
