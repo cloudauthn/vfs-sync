@@ -274,6 +274,14 @@ export class ExplorerModel {
   private readonly listeners = new Set<() => void>();
   private readonly decoder = new TextDecoder();
   private readonly encoder = new TextEncoder();
+  /**
+   * Browse-tree listings, keyed `sourceKey:path`. Rebuilding the tree on every
+   * structural change would otherwise re-list every visible folder — a network
+   * round trip each on Drive. Cleared whenever the new-tab view is (re)opened,
+   * and invalidated per-path on our own mutations, so it never shows stale data
+   * from an edit made here; a change made elsewhere shows on the next reopen.
+   */
+  private readonly browseCache = new Map<string, VFSListEntry[]>();
 
   /** Bumped on every selection change; a stale async load drops its result. */
   private detailToken = 0;
@@ -466,6 +474,9 @@ export class ExplorerModel {
 
   async activateNewTab(): Promise<void> {
     this.active = '';
+    // Opening the browser is the moment to read the backends afresh, so a change
+    // made inside a tab (or elsewhere) since last time shows.
+    this.browseCache.clear();
     await this.render();
   }
 
@@ -541,6 +552,30 @@ export class ExplorerModel {
     }
   }
 
+  /** A folder's listing, served from cache when we already fetched it. */
+  private async browseList(source: BrowseSource, path: string): Promise<VFSListEntry[]> {
+    if (!source.adapter) return [];
+    const key = `${source.key}:${normalizePath(path)}`;
+    const hit = this.browseCache.get(key);
+    if (hit) return hit;
+    const entries = await source.adapter.list(path);
+    this.browseCache.set(key, entries);
+    return entries;
+  }
+
+  /** Drop one folder's cached listing (its direct children changed). */
+  private forgetListing(source: BrowseSource, path: string): void {
+    this.browseCache.delete(`${source.key}:${normalizePath(path)}`);
+  }
+
+  /** Drop a folder's listing and every listing beneath it. */
+  private forgetSubtree(source: BrowseSource, path: string): void {
+    const prefix = `${source.key}:${normalizePath(path)}`;
+    for (const key of [...this.browseCache.keys()]) {
+      if (key === prefix || key.startsWith(`${prefix}/`)) this.browseCache.delete(key);
+    }
+  }
+
   /** One level of the tree; expanded folders recurse, in display order. */
   private async collectBrowseRows(
     source: BrowseSource,
@@ -548,9 +583,10 @@ export class ExplorerModel {
     depth: number,
     out: BrowseRow[],
   ): Promise<void> {
-    const adapter = source.adapter;
-    if (!adapter) return;
-    const entries = (await adapter.list(dir)).filter((entry) => entry.name !== CONTROL_DIR);
+    if (!source.adapter) return;
+    const entries = (await this.browseList(source, dir)).filter(
+      (entry) => entry.name !== CONTROL_DIR,
+    );
     entries.sort((a, b) =>
       a.kind === b.kind ? (a.name < b.name ? -1 : 1) : a.kind === 'directory' ? -1 : 1,
     );
@@ -558,8 +594,8 @@ export class ExplorerModel {
       if (entry.kind === 'directory') {
         // One listing per folder gives both the child count and the `.vfs`
         // probe; a separate stat would double the requests on Drive.
-        const children = await adapter.list(entry.path);
-        const info = await this.readVfsInfo(adapter, entry.path, children);
+        const children = await this.browseList(source, entry.path);
+        const info = await this.readVfsInfo(source.adapter, entry.path, children);
         const visible = children.filter((c) => c.name !== CONTROL_DIR);
         const expanded = source.expanded.has(entry.path);
         out.push({
@@ -592,12 +628,14 @@ export class ExplorerModel {
     const picked = this.browseSel && this.browseSel.source === source.key ? this.browseSel : null;
     if (!picked || !adapter) return { kind: 'intro' };
 
-    const stat = await adapter.stat(picked.path);
-    if (!stat) {
-      this.browseSel = null;
-      return { kind: 'intro' };
-    }
-    if (stat.kind === 'file') {
+    // The kind is already known from the row that was clicked, so a directory
+    // needs no `stat` — only a file does, for its size and mtime.
+    if (picked.kind === 'file') {
+      const stat = await adapter.stat(picked.path);
+      if (!stat) {
+        this.browseSel = null;
+        return { kind: 'intro' };
+      }
       return {
         kind: 'file',
         path: picked.path,
@@ -606,11 +644,10 @@ export class ExplorerModel {
         stat,
       };
     }
-    // Shallow on purpose: one listing, not a recursive walk. On Drive every
-    // level is a network round trip, so summing a whole subtree here made a
-    // folder click fan out into dozens of requests. The same listing feeds the
-    // `.vfs` probe, so a directory's details cost exactly one request.
-    const children = await adapter.list(picked.path);
+    // Shallow on purpose: one listing (cached), not a recursive walk. The same
+    // listing feeds the `.vfs` probe, so a directory's details cost is at most
+    // one request — and none once the tree has already listed it.
+    const children = await this.browseList(source, picked.path);
     const info = await this.readVfsInfo(adapter, picked.path, children);
     return {
       kind: 'directory',
@@ -622,6 +659,9 @@ export class ExplorerModel {
   }
 
   selectSource(source: BrowseSource): void {
+    // Re-clicking the chip that is already open is a refresh: drop its cached
+    // listings so the tree re-reads the backend.
+    if (this.activeSource === source.key) this.forgetSubtree(source, '');
     this.activeSource = source.key;
     this.browseSel = null;
     // Highlight the chip and show the new source's intro straight away; the
@@ -685,6 +725,10 @@ export class ExplorerModel {
       if (!relative) return;
       const path = joinPath(base, relative);
       await source.adapter.mkdir(path);
+      // The base's listing gained a child; the new folder is known-empty. Seed
+      // that so the rebuild re-lists only the base, not the whole tree.
+      this.forgetListing(source, base);
+      this.browseCache.set(`${source.key}:${path}`, []);
       // reveal it: the base and every ancestor of the new folder unfold
       const segments = path.split('/');
       for (let i = 1; i < segments.length; i++) {
@@ -709,6 +753,8 @@ export class ExplorerModel {
         await this.closePeer(peer);
       }
       await source.adapter.delete(path);
+      this.forgetListing(source, dirname(path));
+      this.forgetSubtree(source, path);
       source.expanded.delete(path);
       if (
         this.browseSel?.source === source.key &&
@@ -729,6 +775,7 @@ export class ExplorerModel {
     }
     const index = this.sources.indexOf(source);
     if (index !== -1) this.sources.splice(index, 1);
+    this.forgetSubtree(source, '');
     if (source.backend === 'GDrive') {
       this.gdriveToken = null;
       if (this.gdriveClientId) clearGoogleToken(this.gdriveClientId, this.gdriveScope);
@@ -773,6 +820,9 @@ export class ExplorerModel {
       const fresh = !hasStore && (await walk(adapter)).length === 0;
       const peer = await this.addPeer(key, label, adapter, source.backend, source.fsa);
       await this.maybeSeed(peer, fresh);
+      // Initialising just wrote a `.vfs` store into the folder; drop its cached
+      // listing so the vFS badge shows when the browser is reopened.
+      if (!hasStore) this.forgetListing(source, path);
       this.log(hasStore ? `opened ${label}` : `initialised ${label} as vFS`, 'ok');
       await this.activate(peer);
     } catch (error) {
