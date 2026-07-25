@@ -1117,12 +1117,27 @@ export class ExplorerModel {
       return detail;
     }
 
-    detail.stat = await peer.adapter.stat(current.path);
+    // The tree walk already stat'd every file, so reuse it instead of asking
+    // the backend again; only fall back to a stat if the path is not in it.
+    const walked = snapshot.files.find((file) => file.path === current.path);
+    detail.stat = walked?.stat ?? (await peer.adapter.stat(current.path));
     if (!detail.stat) return detail;
 
-    detail.hash = await this.hashOf(peer, current.path, detail.stat.size);
-    if (isTextMime(mime) && detail.stat.size <= EDIT_LIMIT) {
-      detail.text = this.decoder.decode(await peer.node.read(current.path));
+    const size = detail.stat.size;
+    const wantsText = isTextMime(mime) && size <= EDIT_LIMIT;
+    try {
+      if (size <= STREAM_HASH_OVER) {
+        // Small enough to pull once: hash and (when text) decode from the same
+        // bytes, rather than downloading the file a second time for the editor.
+        const bytes = await peer.node.read(current.path);
+        detail.hash = await sha256(bytes);
+        if (wantsText) detail.text = this.decoder.decode(bytes);
+      } else {
+        // Too big to hold whole: stream the checksum, never load it as text.
+        detail.hash = await sha256Stream(await peer.node.readStream(current.path));
+      }
+    } catch {
+      // unreadable — leave hash/text null, as hashOf would
     }
 
     for (const other of this.peers) {
