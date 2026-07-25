@@ -7,7 +7,9 @@ import {
   ScopedAdapter,
   VFSNode,
   basename,
+  dirname,
   isOPFSAvailable,
+  joinPath,
   normalizePath,
   sha256,
   sha256Stream,
@@ -15,7 +17,7 @@ import {
   syncUntilStable,
   walk,
 } from '../../src/index';
-import { googleTokenProvider } from './gis';
+import { clearGoogleToken, googleTokenProvider, hasCachedGoogleToken } from './gis';
 import type {
   ConflictReport,
   Hash,
@@ -279,6 +281,8 @@ export class ExplorerModel {
   private autoTimer: ReturnType<typeof setInterval> | undefined;
   private fsaSeq = 0;
   private gdriveSeq = 0;
+  /** The one Drive source's token provider, reused so a refresh reaches its adapter. */
+  private gdriveToken: (() => Promise<string>) | null = null;
 
   constructor(options: ExplorerOptions = {}) {
     this.options = options;
@@ -363,7 +367,7 @@ export class ExplorerModel {
     this.sources.push(opfs);
     this.activeSource = opfs.adapter ? 'opfs' : 'mem';
     if (opfs.error) this.log(opfs.error, 'warn');
-    await this.restoreGDrive();
+    this.restoreGDrive();
     await this.render();
   }
 
@@ -638,19 +642,26 @@ export class ExplorerModel {
 
   async newBrowseFolder(source: BrowseSource): Promise<void> {
     if (!source.adapter?.mkdir) return;
-    const name = prompt('Folder name (a / creates nested folders)', 'my-root');
+    // Create inside the current selection: a picked folder is the parent, a
+    // picked file contributes its folder, and nothing selected means the root.
+    const sel = this.browseSel?.source === source.key ? this.browseSel : null;
+    const base = sel ? (sel.kind === 'directory' ? sel.path : dirname(sel.path)) : '';
+    const where = base ? `${source.label} / ${base}` : source.label;
+    const name = prompt(`New folder in ${where} (a / nests)`, 'new-folder');
     if (!name) return;
     try {
-      const path = normalizePath(name);
-      if (!path) return;
+      const relative = normalizePath(name);
+      if (!relative) return;
+      const path = joinPath(base, relative);
       await source.adapter.mkdir(path);
-      // reveal it: every ancestor of the new folder unfolds
+      // reveal it: the base and every ancestor of the new folder unfold
       const segments = path.split('/');
       for (let i = 1; i < segments.length; i++) {
         source.expanded.add(segments.slice(0, i).join('/'));
       }
       this.log(`created folder ${path} on ${source.label}`, 'ok');
       await this.render();
+      this.selectBrowse(source, path, 'directory');
     } catch (error) {
       this.log(String(error), 'warn');
     }
@@ -687,7 +698,10 @@ export class ExplorerModel {
     }
     const index = this.sources.indexOf(source);
     if (index !== -1) this.sources.splice(index, 1);
-    if (source.backend === 'GDrive') this.rememberGDrive(false);
+    if (source.backend === 'GDrive') {
+      this.gdriveToken = null;
+      if (this.gdriveClientId) clearGoogleToken(this.gdriveClientId, this.gdriveScope);
+    }
     if (this.activeSource === source.key) this.activeSource = this.sources[0]?.key ?? '';
     if (this.browseSel?.source === source.key) this.browseSel = null;
     this.log(`forgot ${source.label}`);
@@ -763,12 +777,13 @@ export class ExplorerModel {
     }
   }
 
-  private static readonly GDRIVE_MEMO = 'vfs-explorer:gdrive';
-
   /**
    * "Connect Drive": authorise with Google (client-side, via GIS) and add the
-   * user's Drive to the switcher as a browsable filesystem. Must run from a
-   * click — the consent popup needs a user gesture the first time.
+   * user's Drive to the switcher as a browsable filesystem. Runs from a click,
+   * so the token popup has a live user gesture. A cached token (from a previous
+   * session, kept in localStorage) is served without any popup; only an expired
+   * or missing one opens the consent/refresh flow — and with `prompt: ''` that
+   * is a silent refresh, not a fresh login, once the grant exists.
    */
   async connectGDrive(): Promise<void> {
     if (!this.gdriveClientId) {
@@ -776,13 +791,17 @@ export class ExplorerModel {
       return;
     }
     const existing = this.sources.find((source) => source.backend === 'GDrive');
-    if (existing) return this.selectSource(existing);
+    // Reuse the existing source's provider so an expired token refreshes in
+    // place (its adapter keeps working); otherwise mint a fresh one.
+    const token = existing
+      ? (this.gdriveToken as () => Promise<string>)
+      : googleTokenProvider(this.gdriveClientId, this.gdriveScope);
     try {
-      const token = await googleTokenProvider(this.gdriveClientId, this.gdriveScope);
-      await token(); // draw the consent screen now, while the gesture is live
-      this.addGDriveSource(token, true);
-      this.rememberGDrive(true);
-      this.log('connected Google Drive', 'ok');
+      await token(); // cached-or-interactive, within the click's gesture
+      const source = existing ?? this.addGDriveSource(token);
+      this.activeSource = source.key;
+      this.browseSel = null;
+      this.log(existing ? 'refreshed Google Drive' : 'connected Google Drive', 'ok');
       await this.render();
     } catch (error) {
       this.log(String(error), 'warn');
@@ -790,56 +809,29 @@ export class ExplorerModel {
   }
 
   /**
-   * On boot, silently re-attach Drive if it was connected in a previous
-   * session. No gesture and no consent screen: the token comes back through a
-   * hidden frame while the grant still stands. If it needs interaction again,
-   * we drop the memo and leave the "Connect Drive" button for the user.
+   * On boot, re-attach Drive if a still-valid token is cached — no popup and no
+   * network here: the provider serves the stored token, and its first real use
+   * (when the user opens the Drive source) needs no gesture while it lasts.
    */
-  private async restoreGDrive(): Promise<void> {
-    if (!this.gdriveClientId || !this.recalledGDrive()) return;
-    try {
-      const token = await googleTokenProvider(this.gdriveClientId, this.gdriveScope);
-      await token();
-      this.addGDriveSource(token, false);
-      this.log('reconnected Google Drive', 'ok');
-    } catch {
-      this.rememberGDrive(false);
-    }
+  private restoreGDrive(): void {
+    if (!this.gdriveClientId || !hasCachedGoogleToken(this.gdriveClientId, this.gdriveScope)) return;
+    this.addGDriveSource(googleTokenProvider(this.gdriveClientId, this.gdriveScope));
+    this.log('restored Google Drive session', 'ok');
   }
 
-  private addGDriveSource(token: () => Promise<string>, activate: boolean): void {
-    const adapter = new GDriveAdapter({ token, name: 'Drive' });
+  private addGDriveSource(token: () => Promise<string>): BrowseSource {
+    this.gdriveToken = token;
     const source: BrowseSource = {
       key: `gdrive:${++this.gdriveSeq}`,
       label: 'Google Drive',
       icon: BACKEND_ICON.GDrive,
       backend: 'GDrive',
-      adapter,
+      adapter: new GDriveAdapter({ token, name: 'Drive' }),
       removable: true,
       expanded: new Set(),
     };
     this.sources.push(source);
-    if (activate) {
-      this.activeSource = source.key;
-      this.browseSel = null;
-    }
-  }
-
-  private rememberGDrive(on: boolean): void {
-    try {
-      if (on) localStorage.setItem(ExplorerModel.GDRIVE_MEMO, '1');
-      else localStorage.removeItem(ExplorerModel.GDRIVE_MEMO);
-    } catch {
-      // storage unavailable (private mode); reconnect stays manual
-    }
-  }
-
-  private recalledGDrive(): boolean {
-    try {
-      return localStorage.getItem(ExplorerModel.GDRIVE_MEMO) === '1';
-    } catch {
-      return false;
-    }
+    return source;
   }
 
   /** "Pick vFS": straight to a tab, offering to initialise a plain folder. */

@@ -1,6 +1,13 @@
 // Google Identity Services, just enough of it to hand GDriveAdapter a token.
 // This is the whole "no backend" story: a public OAuth client id, a script from
 // Google, and an access token minted in the browser — nothing server-side.
+//
+// The token is cached in localStorage so a page reload keeps browsing Drive
+// without a fresh popup, up to the token's ~1h lifetime. That is a deliberate
+// trade-off: an access token in web storage is a mild XSS exposure (short-lived,
+// drive.file scope). GIS has no silent refresh in its token model — a new token
+// always needs a user gesture — so once the cached one expires, the next
+// interactive call has to come from a click.
 
 interface TokenResponse {
   access_token?: string;
@@ -50,42 +57,91 @@ function loadGis(): Promise<void> {
   return loading;
 }
 
+// ------------------------------------------------------------ token storage
+
+interface StoredToken {
+  token: string;
+  /** Epoch ms; treated as expired a minute early so calls never race the edge. */
+  expiresAt: number;
+}
+
+function storageKey(clientId: string, scope: string): string {
+  return `vfs-explorer:gtoken:${clientId}:${scope}`;
+}
+
+function loadStored(clientId: string, scope: string): StoredToken | null {
+  try {
+    const raw = localStorage.getItem(storageKey(clientId, scope));
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as StoredToken;
+    if (!parsed.token || Date.now() >= parsed.expiresAt - 60_000) return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function saveStored(clientId: string, scope: string, value: StoredToken): void {
+  try {
+    localStorage.setItem(storageKey(clientId, scope), JSON.stringify(value));
+  } catch {
+    // storage unavailable (private mode); the session just won't survive reload
+  }
+}
+
+/** True when a still-valid token is cached — lets boot re-attach without a popup. */
+export function hasCachedGoogleToken(clientId: string, scope: string): boolean {
+  return loadStored(clientId, scope) !== null;
+}
+
+/** Forget the cached token, e.g. when the user disconnects Drive. */
+export function clearGoogleToken(clientId: string, scope: string): void {
+  try {
+    localStorage.removeItem(storageKey(clientId, scope));
+  } catch {
+    // nothing to clear
+  }
+}
+
+// ---------------------------------------------------------------- provider
+
 /**
- * Returns a token provider suitable for {@link GDriveAdapter}: a function that
- * yields a live access token, caching it until shortly before it expires and
- * refreshing silently after that. The first call shows Google's consent screen,
- * so kick it off from a user gesture.
+ * A token provider for {@link GDriveAdapter}: yields a live access token,
+ * serving the cached one until it nears expiry and only then opening Google's
+ * popup for a fresh one. Creating the provider does no I/O and never prompts —
+ * the GIS script and the popup are deferred to the first interactive refresh,
+ * so boot can re-attach a cached session silently.
  */
-export async function googleTokenProvider(
-  clientId: string,
-  scope: string,
-): Promise<() => Promise<string>> {
-  await loadGis();
-  const oauth2 = window.google?.accounts?.oauth2;
-  if (!oauth2) throw new Error('Google Identity Services is unavailable');
-  const client = oauth2.initTokenClient({ client_id: clientId, scope, callback: () => {} });
+export function googleTokenProvider(clientId: string, scope: string): () => Promise<string> {
+  const stored = loadStored(clientId, scope);
+  let token = stored?.token ?? '';
+  let expiresAt = stored?.expiresAt ?? 0;
+  let client: TokenClient | null = null;
 
-  let token = '';
-  let expiresAt = 0;
-
-  return () => {
-    // A minute of slack so a request never leaves with a token about to lapse.
-    if (token && Date.now() < expiresAt - 60_000) return Promise.resolve(token);
+  async function refresh(): Promise<string> {
+    await loadGis();
+    const oauth2 = window.google?.accounts?.oauth2;
+    if (!oauth2) throw new Error('Google Identity Services is unavailable');
+    client ??= oauth2.initTokenClient({ client_id: clientId, scope, callback: () => {} });
     return new Promise<string>((resolve, reject) => {
-      client.callback = (response) => {
+      client!.callback = (response) => {
         if (response.access_token) {
           token = response.access_token;
           expiresAt = Date.now() + (Number(response.expires_in) || 3600) * 1000;
+          saveStored(clientId, scope, { token, expiresAt });
           resolve(token);
         } else {
           reject(new Error(response.error || 'Google denied the token request'));
         }
       };
-      // Empty prompt means "ask only the first time": Google shows consent on
-      // the initial grant and then returns tokens silently on later loads, as
-      // long as the authorisation still stands. Forcing 'consent' here is what
-      // made every reload ask to log in again.
-      client.requestAccessToken({ prompt: '' });
+      // Empty prompt asks only the first time: consent on the initial grant,
+      // then silent thereafter while the authorisation stands.
+      client!.requestAccessToken({ prompt: '' });
     });
+  }
+
+  return () => {
+    if (token && Date.now() < expiresAt - 60_000) return Promise.resolve(token);
+    return refresh();
   };
 }

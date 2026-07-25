@@ -20,7 +20,7 @@ export function NewTabView({ model }: { model: ExplorerModel }): JSX.Element {
               </span>
               <button
                 class="vfs-ghost"
-                title="Create a folder (a / in the name nests)"
+                title="Create a folder inside the selected one, or at the root (a / in the name nests)"
                 disabled={!source.adapter?.mkdir}
                 onClick={() => void model.newBrowseFolder(source)}
               >
