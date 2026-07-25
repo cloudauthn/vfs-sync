@@ -68,7 +68,7 @@ export class VFSStore {
     const data = await this.readFile(this.path('config.json'));
     this.config = data
       ? decodeJSON<NodeConfig>(data)
-      : { id: randomId(), head: null, peers: {} };
+      : { id: randomId(), storeId: randomId(), head: null, peers: {} };
     return this.config;
   }
 
@@ -79,8 +79,16 @@ export class VFSStore {
 
   async init(id?: string): Promise<NodeConfig> {
     const existing = await this.readFile(this.path('config.json'));
-    if (existing) return this.readConfig();
-    const config: NodeConfig = { id: id ?? randomId(), head: null, peers: {} };
+    if (existing) {
+      const config = await this.readConfig();
+      // stores written before storeId existed pick one up on first open
+      if (!config.storeId) {
+        config.storeId = randomId();
+        await this.writeConfig(config);
+      }
+      return config;
+    }
+    const config: NodeConfig = { id: id ?? randomId(), storeId: randomId(), head: null, peers: {} };
     await this.writeConfig(config);
     return config;
   }

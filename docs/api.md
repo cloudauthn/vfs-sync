@@ -37,6 +37,11 @@ const node = await VFSNode.open(adapter, {
 Creates `.vfs/` if it is not there. Opening the same folder twice returns nodes with the same
 `id` — it is read back from `config.json`, and a different `id` argument does not override it.
 
+`config.json` also carries a `storeId`: the shared identity of the dataset, as opposed to `id`,
+which names this one replica. It is generated at init, and every sync makes both peers adopt
+the lexicographically smaller of their two — deterministic and transitive, so a whole mesh
+settles on one value. Two folders showing the same `storeId` are replicas of the same data.
+
 ### Working-folder operations
 
 ```ts

@@ -48,7 +48,7 @@ excluded from the diff — otherwise each node would try to sync the other's met
 
 ```
 .vfs/
-  config.json                  # this node's id, HEAD, peer bookkeeping
+  config.json                  # this node's id, the shared storeId, HEAD, peer bookkeeping
   objects/<hash[0:2]>/<hash>   # blobs and trees, content-addressed (SHA-256)
   commits/<hash>.json          # { tree, parents[], timestamp, peer }
   known-commits.log            # flat index of every commit this node has seen
