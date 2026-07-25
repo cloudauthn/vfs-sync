@@ -114,6 +114,10 @@ jobs:
       - run: npm run pages:build
         env:
           VITE_GDRIVE_CLIENT_ID: ${{ vars.GDRIVE_CLIENT_ID }}
+          # Optional. Defaults to drive.file (app sees only files it created).
+          # Set the repo variable to https://www.googleapis.com/auth/drive to
+          # let the explorer browse the user's whole Drive.
+          VITE_GDRIVE_SCOPE: ${{ vars.GDRIVE_SCOPE }}
 
       - uses: actions/configure-pages@v5
 

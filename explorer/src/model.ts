@@ -44,6 +44,13 @@ export interface ExplorerOptions {
    * new-tab switcher offers a "Connect Drive" button. Leave unset to hide it.
    */
   gdriveClientId?: string;
+  /**
+   * OAuth scope requested for Drive. Defaults to `drive.file`, which only lets
+   * the app see files it created — enough to sync its own folders, but it means
+   * the rest of My Drive is invisible. Use `.../auth/drive` to browse and sync
+   * the user's whole Drive.
+   */
+  gdriveScope?: string;
   /** Draw the footer's sync controls — target, sync, auto-sync. */
   toolbar?: boolean;
   /** Offer the activity drawer the status bar opens. */
@@ -226,6 +233,7 @@ export class ExplorerModel {
   readonly wantsControls: boolean;
   readonly wantsLog: boolean;
   readonly gdriveClientId: string | undefined;
+  readonly gdriveScope: string;
 
   peers: Peer[] = [];
   edges: MeshEdge[] = [];
@@ -277,6 +285,7 @@ export class ExplorerModel {
     this.wantsControls = options.toolbar ?? true;
     this.wantsLog = options.activityLog ?? true;
     this.gdriveClientId = options.gdriveClientId;
+    this.gdriveScope = options.gdriveScope ?? 'https://www.googleapis.com/auth/drive.file';
   }
 
   /** True when the Google Drive backend is configured with a client id. */
@@ -348,6 +357,7 @@ export class ExplorerModel {
     this.sources.push(opfs);
     this.activeSource = opfs.adapter ? 'opfs' : 'mem';
     if (opfs.error) this.log(opfs.error, 'warn');
+    await this.restoreGDrive();
     await this.render();
   }
 
@@ -651,6 +661,7 @@ export class ExplorerModel {
     }
     const index = this.sources.indexOf(source);
     if (index !== -1) this.sources.splice(index, 1);
+    if (source.backend === 'GDrive') this.rememberGDrive(false);
     if (this.activeSource === source.key) this.activeSource = this.sources[0]?.key ?? '';
     if (this.browseSel?.source === source.key) this.browseSel = null;
     this.log(`forgot ${source.label}`);
@@ -726,44 +737,82 @@ export class ExplorerModel {
     }
   }
 
+  private static readonly GDRIVE_MEMO = 'vfs-explorer:gdrive';
+
   /**
    * "Connect Drive": authorise with Google (client-side, via GIS) and add the
    * user's Drive to the switcher as a browsable filesystem. Must run from a
-   * click — the consent popup needs a user gesture.
+   * click — the consent popup needs a user gesture the first time.
    */
   async connectGDrive(): Promise<void> {
     if (!this.gdriveClientId) {
       this.log('Google Drive is not configured (set VITE_GDRIVE_CLIENT_ID)', 'warn');
       return;
     }
-    if (this.sources.some((source) => source.backend === 'GDrive')) {
-      const existing = this.sources.find((source) => source.backend === 'GDrive');
-      if (existing) this.selectSource(existing);
-      return;
-    }
+    const existing = this.sources.find((source) => source.backend === 'GDrive');
+    if (existing) return this.selectSource(existing);
     try {
-      const token = await googleTokenProvider(
-        this.gdriveClientId,
-        'https://www.googleapis.com/auth/drive.file',
-      );
+      const token = await googleTokenProvider(this.gdriveClientId, this.gdriveScope);
       await token(); // draw the consent screen now, while the gesture is live
-      const adapter = new GDriveAdapter({ token, name: 'Drive' });
-      const source: BrowseSource = {
-        key: `gdrive:${++this.gdriveSeq}`,
-        label: 'Google Drive',
-        icon: BACKEND_ICON.GDrive,
-        backend: 'GDrive',
-        adapter,
-        removable: true,
-        expanded: new Set(),
-      };
-      this.sources.push(source);
-      this.activeSource = source.key;
-      this.browseSel = null;
+      this.addGDriveSource(token, true);
+      this.rememberGDrive(true);
       this.log('connected Google Drive', 'ok');
       await this.render();
     } catch (error) {
       this.log(String(error), 'warn');
+    }
+  }
+
+  /**
+   * On boot, silently re-attach Drive if it was connected in a previous
+   * session. No gesture and no consent screen: the token comes back through a
+   * hidden frame while the grant still stands. If it needs interaction again,
+   * we drop the memo and leave the "Connect Drive" button for the user.
+   */
+  private async restoreGDrive(): Promise<void> {
+    if (!this.gdriveClientId || !this.recalledGDrive()) return;
+    try {
+      const token = await googleTokenProvider(this.gdriveClientId, this.gdriveScope);
+      await token();
+      this.addGDriveSource(token, false);
+      this.log('reconnected Google Drive', 'ok');
+    } catch {
+      this.rememberGDrive(false);
+    }
+  }
+
+  private addGDriveSource(token: () => Promise<string>, activate: boolean): void {
+    const adapter = new GDriveAdapter({ token, name: 'Drive' });
+    const source: BrowseSource = {
+      key: `gdrive:${++this.gdriveSeq}`,
+      label: 'Google Drive',
+      icon: BACKEND_ICON.GDrive,
+      backend: 'GDrive',
+      adapter,
+      removable: true,
+      expanded: new Set(),
+    };
+    this.sources.push(source);
+    if (activate) {
+      this.activeSource = source.key;
+      this.browseSel = null;
+    }
+  }
+
+  private rememberGDrive(on: boolean): void {
+    try {
+      if (on) localStorage.setItem(ExplorerModel.GDRIVE_MEMO, '1');
+      else localStorage.removeItem(ExplorerModel.GDRIVE_MEMO);
+    } catch {
+      // storage unavailable (private mode); reconnect stays manual
+    }
+  }
+
+  private recalledGDrive(): boolean {
+    try {
+      return localStorage.getItem(ExplorerModel.GDRIVE_MEMO) === '1';
+    } catch {
+      return false;
     }
   }
 

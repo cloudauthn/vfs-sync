@@ -81,8 +81,11 @@ export async function googleTokenProvider(
           reject(new Error(response.error || 'Google denied the token request'));
         }
       };
-      // Prompt only for the first grant; refreshes are silent.
-      client.requestAccessToken({ prompt: token ? '' : 'consent' });
+      // Empty prompt means "ask only the first time": Google shows consent on
+      // the initial grant and then returns tokens silently on later loads, as
+      // long as the authorisation still stands. Forcing 'consent' here is what
+      // made every reload ask to log in again.
+      client.requestAccessToken({ prompt: '' });
     });
   };
 }
