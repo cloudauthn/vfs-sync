@@ -197,8 +197,8 @@ export type BrowseDetailsData =
       kind: 'directory';
       path: string;
       name: string;
+      /** Immediate children only — a recursive walk is too costly on Drive. */
       count: number;
-      bytes: number;
       info: { storeId: string } | null;
     };
 
@@ -259,6 +259,8 @@ export class ExplorerModel {
   activeSource = '';
   /** Entry picked in the new-tab tree; drives the right-hand info pane. */
   browseSel: BrowseSel | null = null;
+  /** Shown while a fresh new-tab selection's info pane is still loading. */
+  browseDetailsLoading = false;
   newTab: NewTabView | null = null;
 
   readonly autoSyncBoxId = `vfs-auto-${Math.random().toString(36).slice(2, 8)}`;
@@ -270,6 +272,8 @@ export class ExplorerModel {
 
   /** Bumped on every selection change; a stale async load drops its result. */
   private detailToken = 0;
+  /** Bumped on every new-tab selection; a stale details load drops its result. */
+  private browseSeq = 0;
   /** Bumped on every render; a stale async recompute drops its result. */
   private renderSeq = 0;
   private autoTimer: ReturnType<typeof setInterval> | undefined;
@@ -438,6 +442,7 @@ export class ExplorerModel {
       if (seq !== this.renderSeq) return;
       this.newTab = view;
     }
+    this.browseDetailsLoading = false;
     this.emit();
   }
 
@@ -583,14 +588,15 @@ export class ExplorerModel {
         stat,
       };
     }
-    const files = await walk(new ScopedAdapter(adapter, picked.path));
-    const bytes = files.reduce((total, file) => total + file.stat.size, 0);
+    // Shallow on purpose: one listing, not a recursive walk. On Drive every
+    // level is a network round trip, so summing a whole subtree here made a
+    // folder click fan out into dozens of requests.
+    const children = (await adapter.list(picked.path)).filter((e) => e.name !== CONTROL_DIR);
     return {
       kind: 'directory',
       path: picked.path,
       name: basename(picked.path) || picked.path,
-      count: files.length,
-      bytes,
+      count: children.length,
       info: await this.readVfsInfo(adapter, picked.path),
     };
   }
@@ -603,7 +609,25 @@ export class ExplorerModel {
 
   selectBrowse(source: BrowseSource, path: string, kind: 'file' | 'directory'): void {
     this.browseSel = { source: source.key, path, kind };
-    void this.render();
+    // The tree itself does not change on a selection, so we keep the existing
+    // rows and repaint straight away: the row highlights now, and the info pane
+    // shows a placeholder while its (network-bound) details load.
+    this.browseDetailsLoading = true;
+    this.emit();
+    void this.refreshBrowseDetails();
+  }
+
+  /** Recompute only the info pane for the current selection, off the paint. */
+  private async refreshBrowseDetails(): Promise<void> {
+    const source = this.currentSource();
+    const seq = ++this.browseSeq;
+    const details: BrowseDetailsData = source
+      ? await this.buildBrowseDetails(source)
+      : { kind: 'intro' };
+    if (seq !== this.browseSeq) return; // a newer selection won the race
+    if (this.newTab) this.newTab.details = details;
+    this.browseDetailsLoading = false;
+    this.emit();
   }
 
   toggleBrowseDir(source: BrowseSource, path: string, expanded: boolean): void {

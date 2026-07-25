@@ -219,6 +219,25 @@ function BrowseDetails({
       ? model.newTab.details
       : { kind: 'intro' as const };
 
+  // The selection paints instantly; its details land a beat later. Show the
+  // picked entry's name with a placeholder so the pane never looks stalled.
+  if (model.browseDetailsLoading && model.browseSel) {
+    const name = model.browseSel.path.split('/').pop() || model.browseSel.path;
+    return (
+      <div class="vfs-details-inner">
+        <div class="vfs-details-head">
+          <div class="vfs-details-title" title={name}>
+            <span class="vfs-details-icon">{model.browseSel.kind === 'directory' ? '📂' : '📄'}</span>
+            <span class="vfs-details-name">{name}</span>
+          </div>
+        </div>
+        <div class="vfs-details-body">
+          <p class="vfs-hint">Loading…</p>
+        </div>
+      </div>
+    );
+  }
+
   if (!source || data.kind === 'intro') {
     return (
       <div class="vfs-details-inner">
@@ -276,7 +295,6 @@ function BrowseDetails({
               rows={[
                 ['Path', data.path],
                 ['Items', String(data.count)],
-                ['Size', formatSize(data.bytes)],
               ]}
             />
             {data.info ? (
