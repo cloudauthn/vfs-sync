@@ -4,4 +4,6 @@ export default defineConfig({
   // relative base so the built app works from any subpath, including an iframe
   base: './',
   build: { outDir: 'dist', emptyOutDir: true },
+  // Preact powers the explorer UI; esbuild compiles JSX to its automatic runtime.
+  esbuild: { jsx: 'automatic', jsxImportSource: 'preact' },
 });
