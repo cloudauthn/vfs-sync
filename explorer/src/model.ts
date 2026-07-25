@@ -284,8 +284,10 @@ export class ExplorerModel {
     this.wantsLocalFolder = options.localFolder ?? true;
     this.wantsControls = options.toolbar ?? true;
     this.wantsLog = options.activityLog ?? true;
-    this.gdriveClientId = options.gdriveClientId;
-    this.gdriveScope = options.gdriveScope ?? 'https://www.googleapis.com/auth/drive.file';
+    this.gdriveClientId = options.gdriveClientId || undefined;
+    // `||` not `??`: an empty VITE_GDRIVE_SCOPE (set but blank) must fall back,
+    // or GIS rejects with "Missing required parameter scope".
+    this.gdriveScope = options.gdriveScope || 'https://www.googleapis.com/auth/drive.file';
   }
 
   /** True when the Google Drive backend is configured with a client id. */
