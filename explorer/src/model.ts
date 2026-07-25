@@ -405,9 +405,16 @@ export class ExplorerModel {
       .map((p, i) => ({ a: p.node, b: (this.peers[i + 1] as Peer).node }));
   }
 
-  /** The demo files, written only to the very first root when it starts blank. */
+  /**
+   * The demo files, written only to the very first root when it starts blank —
+   * and only to MemFS, which is throwaway. Seeding any persistent backend
+   * (OPFS, a picked disk folder, Google Drive) would write real files the user
+   * can see and would look like a phantom sync; those must start empty until
+   * the user syncs into them.
+   */
   private async maybeSeed(peer: Peer, fresh: boolean): Promise<void> {
     if (!this.seed || !fresh || this.peers.length !== 1) return;
+    if (peer.backend !== 'memory') return;
     for (const [path, text] of Object.entries(this.seed)) {
       await peer.node.write(path, this.encoder.encode(text));
     }
@@ -452,9 +459,9 @@ export class ExplorerModel {
     for (const peer of this.peers) next.set(peer.key, await this.readSnapshot(peer));
     if (seq !== this.renderSeq) return;
     this.snapshots = next;
-    if (this.activePeer()) {
-      this.newTab = null;
-    } else {
+    // Only rebuild the browse view when it is the one on screen; while a peer
+    // tab is active we leave the last one intact so returning to it is instant.
+    if (!this.activePeer()) {
       const view = await this.buildNewTab();
       if (seq !== this.renderSeq) return;
       this.newTab = view;
@@ -462,6 +469,15 @@ export class ExplorerModel {
     this.browseDetailsLoading = false;
     this.newTabLoading = false;
     this.emit();
+  }
+
+  /** Compute one peer's snapshot if we have not already — for an instant switch. */
+  private async ensureSnapshot(peer: Peer): Promise<void> {
+    if (this.snapshots.has(peer.key)) return;
+    const snapshot = await this.readSnapshot(peer);
+    const merged = new Map(this.snapshots);
+    merged.set(peer.key, snapshot);
+    this.snapshots = merged;
   }
 
   snapshotOf(key: string): Snapshot {
@@ -474,10 +490,11 @@ export class ExplorerModel {
 
   async activateNewTab(): Promise<void> {
     this.active = '';
-    // Opening the browser is the moment to read the backends afresh, so a change
-    // made inside a tab (or elsewhere) since last time shows.
-    this.browseCache.clear();
-    await this.render();
+    // Repaint at once — the browse view switches in immediately; its tree fills
+    // from cache (or a Loading placeholder) rather than re-walking every peer.
+    this.newTabLoading = this.newTab === null || this.newTab.sourceKey !== this.activeSource;
+    this.emit();
+    await this.refreshNewTab();
   }
 
   async closePeer(peer: Peer): Promise<void> {
@@ -708,7 +725,7 @@ export class ExplorerModel {
   toggleBrowseDir(source: BrowseSource, path: string, expanded: boolean): void {
     if (expanded) source.expanded.delete(path);
     else source.expanded.add(path);
-    void this.render();
+    void this.refreshNewTab();
   }
 
   async newBrowseFolder(source: BrowseSource): Promise<void> {
@@ -735,7 +752,7 @@ export class ExplorerModel {
         source.expanded.add(segments.slice(0, i).join('/'));
       }
       this.log(`created folder ${path} on ${source.label}`, 'ok');
-      await this.render();
+      await this.refreshNewTab();
       this.selectBrowse(source, path, 'directory');
     } catch (error) {
       this.log(String(error), 'warn');
@@ -766,7 +783,7 @@ export class ExplorerModel {
     } catch (error) {
       this.log(String(error), 'warn');
     }
-    await this.render();
+    await this.refreshNewTab();
   }
 
   async removeSource(source: BrowseSource): Promise<void> {
@@ -954,9 +971,13 @@ export class ExplorerModel {
    */
   async activate(peer: Peer): Promise<void> {
     this.active = peer.key;
+    // Switch the tab in on the spot, reusing the snapshot we already hold; no
+    // full re-render, so opening a tab never re-walks every peer.
+    this.emit();
     if (peer.fsa && !(await peer.fsa.hasPermission())) {
       this.log(`${peer.label} needs its permission re-granted`, 'warn');
     }
+    await this.ensureSnapshot(peer);
     const path = this.selection?.path;
     const stat = path ? await peer.adapter.stat(path) : null;
     if (path && stat) {
@@ -985,7 +1006,7 @@ export class ExplorerModel {
       this.details = null;
       this.detailsLoading = false;
       this.detailToken++;
-      await this.render();
+      this.emit();
       return;
     }
     this.selection = { peer: peer.key, path: entry.path, kind: entry.kind };
