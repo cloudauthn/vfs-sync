@@ -109,6 +109,18 @@ export class VFSStore {
     await this.writeConfig(config);
   }
 
+  /**
+   * The end of a sync moves the head and records the peer at once. Kept as one
+   * config write rather than a `setHead` + `recordPeer` pair, which on a remote
+   * backend like Drive is two round trips for what is a single new state.
+   */
+  async finalizeSync(head: Hash | null, peerId: string, peerHead: Hash | null, at: number): Promise<void> {
+    const config = await this.readConfig();
+    config.head = head;
+    config.peers[peerId] = { lastSync: at, head: peerHead };
+    await this.writeConfig(config);
+  }
+
   // --------------------------------------------------------------- objects
 
   async hasObject(hash: Hash): Promise<boolean> {

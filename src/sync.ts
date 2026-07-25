@@ -92,10 +92,9 @@ export async function sync(a: VFSNode, b: VFSNode, options: SyncOptions = {}): P
     // Both peers instead adopt the same existing commit, chosen by a rule they
     // can both apply without talking: newest first, hash as tiebreak.
     const head = await newerCommit(a, aHead as Hash, bHead as Hash);
-    await a.store.setHead(head);
-    await b.store.setHead(head);
-    await a.store.recordPeer(b.id, head, now());
-    await b.store.recordPeer(a.id, head, now());
+    const at = now();
+    await a.store.finalizeSync(head, b.id, head, at);
+    await b.store.finalizeSync(head, a.id, head, at);
     return { base, head, changed: true, conflicts, transferred };
   }
 
@@ -111,13 +110,11 @@ export async function sync(a: VFSNode, b: VFSNode, options: SyncOptions = {}): P
   const head = await a.store.putCommit(commit);
 
   await a.applyTree(tree);
-  await a.store.setHead(head);
-  await a.store.recordPeer(b.id, head, commit.timestamp);
+  await a.store.finalizeSync(head, b.id, head, commit.timestamp);
 
   await b.store.putCommitAt(head, commit);
   await b.applyTree(tree);
-  await b.store.setHead(head);
-  await b.store.recordPeer(a.id, head, commit.timestamp);
+  await b.store.finalizeSync(head, a.id, head, commit.timestamp);
 
   return { base, head, changed: true, conflicts, transferred };
 }

@@ -109,6 +109,14 @@ export class GDriveAdapter implements VFSAdapter {
   private readonly doFetch: typeof fetch;
   /** Path (relative to the root) → Drive fileId. `''` is the root itself. */
   private readonly ids = new Map<string, string>();
+  /**
+   * Paths a lookup just confirmed do not exist. It lets a `write` that follows a
+   * `stat` (the store's `hasObject` → `putObjectAt` pattern) skip re-asking
+   * whether the file is there — on Drive that saved query is a whole request per
+   * object. Only ever holds paths a resolve/stat found absent this moment, and
+   * every create/discovery clears the entry, so it never suppresses a real file.
+   */
+  private readonly absent = new Set<string>();
 
   constructor(options: GDriveAdapterOptions) {
     this.token = options.token;
@@ -147,8 +155,12 @@ export class GDriveAdapter implements VFSAdapter {
     const parent = await this.resolve(dirname(p));
     if (!parent) return null;
     const child = await this.childByName(parent, basename(p));
-    if (!child) return null;
+    if (!child) {
+      this.absent.add(p); // a following write can skip re-checking existence
+      return null;
+    }
     this.ids.set(p, child.id);
+    this.absent.delete(p);
     return child.id;
   }
 
@@ -163,9 +175,12 @@ export class GDriveAdapter implements VFSAdapter {
     const cached = this.ids.get(p);
     if (cached) return cached;
     const parent = await this.ensureFolder(dirname(p));
-    const existing = await this.childByName(parent, basename(p));
+    // A resolve/stat that just missed this folder means it is not there, so skip
+    // the existence query and create straight away.
+    const existing = this.absent.has(p) ? null : await this.childByName(parent, basename(p));
     if (existing) {
       this.ids.set(p, existing.id);
+      this.absent.delete(p);
       return existing.id;
     }
     const created = await this.json<DriveFile>('/drive/v3/files?fields=id', {
@@ -174,6 +189,7 @@ export class GDriveAdapter implements VFSAdapter {
       body: JSON.stringify({ name: basename(p), mimeType: FOLDER_MIME, parents: [parent] }),
     });
     this.ids.set(p, created.id);
+    this.absent.delete(p);
     return created.id;
   }
 
@@ -202,7 +218,9 @@ export class GDriveAdapter implements VFSAdapter {
         this.ids.set(to, id);
       } else if (key.startsWith(`${from}/`)) {
         this.ids.delete(key);
-        this.ids.set(`${to}${key.slice(from.length)}`, id);
+        const moved = `${to}${key.slice(from.length)}`;
+        this.ids.set(moved, id);
+        this.absent.delete(moved);
       }
     }
   }
@@ -225,6 +243,7 @@ export class GDriveAdapter implements VFSAdapter {
       for (const file of page.files) {
         const childPath = base ? `${base}/${file.name}` : file.name;
         this.ids.set(childPath, file.id); // warm the cache while we are here
+        this.absent.delete(childPath);
         out.push({
           name: file.name,
           path: childPath,
@@ -297,7 +316,12 @@ export class GDriveAdapter implements VFSAdapter {
   async write(path: string, data: Uint8Array): Promise<void> {
     const target = normalizePath(path);
     const parentId = await this.ensureFolder(dirname(target));
-    let id = this.ids.get(target) ?? (await this.childByName(parentId, basename(target)))?.id;
+    // Prefer a cached id; else only query for an existing file when a recent
+    // lookup has not already told us there is none.
+    let id = this.ids.get(target);
+    if (!id && !this.absent.has(target)) {
+      id = (await this.childByName(parentId, basename(target)))?.id;
+    }
     if (!id) {
       // Create the metadata first to mint an id, then stream the bytes into it.
       const created = await this.json<DriveFile>('/drive/v3/files?fields=id', {
@@ -308,6 +332,7 @@ export class GDriveAdapter implements VFSAdapter {
       id = created.id;
       this.ids.set(target, id);
     }
+    this.absent.delete(target);
     const res = await this.authorized(`/upload/drive/v3/files/${id}?uploadType=media`, {
       method: 'PATCH',
       body: data as unknown as BodyInit,
@@ -325,6 +350,7 @@ export class GDriveAdapter implements VFSAdapter {
     // Deleting a folder removes its children too, so this is recursive.
     if (!res.ok && res.status !== 404) throw await driveError(res, path);
     this.forget(path);
+    this.absent.add(normalizePath(path)); // now gone — a rewrite can skip the check
   }
 
   async rename(oldPath: string, newPath: string): Promise<void> {
@@ -350,6 +376,8 @@ export class GDriveAdapter implements VFSAdapter {
     // The id is stable across the move; only the paths it is filed under change.
     this.forget(to);
     this.reparent(from, to);
+    this.absent.add(from); // the old path is now empty
+    this.absent.delete(to); // and the new one holds the file
   }
 
   async stat(path: string): Promise<VFSStat | null> {
@@ -360,6 +388,7 @@ export class GDriveAdapter implements VFSAdapter {
     const res = await this.authorized(`/drive/v3/files/${id}?fields=id,mimeType,size,modifiedTime`);
     if (res.status === 404) {
       this.forget(target);
+      this.absent.add(target);
       return null;
     }
     if (!res.ok) throw await driveError(res, path);

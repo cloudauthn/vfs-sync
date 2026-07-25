@@ -60,6 +60,30 @@ describe('GDriveAdapter', () => {
     expect(seen.every((h) => h === 'Bearer secret')).toBe(true);
   });
 
+  it('skips the redundant existence check when a stat just found the file absent', async () => {
+    const seen: string[] = [];
+    const fake = makeFakeDrive();
+    const wrapped: typeof fetch = (input, init) => {
+      seen.push(`${init?.method ?? 'GET'} ${String(input)}`);
+      return fake.fetch(input, init);
+    };
+    const adapter = new GDriveAdapter({ token: 'tok', fetch: wrapped });
+    await adapter.mkdir('objects'); // parent exists and is cached
+
+    // This is the store's `hasObject` → `putObjectAt` pattern: stat, then write.
+    seen.length = 0;
+    expect(await adapter.stat('objects/x')).toBeNull();
+    const afterStat = seen.length;
+    await adapter.write('objects/x', encoder.encode('data'));
+    const writeReqs = seen.length - afterStat;
+
+    // The write only creates: POST metadata + media upload. No second name
+    // query, because the stat already established the file was not there.
+    expect(writeReqs).toBe(2);
+    expect(seen.slice(afterStat).some((u) => u.includes('pageSize=1'))).toBe(false);
+    expect(decoder.decode(await adapter.read('objects/x'))).toBe('data');
+  });
+
   it('works in the hidden appDataFolder space', async () => {
     const seen: string[] = [];
     const fake = makeFakeDrive();
