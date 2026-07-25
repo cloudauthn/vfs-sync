@@ -268,6 +268,8 @@ export class ExplorerModel {
   newTabLoading = false;
   /** Shown while an opened peer tab's file tree (its first walk) is loading. */
   treeLoading = false;
+  /** A tab that has been clicked but whose peer (store open + first walk) is still loading. */
+  pendingTab: { key: string; label: string; backend: Backend } | null = null;
   newTab: NewTabView | null = null;
 
   readonly autoSyncBoxId = `vfs-auto-${Math.random().toString(36).slice(2, 8)}`;
@@ -318,6 +320,11 @@ export class ExplorerModel {
   /** True when the Google Drive backend is configured with a client id. */
   get canGDrive(): boolean {
     return Boolean(this.gdriveClientId);
+  }
+
+  /** True once a Google Drive source is in the switcher. */
+  get gdriveConnected(): boolean {
+    return this.sources.some((source) => source.backend === 'GDrive');
   }
 
   // -------------------------------------------------------------- subscribe
@@ -846,12 +853,23 @@ export class ExplorerModel {
     const key = `${source.key}:${path}`;
     const existing = this.peerOf(key);
     if (existing) return this.activate(existing);
+    const label = basename(path) || source.label;
+    const prevActive = this.active;
+    // Switch to the tab the instant it is clicked: a placeholder peer with a
+    // loading tree, before any network. The real peer (store open + first walk)
+    // fills in behind it.
+    this.pendingTab = { key, label, backend: source.backend };
+    this.active = key;
+    this.treeLoading = true;
+    this.emit();
     try {
-      const label = basename(path) || source.label;
       const adapter = path ? new ScopedAdapter(source.adapter, path, label) : source.adapter;
       const hasStore = await this.adapterHasStore(adapter);
       if (!hasStore && !initialise) {
         this.log(`${label} is not initialised as vFS`, 'warn');
+        this.pendingTab = null;
+        this.active = prevActive;
+        this.emit();
         return;
       }
       const peer = await this.addPeer(key, label, adapter, source.backend, source.fsa);
@@ -864,10 +882,14 @@ export class ExplorerModel {
       // Initialising just wrote a `.vfs` store into the folder; drop its cached
       // listing so the vFS badge shows when the browser is reopened.
       if (!hasStore) this.forgetListing(source, path);
+      this.pendingTab = null;
       this.log(hasStore ? `opened ${label}` : `initialised ${label} as vFS`, 'ok');
       await this.activate(peer);
     } catch (error) {
+      this.pendingTab = null;
+      this.active = prevActive;
       this.log(String(error), 'warn');
+      this.emit();
     }
   }
 

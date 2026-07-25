@@ -11,6 +11,7 @@ import { Footer } from './Footer';
 export function App({ model }: { model: ExplorerModel }): JSX.Element {
   useModel(model);
   const peer = model.activePeer();
+  const pending = !peer && model.pendingTab && model.active === model.pendingTab.key;
   return (
     <div class="vfs-explorer">
       <Tabs model={model} />
@@ -20,6 +21,8 @@ export function App({ model }: { model: ExplorerModel }): JSX.Element {
             <PeerSidebar model={model} peer={peer} />
             <PeerDetails model={model} peer={peer} />
           </>
+        ) : pending ? (
+          <PendingPeer />
         ) : (
           <NewTabView model={model} />
         )}
@@ -27,5 +30,19 @@ export function App({ model }: { model: ExplorerModel }): JSX.Element {
       <Drawer model={model} />
       <Footer model={model} />
     </div>
+  );
+}
+
+/** The tab is open but its peer is still loading; a placeholder stands in. */
+function PendingPeer(): JSX.Element {
+  return (
+    <>
+      <div class="vfs-sidebar">
+        <ul class="vfs-tree" role="tree">
+          <li class="vfs-empty">Loading…</li>
+        </ul>
+      </div>
+      <div class="vfs-details" />
+    </>
   );
 }

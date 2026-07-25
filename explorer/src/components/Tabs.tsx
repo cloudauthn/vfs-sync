@@ -4,11 +4,24 @@ import type { ExplorerModel, Peer } from '../model';
 import { formatBytes } from '../format';
 
 export function Tabs({ model }: { model: ExplorerModel }): JSX.Element {
+  const pending =
+    model.pendingTab && !model.peers.some((peer) => peer.key === model.pendingTab?.key)
+      ? model.pendingTab
+      : null;
   return (
     <div class="vfs-tabs" role="tablist">
       {model.peers.map((peer) => (
         <Tab key={peer.key} model={model} peer={peer} />
       ))}
+      {pending && (
+        <div class="vfs-tab vfs-active" role="tab" aria-selected title="Opening…">
+          <span class="vfs-tab-title">
+            <span class="vfs-tab-icon">{BACKEND_ICON[pending.backend]}</span>
+            <span class="vfs-tab-name">{pending.label}</span>
+          </span>
+          <span class="vfs-tab-meta">Loading…</span>
+        </div>
+      )}
       <NewTabButton model={model} />
     </div>
   );
