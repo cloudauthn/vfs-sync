@@ -18,14 +18,24 @@ export function NewTabView({ model }: { model: ExplorerModel }): JSX.Element {
                 <span class="vfs-tab-icon">{source.icon}</span>
                 <span>{source.label}</span>
               </span>
-              <button
-                class="vfs-ghost"
-                title="Create a folder inside the selected one, or at the root (a / in the name nests)"
-                disabled={!source.adapter?.mkdir}
-                onClick={() => void model.newBrowseFolder(source)}
-              >
-                ＋ New folder
-              </button>
+              <span class="vfs-head-actions">
+                <button
+                  class="vfs-ghost"
+                  title="Re-read this filesystem from the backend, past the cache"
+                  aria-label="Refresh"
+                  onClick={() => void model.reload()}
+                >
+                  ↻
+                </button>
+                <button
+                  class="vfs-ghost"
+                  title="Create a folder inside the selected one, or at the root (a / in the name nests)"
+                  disabled={!source.adapter?.mkdir}
+                  onClick={() => void model.newBrowseFolder(source)}
+                >
+                  ＋ New folder
+                </button>
+              </span>
             </div>
             <BrowseTree model={model} source={source} />
             <div class="vfs-sidebar-foot">

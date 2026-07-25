@@ -125,13 +125,23 @@ export function PeerSidebar({ model, peer }: { model: ExplorerModel; peer: Peer 
           <span class="vfs-tab-icon">{BACKEND_ICON[peer.backend]}</span>
           <span>{peer.label}</span>
         </button>
-        <button
-          class="vfs-ghost"
-          title="Create a file (a / in the name creates a folder)"
-          onClick={() => void model.newFile(peer)}
-        >
-          ＋ New
-        </button>
+        <span class="vfs-head-actions">
+          <button
+            class="vfs-ghost"
+            title="Re-read this root from the backend, past the cache"
+            aria-label="Refresh"
+            onClick={() => void model.reload()}
+          >
+            ↻
+          </button>
+          <button
+            class="vfs-ghost"
+            title="Create a file (a / in the name creates a folder)"
+            onClick={() => void model.newFile(peer)}
+          >
+            ＋ New
+          </button>
+        </span>
       </div>
       <ul class="vfs-tree" role="tree">
         {model.treeLoading ? (

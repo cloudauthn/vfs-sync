@@ -17,7 +17,12 @@ import {
   syncUntilStable,
   walk,
 } from '../../src/index';
-import { clearGoogleToken, googleTokenProvider, hasCachedGoogleToken } from './gis';
+import {
+  clearGoogleToken,
+  googleTokenExpiry,
+  googleTokenProvider,
+  hasCachedGoogleToken,
+} from './gis';
 import type {
   ConflictReport,
   Hash,
@@ -285,7 +290,10 @@ export class ExplorerModel {
    * and invalidated per-path on our own mutations, so it never shows stale data
    * from an edit made here; a change made elsewhere shows on the next reopen.
    */
-  private readonly browseCache = new Map<string, VFSListEntry[]>();
+  private readonly browseCache = new Map<
+    string,
+    { entries: VFSListEntry[]; expiresAt: number }
+  >();
   /** Browse-tree folders whose children are still being listed, keyed `sourceKey:path`. */
   private readonly browseLoading = new Set<string>();
 
@@ -509,6 +517,35 @@ export class ExplorerModel {
     await this.refreshNewTab();
   }
 
+  /**
+   * Re-read whatever is on screen straight from the backend, past the cache —
+   * the manual escape hatch for the token-lifetime cache. On a peer tab it
+   * re-walks that root; on the browse view it drops the current source's cached
+   * listings and rebuilds.
+   */
+  async reload(): Promise<void> {
+    const peer = this.activePeer();
+    if (peer) {
+      this.treeLoading = true;
+      this.emit();
+      const snapshot = await this.readSnapshot(peer);
+      const merged = new Map(this.snapshots);
+      merged.set(peer.key, snapshot);
+      this.snapshots = merged;
+      this.treeLoading = false;
+      this.emit();
+      if (this.selection?.peer === peer.key) {
+        await this.select(peer, { path: this.selection.path, kind: this.selection.kind });
+      }
+      return;
+    }
+    const source = this.currentSource();
+    if (source) this.forgetSubtree(source, '');
+    this.newTabLoading = true;
+    this.emit();
+    await this.refreshNewTab();
+  }
+
   async closePeer(peer: Peer): Promise<void> {
     const index = this.peers.indexOf(peer);
     if (index === -1) return;
@@ -581,15 +618,30 @@ export class ExplorerModel {
     }
   }
 
-  /** A folder's listing, served from cache when we already fetched it. */
+  /** A folder's listing, served from cache until it expires with the token. */
   private async browseList(source: BrowseSource, path: string): Promise<VFSListEntry[]> {
     if (!source.adapter) return [];
     const key = `${source.key}:${normalizePath(path)}`;
     const hit = this.browseCache.get(key);
-    if (hit) return hit;
+    if (hit && Date.now() < hit.expiresAt) return hit.entries;
     const entries = await source.adapter.list(path);
-    this.browseCache.set(key, entries);
+    this.browseCache.set(key, { entries, expiresAt: this.browseExpiry(source) });
     return entries;
+  }
+
+  /**
+   * When a cached listing goes stale. For Drive it is pinned to the access
+   * token's expiry, so cached data lives exactly as long as the session that
+   * fetched it; other backends are local and cheap, so they never time out
+   * (cleared only on a mutation or a manual refresh).
+   */
+  private browseExpiry(source: BrowseSource): number {
+    if (source.backend === 'GDrive' && this.gdriveClientId) {
+      return (
+        googleTokenExpiry(this.gdriveClientId, this.gdriveScope) ?? Date.now() + 55 * 60_000
+      );
+    }
+    return Number.POSITIVE_INFINITY;
   }
 
   /** Drop one folder's cached listing (its direct children changed). */
@@ -772,7 +824,10 @@ export class ExplorerModel {
       // The base's listing gained a child; the new folder is known-empty. Seed
       // that so the rebuild re-lists only the base, not the whole tree.
       this.forgetListing(source, base);
-      this.browseCache.set(`${source.key}:${path}`, []);
+      this.browseCache.set(`${source.key}:${path}`, {
+        entries: [],
+        expiresAt: this.browseExpiry(source),
+      });
       // reveal it: the base and every ancestor of the new folder unfold
       const segments = path.split('/');
       for (let i = 1; i < segments.length; i++) {

@@ -94,6 +94,21 @@ export function hasCachedGoogleToken(clientId: string, scope: string): boolean {
   return loadStored(clientId, scope) !== null;
 }
 
+/**
+ * Epoch-ms expiry of the stored access token, or `null` if none. Read raw (no
+ * validity check) so callers can pin a data cache to exactly the token's life.
+ */
+export function googleTokenExpiry(clientId: string, scope: string): number | null {
+  try {
+    const raw = localStorage.getItem(storageKey(clientId, scope));
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as StoredToken;
+    return typeof parsed.expiresAt === 'number' ? parsed.expiresAt : null;
+  } catch {
+    return null;
+  }
+}
+
 /** Forget the cached token, e.g. when the user disconnects Drive. */
 export function clearGoogleToken(clientId: string, scope: string): void {
   try {
