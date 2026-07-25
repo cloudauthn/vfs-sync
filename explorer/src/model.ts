@@ -25,6 +25,7 @@ import type {
   NodeConfig,
   TreeEntry,
   VFSAdapter,
+  VFSListEntry,
   VFSStat,
   WalkedFile,
 } from '../../src/index';
@@ -263,6 +264,8 @@ export class ExplorerModel {
   browseSel: BrowseSel | null = null;
   /** Shown while a fresh new-tab selection's info pane is still loading. */
   browseDetailsLoading = false;
+  /** Shown while switching browse source and its folder tree is still loading. */
+  newTabLoading = false;
   newTab: NewTabView | null = null;
 
   readonly autoSyncBoxId = `vfs-auto-${Math.random().toString(36).slice(2, 8)}`;
@@ -276,6 +279,8 @@ export class ExplorerModel {
   private detailToken = 0;
   /** Bumped on every new-tab selection; a stale details load drops its result. */
   private browseSeq = 0;
+  /** Bumped on every browse-source switch; a stale tree build drops its result. */
+  private newTabSeq = 0;
   /** Bumped on every render; a stale async recompute drops its result. */
   private renderSeq = 0;
   private autoTimer: ReturnType<typeof setInterval> | undefined;
@@ -447,6 +452,7 @@ export class ExplorerModel {
       this.newTab = view;
     }
     this.browseDetailsLoading = false;
+    this.newTabLoading = false;
     this.emit();
   }
 
@@ -514,15 +520,20 @@ export class ExplorerModel {
     return view;
   }
 
-  /** `.vfs` probe: `null` for a plain folder, the pairing id when initialised. */
+  /**
+   * `.vfs` probe from a folder's already-fetched listing — no extra `stat`,
+   * which on Drive is a whole request per folder. `null` for a plain folder,
+   * the pairing id when initialised.
+   */
   private async readVfsInfo(
     adapter: VFSAdapter,
     path: string,
+    children: VFSListEntry[],
   ): Promise<{ storeId: string } | null> {
-    const control = path ? `${path}/${CONTROL_DIR}` : CONTROL_DIR;
-    if ((await adapter.stat(control))?.kind !== 'directory') return null;
+    const control = children.find((c) => c.name === CONTROL_DIR && c.kind === 'directory');
+    if (!control) return null;
     try {
-      const raw = this.decoder.decode(await adapter.read(`${control}/config.json`));
+      const raw = this.decoder.decode(await adapter.read(`${control.path}/config.json`));
       const config = JSON.parse(raw) as Partial<NodeConfig>;
       return { storeId: config.storeId ?? config.id ?? 'unknown' };
     } catch {
@@ -545,15 +556,18 @@ export class ExplorerModel {
     );
     for (const entry of entries) {
       if (entry.kind === 'directory') {
-        const children = (await adapter.list(entry.path)).filter((c) => c.name !== CONTROL_DIR);
-        const info = await this.readVfsInfo(adapter, entry.path);
+        // One listing per folder gives both the child count and the `.vfs`
+        // probe; a separate stat would double the requests on Drive.
+        const children = await adapter.list(entry.path);
+        const info = await this.readVfsInfo(adapter, entry.path, children);
+        const visible = children.filter((c) => c.name !== CONTROL_DIR);
         const expanded = source.expanded.has(entry.path);
         out.push({
           kind: 'directory',
           path: entry.path,
           name: entry.name,
           depth,
-          childCount: children.length,
+          childCount: visible.length,
           info,
           expanded,
         });
@@ -594,21 +608,38 @@ export class ExplorerModel {
     }
     // Shallow on purpose: one listing, not a recursive walk. On Drive every
     // level is a network round trip, so summing a whole subtree here made a
-    // folder click fan out into dozens of requests.
-    const children = (await adapter.list(picked.path)).filter((e) => e.name !== CONTROL_DIR);
+    // folder click fan out into dozens of requests. The same listing feeds the
+    // `.vfs` probe, so a directory's details cost exactly one request.
+    const children = await adapter.list(picked.path);
+    const info = await this.readVfsInfo(adapter, picked.path, children);
     return {
       kind: 'directory',
       path: picked.path,
       name: basename(picked.path) || picked.path,
-      count: children.length,
-      info: await this.readVfsInfo(adapter, picked.path),
+      count: children.filter((e) => e.name !== CONTROL_DIR).length,
+      info,
     };
   }
 
   selectSource(source: BrowseSource): void {
     this.activeSource = source.key;
     this.browseSel = null;
-    void this.render();
+    // Highlight the chip and show the new source's intro straight away; the
+    // folder tree (a network round trip on Drive) fills in behind a placeholder.
+    this.newTabLoading = true;
+    this.emit();
+    void this.refreshNewTab();
+  }
+
+  /** Rebuild only the new-tab view (tree + info pane), off the paint. */
+  private async refreshNewTab(): Promise<void> {
+    const seq = ++this.newTabSeq;
+    const view = await this.buildNewTab();
+    if (seq !== this.newTabSeq) return; // a newer source switch won the race
+    this.newTab = view;
+    this.newTabLoading = false;
+    this.browseDetailsLoading = false;
+    this.emit();
   }
 
   selectBrowse(source: BrowseSource, path: string, kind: 'file' | 'directory'): void {

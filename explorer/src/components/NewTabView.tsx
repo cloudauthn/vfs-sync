@@ -118,8 +118,18 @@ function BrowseTree({
   source: BrowseSource;
 }): JSX.Element {
   const view = model.newTab;
-  const rows = view && view.sourceKey === source.key ? view.rows : null;
-  const notice = view && view.sourceKey === source.key ? view.notice : null;
+  const fresh = view && view.sourceKey === source.key;
+  const rows = fresh ? view.rows : null;
+  const notice = fresh ? view.notice : null;
+  // While switching source the tree for the new source is not built yet; show a
+  // placeholder rather than the previous source's rows or a blank pane.
+  if (model.newTabLoading || !fresh) {
+    return (
+      <ul class="vfs-tree" role="tree">
+        <li class="vfs-empty">Loading…</li>
+      </ul>
+    );
+  }
   return (
     <ul class="vfs-tree" role="tree">
       {rows && rows.length > 0
