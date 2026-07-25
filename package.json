@@ -1,6 +1,6 @@
 {
   "name": "@cloudauthn/vfs-sync",
-  "version": "0.1.14",
+  "version": "0.1.15",
   "description": "Multi-peer folder sync for OPFS, the File System Access API and Node fs — a git-style content-addressed engine with renames, tombstones and mtime conflict resolution.",
   "keywords": [
     "sync",
