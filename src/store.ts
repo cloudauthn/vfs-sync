@@ -34,17 +34,47 @@ export interface KnownCommit {
  *   hash-cache.json
  * ```
  */
+export interface VFSStoreOptions {
+  /**
+   * Treat the working folder as the blob store: a blob whose content is already
+   * a file in the working folder is not copied into `objects/` as well, and
+   * reads reconstruct it from that file. Halves the writes on a backend where
+   * every object is a network round trip (Google Drive), at the cost of a
+   * hash→path lookup on read. Off by default — the ordinary layout keeps every
+   * blob under `objects/`, reachable regardless of working-folder state.
+   */
+  reconstruct?: boolean;
+}
+
 export class VFSStore {
   readonly adapter: VFSAdapter;
   readonly root: string;
+  readonly reconstruct: boolean;
 
   private knownIndex: Map<Hash, KnownCommit> | null = null;
   private cache: HashCache | null = null;
   private config: NodeConfig | null = null;
+  /** Lazy hash→working-path index, rebuilt from the cache. Reconstruct mode only. */
+  private reverse: Map<Hash, string> | null = null;
 
-  constructor(adapter: VFSAdapter, root = CONTROL_DIR) {
+  constructor(adapter: VFSAdapter, root = CONTROL_DIR, options: VFSStoreOptions = {}) {
     this.adapter = adapter;
     this.root = root;
+    this.reconstruct = options.reconstruct ?? false;
+  }
+
+  /** A working file whose content is `hash`, from the cache. Reconstruct mode only. */
+  private async reconstructPath(hash: Hash): Promise<string | null> {
+    if (!this.reconstruct) return null;
+    if (!this.reverse) {
+      const cache = await this.hashCache();
+      this.reverse = new Map();
+      for (const [path, entry] of Object.entries(cache.files)) this.reverse.set(entry.hash, path);
+    }
+    const path = this.reverse.get(hash);
+    if (!path) return null;
+    // The cache can lag the disk; make sure the file is still there.
+    return (await this.adapter.stat(path)) ? path : null;
   }
 
   private path(...parts: string[]): string {
@@ -123,15 +153,25 @@ export class VFSStore {
 
   // --------------------------------------------------------------- objects
 
+  /** True only when the blob is stored under `objects/`, ignoring reconstruction. */
+  async hasStoredObject(hash: Hash): Promise<boolean> {
+    return (await this.adapter.stat(this.objectPath(hash))) !== null;
+  }
+
   async hasObject(hash: Hash): Promise<boolean> {
-    const stat = await this.adapter.stat(this.objectPath(hash));
-    return stat !== null;
+    if (await this.hasStoredObject(hash)) return true;
+    return (await this.reconstructPath(hash)) !== null;
   }
 
   async getObject(hash: Hash): Promise<Uint8Array> {
     const data = await this.readFile(this.objectPath(hash));
-    if (!data) throw new Error(`missing object ${hash} in ${this.adapter.name}`);
-    return data;
+    if (data) return data;
+    const path = await this.reconstructPath(hash);
+    if (path) {
+      const reconstructed = await this.readFile(path);
+      if (reconstructed) return reconstructed;
+    }
+    throw new Error(`missing object ${hash} in ${this.adapter.name}`);
   }
 
   /** Stores a blob and returns its content address. Writes are idempotent. */
@@ -147,16 +187,30 @@ export class VFSStore {
     await this.adapter.write(this.objectPath(hash), data);
   }
 
-  /** Size on disk of a stored blob, or 0 when it is not here. */
+  /**
+   * Force a blob into `objects/` even when reconstruction would otherwise cover
+   * it — used to pin a blob that is about to be overwritten in the working
+   * folder (a conflict loser), so it stays readable through the change.
+   */
+  async materialize(hash: Hash, data: Uint8Array): Promise<void> {
+    if (await this.hasStoredObject(hash)) return;
+    await this.adapter.write(this.objectPath(hash), data);
+  }
+
+  /** Size of a blob, from its stored object or the working file it reconstructs from. */
   async objectSize(hash: Hash): Promise<number> {
-    return (await this.adapter.stat(this.objectPath(hash)))?.size ?? 0;
+    const stored = (await this.adapter.stat(this.objectPath(hash)))?.size;
+    if (stored !== undefined) return stored;
+    const path = await this.reconstructPath(hash);
+    if (path) return (await this.adapter.stat(path))?.size ?? 0;
+    return 0;
   }
 
   async getObjectStream(hash: Hash): Promise<ReadableStream<Uint8Array>> {
-    if (!(await this.hasObject(hash))) {
-      throw new Error(`missing object ${hash} in ${this.adapter.name}`);
-    }
-    return readStream(this.adapter, this.objectPath(hash));
+    if (await this.hasStoredObject(hash)) return readStream(this.adapter, this.objectPath(hash));
+    const path = await this.reconstructPath(hash);
+    if (path) return readStream(this.adapter, path);
+    throw new Error(`missing object ${hash} in ${this.adapter.name}`);
   }
 
   /**
@@ -176,6 +230,21 @@ export class VFSStore {
       });
       return;
     }
+    await this.storeStream(hash, source);
+  }
+
+  /** Streaming counterpart of {@link materialize}: pins even reconstructible blobs. */
+  async materializeStream(hash: Hash, source: ReadableStream<Uint8Array>): Promise<void> {
+    if (await this.hasStoredObject(hash)) {
+      await source.cancel().catch(() => {
+        // nothing to drain
+      });
+      return;
+    }
+    await this.storeStream(hash, source);
+  }
+
+  private async storeStream(hash: Hash, source: ReadableStream<Uint8Array>): Promise<void> {
     const path = this.objectPath(hash);
     const hasher = new Sha256();
     try {
@@ -298,6 +367,7 @@ export class VFSStore {
 
   async writeHashCache(cache: HashCache): Promise<void> {
     this.cache = cache;
+    this.reverse = null; // the working set changed; the hash→path index is stale
     await this.adapter.write(this.path('hash-cache.json'), encodeJSON(cache));
   }
 
@@ -306,6 +376,7 @@ export class VFSStore {
     this.knownIndex = null;
     this.cache = null;
     this.config = null;
+    this.reverse = null;
   }
 }
 

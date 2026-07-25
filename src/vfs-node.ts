@@ -1,4 +1,4 @@
-import { randomId, sha256 } from './hash.js';
+import { randomId, sha256, sha256Stream } from './hash.js';
 import { EMPTY_TREE, VFSStore, canonicalTree } from './store.js';
 import {
   STREAM_THRESHOLD,
@@ -24,6 +24,14 @@ export interface VFSNodeOptions {
    * takes effect on adapters that implement the streaming methods.
    */
   streamThreshold?: number;
+  /**
+   * Use the working folder as the blob store instead of duplicating every
+   * file's bytes under `.vfs/objects/`. Worth it on a backend where each object
+   * is a network write (Google Drive); leave off for local backends where the
+   * extra copy is cheap and the plain layout is simplest. See
+   * {@link VFSStoreOptions.reconstruct}.
+   */
+  reconstructBlobs?: boolean;
 }
 
 export interface CommitOptions {
@@ -51,7 +59,7 @@ export class VFSNode {
 
   private constructor(adapter: VFSAdapter, id: string, options: VFSNodeOptions) {
     this.adapter = adapter;
-    this.store = new VFSStore(adapter);
+    this.store = new VFSStore(adapter, undefined, { reconstruct: options.reconstructBlobs ?? false });
     this.id = id;
     this.ignore = options.ignore;
     this.now = options.now ?? (() => Date.now());
@@ -188,13 +196,18 @@ export class VFSNode {
       let hash: Hash;
       if (cached && cached.mtime === file.stat.mtime && cached.size === file.stat.size) {
         hash = cached.hash;
-        if (!(await this.store.hasObject(hash))) {
+        if (!this.store.reconstruct && !(await this.store.hasObject(hash))) {
           if (streaming) {
             await this.store.putObjectStreamAt(hash, await readStream(this.adapter, file.path));
           } else {
             await this.store.putObjectAt(hash, await this.adapter.read(file.path));
           }
         }
+      } else if (this.store.reconstruct) {
+        // The working file is the blob, so hash it in place — no copy into objects/.
+        hash = streaming
+          ? await sha256Stream(await readStream(this.adapter, file.path))
+          : await sha256(await this.adapter.read(file.path));
       } else if (streaming) {
         hash = await this.store.putObjectStream(() => readStream(this.adapter, file.path));
       } else {
@@ -375,6 +388,21 @@ export class VFSNode {
       }
       if (!wasLive || before.hash !== entry.hash) {
         writes.push({ path: entry.path, hash: entry.hash as Hash, size: entry.size });
+      }
+    }
+
+    // In reconstruct mode a blob about to be written may only exist as a working
+    // file that this apply is about to overwrite (a conflict loser is the peer's
+    // own current content). Pin those before touching anything, so the write
+    // phase can still read them.
+    if (this.store.reconstruct) {
+      for (const write of writes) {
+        if (await this.store.hasStoredObject(write.hash)) continue;
+        if (this.streams(write.size)) {
+          await this.store.materializeStream(write.hash, await this.store.getObjectStream(write.hash));
+        } else {
+          await this.store.materialize(write.hash, await this.store.getObject(write.hash));
+        }
       }
     }
 

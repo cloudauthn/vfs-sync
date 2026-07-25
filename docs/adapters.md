@@ -204,6 +204,23 @@ moves with certainty and never needs the hash heuristic. The cost is that a path
 key — resolving `a/b/c.txt` walks the folder tree by name — so the adapter keeps a path→id cache
 and invalidates it on every write, delete and rename.
 
+### Fewer writes: reconstruct mode
+
+By default the store copies every file's bytes into `.vfs/objects/` as well, so on Drive each file
+is written twice — once as the visible file, once as its blob. Open the node with
+`reconstructBlobs: true` and the store treats the working folder *as* the blob store: a blob that is
+already a file is not duplicated, and reads reconstruct it from that file. It roughly halves the
+object writes a sync makes on Drive.
+
+```ts
+const drive = new GDriveAdapter({ token });
+const node = await VFSNode.open(drive, { reconstructBlobs: true });
+```
+
+Leave it off for local backends (OPFS, node, memory), where the extra copy is cheap and the plain
+`objects/` layout is simplest. It composes with any backend, so a Drive node can sync with a normal
+one.
+
 ### Notes
 
 - **Large uploads.** `readRange`/`readStream` map onto Drive's `Range` support and are cheap, but

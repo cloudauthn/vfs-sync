@@ -30,7 +30,7 @@ export {
 } from './stream.js';
 export { basename, dirname, joinPath, normalizePath, splitExtension } from './path.js';
 export { CONTROL_DIR, EMPTY_TREE, VFSStore, canonicalTree } from './store.js';
-export type { KnownCommit } from './store.js';
+export type { KnownCommit, VFSStoreOptions } from './store.js';
 export { walk } from './walk.js';
 export type { WalkOptions, WalkedFile } from './walk.js';
 

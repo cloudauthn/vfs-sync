@@ -410,7 +410,12 @@ export class ExplorerModel {
     backend: Backend,
     fsa?: FSAAdapter,
   ): Promise<Peer> {
-    const node = await VFSNode.open(adapter, { id: label });
+    // On Drive every object is a network write, so let its store treat the
+    // working folder as the blob store instead of duplicating every file.
+    const node = await VFSNode.open(adapter, {
+      id: label,
+      reconstructBlobs: backend === 'GDrive',
+    });
     const peer: Peer = { key, label, backend, adapter, node, collapsed: new Set() };
     if (fsa) peer.fsa = fsa;
     this.peers.push(peer);
