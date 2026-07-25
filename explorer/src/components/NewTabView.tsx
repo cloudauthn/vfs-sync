@@ -97,6 +97,15 @@ function SourceBar({ model }: { model: ExplorerModel }): JSX.Element {
           </button>
         </>
       )}
+      {model.canGDrive && (
+        <button
+          class="vfs-fs vfs-fs-pick"
+          title="Authorise Google Drive in the browser and browse it as a filesystem"
+          onClick={() => void model.connectGDrive()}
+        >
+          ☁ Connect Drive
+        </button>
+      )}
     </div>
   );
 }

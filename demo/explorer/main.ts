@@ -2,4 +2,4 @@
 // the same way any other page would embed it.
 import { mountExplorer } from '../../explorer/src/index';
 
-mountExplorer('#explorer');
+mountExplorer('#explorer', { gdriveClientId: import.meta.env.VITE_GDRIVE_CLIENT_ID });

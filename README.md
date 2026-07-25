@@ -4,7 +4,8 @@ Multi-peer folder sync for the browser and Node, with a git-shaped core: content
 tree snapshots, and merge commits.
 
 Any backend syncs with any other — OPFS, a real folder picked through the File System Access API,
-a Node directory, or plain memory. Peers form a **mesh, not a hub-and-spoke**: a node knows only
+Google Drive (client-side, no server of your own), a Node directory, or plain memory. Peers form a
+**mesh, not a hub-and-spoke**: a node knows only
 the peers it syncs with directly, and changes travel down a chain because every edge syncs
 independently.
 
@@ -202,15 +203,16 @@ explorer.destroy();
 
 ## Status
 
-OPFS, File System Access, Node fs and memory adapters are implemented and tested — 222 tests, 99%
-statement coverage. Every backend runs the same contract suite, streaming methods included.
+OPFS, File System Access, Google Drive, Node fs and memory adapters are implemented and tested.
+Every backend runs the same contract suite, streaming methods included. The Drive adapter runs
+entirely client-side — its native `fileId` plugs straight into the optional `fileId()` method, so
+renames and moves are tracked with certainty and the engine stays untouched. See
+[docs/adapters.md](docs/adapters.md#gdriveadapter) for the token setup (Google Identity Services,
+no backend).
 
-A Google Drive adapter is the planned next backend: `changes.list` + `pageToken` for incremental
-sync, and its native `fileId` plugs straight into the optional `fileId()` method, so it slots in
-without touching the engine.
-
-Not implemented: garbage collection over `objects/` for blobs unreachable from any commit, and
-delta transfer — streaming bounds memory, not bytes moved, so a blob still travels in full.
+Not implemented: garbage collection over `objects/` for blobs unreachable from any commit,
+resumable/streaming uploads to Drive (uploads buffer whole), and delta transfer — streaming bounds
+memory, not bytes moved, so a blob still travels in full.
 
 ## License
 

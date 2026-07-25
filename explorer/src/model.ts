@@ -1,6 +1,7 @@
 import {
   CONTROL_DIR,
   FSAAdapter,
+  GDriveAdapter,
   MemoryAdapter,
   OPFSAdapter,
   ScopedAdapter,
@@ -14,6 +15,7 @@ import {
   syncUntilStable,
   walk,
 } from '../../src/index';
+import { googleTokenProvider } from './gis';
 import type {
   ConflictReport,
   Hash,
@@ -37,6 +39,11 @@ export interface ExplorerOptions {
   autoSyncMs?: number;
   /** Offer the card that opens a folder from disk through the File System Access API. */
   localFolder?: boolean;
+  /**
+   * Public OAuth client id that enables the Google Drive backend. When set, the
+   * new-tab switcher offers a "Connect Drive" button. Leave unset to hide it.
+   */
+  gdriveClientId?: string;
   /** Draw the footer's sync controls — target, sync, auto-sync. */
   toolbar?: boolean;
   /** Offer the activity drawer the status bar opens. */
@@ -60,12 +67,13 @@ export const EDIT_LIMIT = 512 * 1024;
 /** Sentinel target: sync the whole chain rather than one pair. */
 export const ALL_ROOTS = '*';
 
-export type Backend = 'OPFS' | 'memory' | 'local folder';
+export type Backend = 'OPFS' | 'memory' | 'local folder' | 'GDrive';
 
 export const BACKEND_ICON: Record<Backend, string> = {
   OPFS: '🗄',
   memory: '🧠',
   'local folder': '📁',
+  GDrive: '☁',
 };
 
 /** One line per backend, shown when a root is open with nothing selected. */
@@ -79,6 +87,9 @@ export const BLURB: Record<Backend, string> = {
   'local folder':
     'File System Access API — a real folder on your disk. Permission is revoked ' +
     'on reload, so it has to be re-granted from a click.',
+  GDrive:
+    'Google Drive over its REST API, straight from the browser — no server of ' +
+    'your own. Its native fileId tracks renames and moves with certainty.',
 };
 
 export interface Peer {
@@ -214,6 +225,7 @@ export class ExplorerModel {
   readonly wantsLocalFolder: boolean;
   readonly wantsControls: boolean;
   readonly wantsLog: boolean;
+  readonly gdriveClientId: string | undefined;
 
   peers: Peer[] = [];
   edges: MeshEdge[] = [];
@@ -254,6 +266,7 @@ export class ExplorerModel {
   private renderSeq = 0;
   private autoTimer: ReturnType<typeof setInterval> | undefined;
   private fsaSeq = 0;
+  private gdriveSeq = 0;
 
   constructor(options: ExplorerOptions = {}) {
     this.options = options;
@@ -263,6 +276,12 @@ export class ExplorerModel {
     this.wantsLocalFolder = options.localFolder ?? true;
     this.wantsControls = options.toolbar ?? true;
     this.wantsLog = options.activityLog ?? true;
+    this.gdriveClientId = options.gdriveClientId;
+  }
+
+  /** True when the Google Drive backend is configured with a client id. */
+  get canGDrive(): boolean {
+    return Boolean(this.gdriveClientId);
   }
 
   // -------------------------------------------------------------- subscribe
@@ -704,6 +723,47 @@ export class ExplorerModel {
       await this.render();
     } catch (error) {
       if ((error as DOMException)?.name !== 'AbortError') this.log(String(error), 'warn');
+    }
+  }
+
+  /**
+   * "Connect Drive": authorise with Google (client-side, via GIS) and add the
+   * user's Drive to the switcher as a browsable filesystem. Must run from a
+   * click — the consent popup needs a user gesture.
+   */
+  async connectGDrive(): Promise<void> {
+    if (!this.gdriveClientId) {
+      this.log('Google Drive is not configured (set VITE_GDRIVE_CLIENT_ID)', 'warn');
+      return;
+    }
+    if (this.sources.some((source) => source.backend === 'GDrive')) {
+      const existing = this.sources.find((source) => source.backend === 'GDrive');
+      if (existing) this.selectSource(existing);
+      return;
+    }
+    try {
+      const token = await googleTokenProvider(
+        this.gdriveClientId,
+        'https://www.googleapis.com/auth/drive.file',
+      );
+      await token(); // draw the consent screen now, while the gesture is live
+      const adapter = new GDriveAdapter({ token, name: 'Drive' });
+      const source: BrowseSource = {
+        key: `gdrive:${++this.gdriveSeq}`,
+        label: 'Google Drive',
+        icon: BACKEND_ICON.GDrive,
+        backend: 'GDrive',
+        adapter,
+        removable: true,
+        expanded: new Set(),
+      };
+      this.sources.push(source);
+      this.activeSource = source.key;
+      this.browseSel = null;
+      this.log('connected Google Drive', 'ok');
+      await this.render();
+    } catch (error) {
+      this.log(String(error), 'warn');
     }
   }
 
