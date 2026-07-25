@@ -358,10 +358,6 @@
   color: var(--vfs-conflict);
 }
 
-.vfs-explorer .vfs-row.vfs-inert .vfs-name {
-  color: var(--vfs-muted);
-}
-
 /* "vfs" marker on folders that already hold a sync store */
 .vfs-explorer .vfs-chip {
   flex: 0 0 auto;
@@ -583,47 +579,87 @@
   }
 }
 
-/* ------------------------------------------------------- new-tab cards */
+/* ------------------------------------------------- new-tab FS switcher */
 
-.vfs-explorer .vfs-cards {
+.vfs-explorer .vfs-fs-bar {
   display: flex;
-  flex-direction: column;
-  gap: 12px;
-  padding: 22px;
-  max-width: 460px;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--vfs-line);
+  background: var(--vfs-chrome);
 }
 
-.vfs-explorer button.vfs-card {
+.vfs-explorer button.vfs-fs {
   display: flex;
-  align-items: flex-start;
-  gap: 12px;
-  padding: 14px 16px;
-  border-radius: 10px;
-  text-align: left;
-  background: var(--vfs-panel-2);
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  padding: 3px 9px;
+  border-radius: 999px;
+  background: none;
+  border-color: var(--vfs-line);
+  color: var(--vfs-muted);
 }
 
-.vfs-explorer .vfs-card-icon {
-  font-size: 22px;
-  line-height: 1.2;
+.vfs-explorer button.vfs-fs.vfs-active {
+  color: var(--vfs-text);
+  background: var(--vfs-panel);
+  border-color: var(--vfs-accent);
+  box-shadow: inset 0 0 0 1px var(--vfs-accent);
 }
 
-.vfs-explorer .vfs-card-text {
+.vfs-explorer button.vfs-fs .vfs-tab-close {
+  opacity: 1;
+  margin-left: 2px;
+}
+
+.vfs-explorer button.vfs-fs-pick {
+  border-style: dashed;
+}
+
+/* the two stacked blocks of a folder row in the new-tab tree */
+
+.vfs-explorer .vfs-entry-line {
   display: flex;
-  flex-direction: column;
-  gap: 3px;
+  align-items: center;
   min-width: 0;
 }
 
-.vfs-explorer .vfs-card-title {
-  font-weight: 650;
-  font-size: 13.5px;
+.vfs-explorer .vfs-entry-line button.vfs-entry {
+  flex: 1;
+  min-width: 0;
 }
 
-.vfs-explorer .vfs-card-sub {
+/* folder initialised as vFS: badge + pairing id; the whole line opens a tab */
+.vfs-explorer button.vfs-vfsline {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  background: none;
+  border: none;
+  border-radius: 6px;
+  padding: 1px 8px 4px 6px;
+  text-align: left;
+  min-width: 0;
+}
+
+.vfs-explorer button.vfs-vfsline:hover {
+  border-color: transparent;
+}
+
+.vfs-explorer button.vfs-vfsline:hover .vfs-vfsid {
+  color: var(--vfs-accent);
+}
+
+.vfs-explorer .vfs-vfsid {
+  font-family: var(--vfs-mono);
+  font-size: 10.5px;
   color: var(--vfs-muted);
-  font-size: 12px;
-  white-space: normal;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* ---------------------------------------------------------------- editor */

@@ -20,6 +20,8 @@ export class MemoryAdapter implements VFSAdapter {
   readonly name: string;
 
   private readonly entries = new Map<string, { data: Uint8Array; mtime: number }>();
+  /** Directories created empty via mkdir(); implicit parents are not tracked. */
+  private readonly dirs = new Set<string>();
   private readonly clock: () => number;
   private last = 0;
 
@@ -39,17 +41,24 @@ export class MemoryAdapter implements VFSAdapter {
     }
   }
 
+  async mkdir(path: string): Promise<void> {
+    const parts = normalizePath(path).split('/').filter(Boolean);
+    for (let i = 1; i <= parts.length; i++) this.dirs.add(parts.slice(0, i).join('/'));
+  }
+
   async list(path: string): Promise<VFSListEntry[]> {
     const dir = normalizePath(path);
     const seen = new Map<string, VFSListEntry>();
-    for (const key of this.entries.keys()) {
+    for (const key of [...this.entries.keys(), ...this.dirs]) {
       if (!isInside(key, dir) || key === dir) continue;
       const rest = dir ? key.slice(dir.length + 1) : key;
       const slash = rest.indexOf('/');
       const name = slash === -1 ? rest : rest.slice(0, slash);
       const child = dir ? `${dir}/${name}` : name;
-      if (!seen.has(child)) {
-        seen.set(child, { name, path: child, kind: slash === -1 ? 'file' : 'directory' });
+      const isDir = slash !== -1 || this.dirs.has(key);
+      const known = seen.get(child);
+      if (!known || (isDir && known.kind === 'file')) {
+        seen.set(child, { name, path: child, kind: isDir ? 'directory' : 'file' });
       }
     }
     return [...seen.values()];
@@ -69,6 +78,9 @@ export class MemoryAdapter implements VFSAdapter {
     const target = normalizePath(path);
     for (const key of [...this.entries.keys()]) {
       if (key === target || key.startsWith(`${target}/`)) this.entries.delete(key);
+    }
+    for (const dir of [...this.dirs]) {
+      if (dir === target || dir.startsWith(`${target}/`)) this.dirs.delete(dir);
     }
   }
 
@@ -122,6 +134,7 @@ export class MemoryAdapter implements VFSAdapter {
     for (const key of this.entries.keys()) {
       if (key.startsWith(`${target}/`)) return { kind: 'directory', size: 0, mtime: 0 };
     }
+    if (this.dirs.has(target)) return { kind: 'directory', size: 0, mtime: 0 };
     return target === '' ? { kind: 'directory', size: 0, mtime: 0 } : null;
   }
 

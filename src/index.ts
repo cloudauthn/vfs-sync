@@ -58,3 +58,4 @@ export { HandleAdapter } from './adapters/handle.js';
 export { OPFSAdapter, isOPFSAvailable } from './adapters/opfs.js';
 export type { OPFSAdapterOptions } from './adapters/opfs.js';
 export { FSAAdapter, isFSAAvailable } from './adapters/fsa.js';
+export { ScopedAdapter } from './adapters/scoped.js';

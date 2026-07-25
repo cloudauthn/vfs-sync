@@ -183,6 +183,25 @@ The default clock never repeats a timestamp, which keeps conflict resolution una
 
 ---
 
+## ScopedAdapter
+
+A view of another adapter rooted at one of its subfolders. Any folder of any backend can host
+its own `.vfs` store this way — it is how the explorer opens one subfolder of a MemFS or of a
+picked local folder as a sync root.
+
+```ts
+import { MemoryAdapter, ScopedAdapter, VFSNode } from '@cloudauthn/vfs-sync';
+
+const host = new MemoryAdapter('host');
+const notes = await VFSNode.open(new ScopedAdapter(host, 'projects/notes'));
+// notes reads and writes under projects/notes/; its store is projects/notes/.vfs
+```
+
+The wrapper only advertises the optional methods (`mkdir`, `fileId`, streaming) that its base
+implements, so capability checks like `canStream()` keep telling the truth.
+
+---
+
 ## Writing an adapter
 
 Implement seven methods. Paths are relative to the adapter root, use `/` as separator, and never

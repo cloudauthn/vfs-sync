@@ -45,6 +45,10 @@ export class HandleAdapter implements VFSAdapter {
     }
   }
 
+  async mkdir(path: string): Promise<void> {
+    await this.dir(path, true);
+  }
+
   async list(path: string): Promise<VFSListEntry[]> {
     const dir = await this.dir(path);
     if (!dir) return [];

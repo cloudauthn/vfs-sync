@@ -45,6 +45,12 @@ export interface VFSAdapter {
   /** `null` when the path does not exist. */
   stat(path: string): Promise<VFSStat | null>;
   /**
+   * Creates an empty directory (and its ancestors). Optional because the
+   * engine never needs it — parents appear implicitly on write — but browsers
+   * of a filesystem do: it is how a folder exists before its first file.
+   */
+  mkdir?(path: string): Promise<void>;
+  /**
    * Backends with stable native identifiers (Google Drive `fileId`) implement
    * this so renames need no heuristic. OPFS/FSA/node leave it undefined and
    * the engine assigns synthetic ids instead.
@@ -107,6 +113,13 @@ export interface Commit {
 
 export interface NodeConfig {
   id: string;
+  /**
+   * Shared identity of the dataset. Every replica of the same folder converges
+   * on one value: generated at init, and on each sync both peers adopt the
+   * lexicographically smaller of their two — a rule that needs no coordination
+   * and settles mesh-wide. Absent only in stores written before it existed.
+   */
+  storeId?: string;
   head: Hash | null;
   /** Last commit exchanged with each peer, for diagnostics only. */
   peers: Record<string, { lastSync: number; head: Hash | null }>;

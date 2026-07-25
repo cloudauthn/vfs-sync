@@ -3,11 +3,11 @@ import {
   FSAAdapter,
   MemoryAdapter,
   OPFSAdapter,
+  ScopedAdapter,
   VFSNode,
   basename,
   isFSAAvailable,
   isOPFSAvailable,
-  joinPath,
   normalizePath,
   sha256,
   sha256Stream,
@@ -206,13 +206,30 @@ export function mountExplorer(
   let logCount = 0;
   let lastMessage = 'ready';
   let lastKind: LogKind = 'info';
-  let memSeq = 0;
-  let localSeq = 0;
+  let fsaSeq = 0;
 
-  /** Adapter the new-tab view browses OPFS with; `null` when OPFS is unusable. */
-  let browse: OPFSAdapter | null = null;
-  let browseError: string | null = null;
-  const browseExpanded = new Set<string>();
+  /** One filesystem the new-tab view can browse. */
+  interface BrowseSource {
+    key: string;
+    label: string;
+    icon: string;
+    backend: Backend;
+    /** `null` when the backend is unavailable here; `error` says why. */
+    adapter: VFSAdapter | null;
+    error?: string;
+    /** Local folders keep their FSAAdapter around for permission re-grants. */
+    fsa?: FSAAdapter;
+    /** Picked local folders can be dropped from the switcher again. */
+    removable?: boolean;
+    /** Directories this view has unfolded. */
+    expanded: Set<string>;
+  }
+
+  const sources: BrowseSource[] = [];
+  /** Key of the filesystem the new-tab view is browsing. */
+  let activeSource = '';
+  /** Entry picked in the new-tab tree; drives the right-hand info pane. */
+  let browseSel: { source: string; path: string; kind: 'file' | 'directory' } | null = null;
 
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
@@ -292,18 +309,36 @@ export function mountExplorer(
   }
 
   async function boot(): Promise<void> {
+    sources.push({
+      key: 'mem',
+      label: 'MemFS',
+      icon: BACKEND_ICON.memory,
+      backend: 'memory',
+      adapter: new MemoryAdapter('memfs'),
+      expanded: new Set(),
+    });
+    const opfs: BrowseSource = {
+      key: 'opfs',
+      label: opfsRoot ? `OPFS / ${opfsRoot}` : 'OPFS',
+      icon: BACKEND_ICON.OPFS,
+      backend: 'OPFS',
+      adapter: null,
+      expanded: new Set(),
+    };
     if (!isOPFSAvailable()) {
-      browseError = 'This browser has no Origin Private File System.';
+      opfs.error = 'This browser has no Origin Private File System.';
     } else {
       try {
-        browse = await withTimeout(OPFSAdapter.open({ path: opfsRoot, name: 'opfs' }), 3000);
+        opfs.adapter = await withTimeout(OPFSAdapter.open({ path: opfsRoot, name: 'opfs' }), 3000);
       } catch {
-        browseError =
+        opfs.error =
           'OPFS is blocked or stalled here (private window, sandboxed iframe). ' +
-          'MemFS roots still work.';
+          'MemFS still works.';
       }
     }
-    if (browseError) log(browseError, 'warn');
+    sources.push(opfs);
+    activeSource = opfs.adapter ? 'opfs' : 'mem';
+    if (opfs.error) log(opfs.error, 'warn');
     await render();
   }
 
@@ -481,33 +516,38 @@ export function mountExplorer(
 
   // --------------------------------------------------------- new-tab view
 
-  /** Two columns: browse OPFS on the left, the other backends on the right. */
+  function currentSource(): BrowseSource | undefined {
+    return sources.find((source) => source.key === activeSource) ?? sources[0];
+  }
+
+  /** Left: FS switcher + folder tree of the active FS. Right: info pane. */
   async function renderNewTab(): Promise<void> {
     sidebarEl.replaceChildren();
     detailsEl.replaceChildren();
 
+    sidebarEl.append(sourceBar());
+    const source = currentSource();
+    if (!source) return;
+
     const head = el('div', 'vfs-sidebar-head');
     const title = el('span', 'vfs-crumbs-static');
-    title.append(
-      el('span', 'vfs-tab-icon', '🗄'),
-      el('span', undefined, opfsRoot ? `OPFS / ${opfsRoot}` : 'OPFS'),
-    );
+    title.append(el('span', 'vfs-tab-icon', source.icon), el('span', undefined, source.label));
     const add = el('button', 'vfs-ghost', '＋ New folder');
     add.title = 'Create a folder (a / in the name nests)';
-    add.disabled = !browse;
-    add.addEventListener('click', () => void newBrowseFolder());
+    add.disabled = !source.adapter?.mkdir;
+    add.addEventListener('click', () => void newBrowseFolder(source));
     head.append(title, add);
     sidebarEl.append(head);
 
     const tree = el('ul', 'vfs-tree');
     tree.setAttribute('role', 'tree');
-    if (!browse) {
-      tree.append(el('li', 'vfs-empty', browseError ?? 'OPFS is unavailable.'));
+    if (!source.adapter) {
+      tree.append(el('li', 'vfs-empty', source.error ?? `${source.label} is unavailable.`));
     } else {
       try {
-        await renderBrowseDir(tree, '', 0);
+        await renderBrowseDir(source, tree, '', 0);
         if (tree.childElementCount === 0) {
-          tree.append(el('li', 'vfs-empty', 'OPFS is empty — create a folder to make a root'));
+          tree.append(el('li', 'vfs-empty', 'Empty — create a folder to get started'));
         }
       } catch (error) {
         tree.append(el('li', 'vfs-empty', String(error)));
@@ -516,230 +556,411 @@ export function mountExplorer(
     sidebarEl.append(tree);
 
     const foot = el('div', 'vfs-sidebar-foot');
-    foot.append(el('span', undefined, 'Folders holding a .vfs store open as tabs'));
+    foot.append(el('span', undefined, 'Tabs only open folders initialised as vFS'));
+    if (source.fsa) {
+      const grant = el('button', 'vfs-ghost', 'Re-grant');
+      grant.title = 'Ask for permission on this folder again';
+      grant.addEventListener('click', () => void regrantSource(source));
+      foot.append(grant);
+    }
     sidebarEl.append(foot);
 
-    detailsEl.append(openCards());
+    detailsEl.append(await browseDetails(source));
   }
 
-  /** One level of the OPFS browser; expanded plain folders recurse. */
-  async function renderBrowseDir(list: HTMLUListElement, dir: string, depth: number): Promise<void> {
-    if (!browse) return;
-    const entries = (await browse.list(dir)).filter((entry) => entry.name !== CONTROL_DIR);
+  /** One button per filesystem, plus the two File System Access pickers. */
+  function sourceBar(): HTMLElement {
+    const bar = el('div', 'vfs-fs-bar');
+    for (const source of sources) {
+      const button = el('button', 'vfs-fs');
+      if (source.key === currentSource()?.key) button.classList.add('vfs-active');
+      button.append(el('span', 'vfs-tab-icon', source.icon), el('span', undefined, source.label));
+      button.title = BLURB[source.backend];
+      button.addEventListener('click', () => {
+        activeSource = source.key;
+        browseSel = null;
+        void render();
+      });
+      if (source.removable) {
+        const drop = el('span', 'vfs-tab-close', '×');
+        drop.setAttribute('role', 'button');
+        drop.setAttribute('aria-label', `Forget ${source.label}`);
+        drop.title = 'Forget this folder (nothing on disk is touched)';
+        drop.addEventListener('click', (event) => {
+          event.stopPropagation();
+          void removeSource(source);
+        });
+        button.append(drop);
+      }
+      bar.append(button);
+    }
+    if (wantsLocalFolder && isFSAAvailable()) {
+      const pickFs = el('button', 'vfs-fs vfs-fs-pick', '＋ Pick FS');
+      pickFs.title = 'Browse a folder from your disk as a plain filesystem';
+      pickFs.addEventListener('click', () => void pickFsaSource());
+      const pickVfs = el('button', 'vfs-fs vfs-fs-pick', '＋ Pick vFS');
+      pickVfs.title = 'Open a folder from your disk as a vFS tab (offers to initialise it)';
+      pickVfs.addEventListener('click', () => void pickFsaVfs());
+      bar.append(pickFs, pickVfs);
+    }
+    return bar;
+  }
+
+  /** `.vfs` probe: `null` for a plain folder, the pairing id when initialised. */
+  async function readVfsInfo(
+    adapter: VFSAdapter,
+    path: string,
+  ): Promise<{ storeId: string } | null> {
+    const control = path ? `${path}/${CONTROL_DIR}` : CONTROL_DIR;
+    if ((await adapter.stat(control))?.kind !== 'directory') return null;
+    try {
+      const raw = decoder.decode(await adapter.read(`${control}/config.json`));
+      const config = JSON.parse(raw) as Partial<NodeConfig>;
+      return { storeId: config.storeId ?? config.id ?? 'unknown' };
+    } catch {
+      return { storeId: 'unknown' };
+    }
+  }
+
+  function shortId(id: string): string {
+    return id.length > 12 ? `${id.slice(0, 8)}…` : id;
+  }
+
+  /** One level of the tree; expanded folders recurse. */
+  async function renderBrowseDir(
+    source: BrowseSource,
+    list: HTMLUListElement,
+    dir: string,
+    depth: number,
+  ): Promise<void> {
+    const adapter = source.adapter;
+    if (!adapter) return;
+    const entries = (await adapter.list(dir)).filter((entry) => entry.name !== CONTROL_DIR);
     entries.sort((a, b) =>
       a.kind === b.kind ? (a.name < b.name ? -1 : 1) : a.kind === 'directory' ? -1 : 1,
     );
     for (const entry of entries) {
       if (entry.kind === 'directory') {
-        const children = (await browse.list(entry.path)).filter((c) => c.name !== CONTROL_DIR);
-        const isRoot = await hasStore(entry.path);
-        const expanded = !isRoot && browseExpanded.has(entry.path);
-        list.append(browseDirRow(entry, children.length, isRoot, expanded, depth));
-        if (expanded) await renderBrowseDir(list, entry.path, depth + 1);
+        const children = (await adapter.list(entry.path)).filter((c) => c.name !== CONTROL_DIR);
+        const info = await readVfsInfo(adapter, entry.path);
+        const expanded = source.expanded.has(entry.path);
+        list.append(browseDirRow(source, entry, children.length, info, expanded, depth));
+        if (expanded) await renderBrowseDir(source, list, entry.path, depth + 1);
       } else {
-        list.append(browseFileRow(entry, depth));
+        list.append(browseFileRow(source, entry, depth));
       }
     }
   }
 
-  async function hasStore(path: string): Promise<boolean> {
-    if (!browse) return false;
-    return (await browse.stat(`${path}/${CONTROL_DIR}`))?.kind === 'directory';
+  function markBrowseSelected(item: HTMLElement, source: BrowseSource, path: string): void {
+    if (browseSel && browseSel.source === source.key && browseSel.path === path) {
+      item.classList.add('vfs-selected');
+      item.setAttribute('aria-selected', 'true');
+    }
   }
 
+  /**
+   * A folder is two stacked blocks: `[twisty | name | delete]` selects it, and
+   * — when a `.vfs` store lives inside — a vFS line underneath (badge +
+   * pairing id) that opens the store as a tab.
+   */
   function browseDirRow(
+    source: BrowseSource,
     entry: VFSListEntry,
     childCount: number,
-    isRoot: boolean,
+    info: { storeId: string } | null,
     expanded: boolean,
     depth: number,
   ): HTMLElement {
     const item = el('li', 'vfs-row vfs-dir');
     item.setAttribute('role', 'treeitem');
-    if (!isRoot) item.setAttribute('aria-expanded', String(expanded));
+    item.setAttribute('aria-expanded', String(expanded));
+    markBrowseSelected(item, source, entry.path);
 
+    const line = el('div', 'vfs-entry-line');
     const open = el('button', 'vfs-entry');
     open.style.paddingLeft = `${depth * 14 + 6}px`;
+    open.title = entry.path;
+    const twisty = el('span', 'vfs-twisty', expanded ? '▾' : '▸');
+    twisty.addEventListener('click', (event) => {
+      event.stopPropagation();
+      toggleBrowseDir(source, entry.path, expanded);
+    });
     open.append(
-      el('span', 'vfs-twisty', isRoot ? '' : expanded ? '▾' : '▸'),
-      el('span', 'vfs-icon-cell', isRoot ? '🗄' : expanded ? '📂' : '📁'),
+      twisty,
+      el('span', 'vfs-icon-cell', expanded ? '📂' : '📁'),
       el('span', 'vfs-name', entry.name),
+      el('span', 'vfs-meta', `${childCount}`),
     );
-    if (isRoot) {
-      open.append(el('span', 'vfs-chip', 'vfs'));
-      open.title = 'A vfs-sync store lives here — opens as a tab';
-      open.addEventListener('click', () => void openOpfsFolder(entry.path));
-    } else {
-      open.append(el('span', 'vfs-meta', `${childCount}`));
-      open.title = 'Expand';
-      open.addEventListener('click', () => {
-        if (expanded) browseExpanded.delete(entry.path);
-        else browseExpanded.add(entry.path);
-        void render();
-      });
+    open.addEventListener('click', () => selectBrowse(source, entry.path, 'directory'));
+    open.addEventListener('dblclick', () => toggleBrowseDir(source, entry.path, expanded));
 
-      // Plain folders need an explicit action to become a root, since a
-      // click means "expand". Opening one writes its .vfs store.
-      const init = el('button', 'vfs-rowbtn', 'Open');
-      init.title = 'Open this folder as a sync root (initialises a .vfs store)';
-      init.addEventListener('click', () => void openOpfsFolder(entry.path));
-      item.append(open, init);
-      item.append(deleteButton(entry));
-      return item;
+    const remove = el('button', 'vfs-rowbtn vfs-danger', '×');
+    remove.title = `Delete ${entry.path}`;
+    remove.setAttribute('aria-label', `Delete ${entry.path}`);
+    remove.addEventListener('click', () => void deleteBrowseEntry(source, entry.path));
+    line.append(open, remove);
+    item.append(line);
+
+    if (info) {
+      const vfs = el('button', 'vfs-vfsline');
+      vfs.style.paddingLeft = `${depth * 14 + 24}px`;
+      vfs.append(el('span', 'vfs-chip', 'vFS'), el('span', 'vfs-vfsid', shortId(info.storeId)));
+      vfs.title = `Pairing id ${info.storeId} — open this vFS in a tab`;
+      vfs.addEventListener('click', () => void openVfsTab(source, entry.path));
+      item.append(vfs);
     }
-
-    item.append(open, deleteButton(entry));
     return item;
   }
 
-  function deleteButton(entry: VFSListEntry): HTMLElement {
-    const remove = el('button', 'vfs-rowbtn vfs-danger', '×');
-    remove.title = `Delete ${entry.path}`;
-    remove.addEventListener('click', () => void deleteBrowseFolder(entry.path));
-    return remove;
+  function toggleBrowseDir(source: BrowseSource, path: string, expanded: boolean): void {
+    if (expanded) source.expanded.delete(path);
+    else source.expanded.add(path);
+    void render();
   }
 
-  /** Loose files in OPFS are shown, but only folders can become roots. */
-  function browseFileRow(entry: VFSListEntry, depth: number): HTMLElement {
-    const item = el('li', 'vfs-row vfs-inert');
+  function browseFileRow(source: BrowseSource, entry: VFSListEntry, depth: number): HTMLElement {
+    const item = el('li', 'vfs-row');
+    markBrowseSelected(item, source, entry.path);
     const row = el('button', 'vfs-entry');
-    row.disabled = true;
     row.style.paddingLeft = `${depth * 14 + 6}px`;
+    row.title = entry.path;
     row.append(
       el('span', 'vfs-twisty'),
       el('span', 'vfs-icon-cell', iconOf(mimeOf(entry.path))),
       el('span', 'vfs-name', entry.name),
     );
+    row.addEventListener('click', () => selectBrowse(source, entry.path, 'file'));
     item.append(row);
     return item;
   }
 
-  async function newBrowseFolder(): Promise<void> {
-    if (!browse) return;
+  function selectBrowse(source: BrowseSource, path: string, kind: 'file' | 'directory'): void {
+    browseSel = { source: source.key, path, kind };
+    void render();
+  }
+
+  /** The right-hand pane of the new tab: the picked entry, or the FS itself. */
+  async function browseDetails(source: BrowseSource): Promise<HTMLElement> {
+    const wrap = el('div', 'vfs-details-inner');
+    const adapter = source.adapter;
+    const picked = browseSel && browseSel.source === source.key ? browseSel : null;
+
+    if (!picked || !adapter) {
+      const body = el('div', 'vfs-details-body');
+      body.append(el('h3', undefined, source.label));
+      body.append(el('p', 'vfs-blurb', BLURB[source.backend]));
+      body.append(
+        el(
+          'p',
+          'vfs-hint',
+          'Pick a folder or file on the left to inspect it. Folders holding a .vfs store ' +
+            'show a vFS block underneath — that block opens the store as a tab. A plain ' +
+            'folder can be initialised from its info pane.',
+        ),
+      );
+      wrap.append(body);
+      return wrap;
+    }
+
+    const stat = await adapter.stat(picked.path);
+    if (!stat) {
+      browseSel = null;
+      return browseDetails(source);
+    }
+
+    const head = el('div', 'vfs-details-head');
+    const title = el('div', 'vfs-details-title');
+    title.append(
+      el('span', 'vfs-details-icon', stat.kind === 'directory' ? '📂' : iconOf(mimeOf(picked.path))),
+      el('span', 'vfs-details-name', basename(picked.path) || picked.path),
+    );
+    title.title = `${source.label} / ${picked.path}`;
+    const actions = el('div', 'vfs-details-actions');
+    const remove = el('button', 'vfs-ghost vfs-danger', 'Delete');
+    remove.addEventListener('click', () => void deleteBrowseEntry(source, picked.path));
+    actions.append(remove);
+    head.append(title, actions);
+    wrap.append(head);
+
+    const body = el('div', 'vfs-details-body');
+    if (stat.kind === 'file') {
+      body.append(
+        section('File', [
+          ['Path', picked.path],
+          ['Kind', mimeOf(picked.path)],
+          ['Size', formatSize(stat.size)],
+          ['Modified', `${formatTime(stat.mtime)} (${formatAgo(stat.mtime)})`],
+        ]),
+      );
+      body.append(
+        el('p', 'vfs-hint', 'Loose files can be inspected here; editing happens inside a vFS tab.'),
+      );
+    } else {
+      const files = await walk(new ScopedAdapter(adapter, picked.path));
+      const bytes = files.reduce((total, file) => total + file.stat.size, 0);
+      body.append(
+        section('Folder', [
+          ['Path', picked.path],
+          ['Items', String(files.length)],
+          ['Size', formatSize(bytes)],
+        ]),
+      );
+      const info = await readVfsInfo(adapter, picked.path);
+      if (info) {
+        body.append(section('vFS', [['Pairing id', info.storeId]]));
+        const openTab = el('button', 'vfs-primary', 'Open as tab');
+        openTab.addEventListener('click', () => void openVfsTab(source, picked.path));
+        body.append(openTab);
+        body.append(
+          el(
+            'p',
+            'vfs-hint',
+            'Replicas of this folder converge on the same pairing id, whichever FS they live on.',
+          ),
+        );
+      } else {
+        const init = el('button', 'vfs-primary', 'Initialise as vFS');
+        init.title = 'Writes a .vfs store into this folder and opens it as a tab';
+        init.addEventListener('click', () => void openVfsTab(source, picked.path, true));
+        body.append(init);
+        body.append(
+          el('p', 'vfs-hint', 'A plain folder. Initialising writes a .vfs store inside so it can sync.'),
+        );
+      }
+    }
+    wrap.append(body);
+    return wrap;
+  }
+
+  async function newBrowseFolder(source: BrowseSource): Promise<void> {
+    if (!source.adapter?.mkdir) return;
     const name = prompt('Folder name (a / creates nested folders)', 'my-root');
     if (!name) return;
     try {
       const path = normalizePath(name);
       if (!path) return;
-      let handle = browse.root;
-      const segments = path.split('/');
-      for (const segment of segments) {
-        handle = await handle.getDirectoryHandle(segment, { create: true });
-      }
+      await source.adapter.mkdir(path);
       // reveal it: every ancestor of the new folder unfolds
+      const segments = path.split('/');
       for (let i = 1; i < segments.length; i++) {
-        browseExpanded.add(segments.slice(0, i).join('/'));
+        source.expanded.add(segments.slice(0, i).join('/'));
       }
-      log(`created folder ${path}`, 'ok');
+      log(`created folder ${path} on ${source.label}`, 'ok');
       await render();
     } catch (error) {
       log(String(error), 'warn');
     }
   }
 
-  async function deleteBrowseFolder(path: string): Promise<void> {
-    if (!browse) return;
+  async function deleteBrowseEntry(source: BrowseSource, path: string): Promise<void> {
+    if (!source.adapter) return;
     if (!confirm(`Delete ${path} and everything inside it?`)) return;
     try {
       // a tab open on this folder (or inside it) would be left dangling
       for (const peer of peers.filter(
-        (p) => p.key === `opfs:${path}` || p.key.startsWith(`opfs:${path}/`),
+        (p) => p.key === `${source.key}:${path}` || p.key.startsWith(`${source.key}:${path}/`),
       )) {
         await closePeer(peer);
       }
-      let handle = browse.root;
-      const parent = path.split('/').slice(0, -1);
-      for (const segment of parent) handle = await handle.getDirectoryHandle(segment);
-      await handle.removeEntry(basename(path), { recursive: true });
-      browseExpanded.delete(path);
-      log(`deleted ${path}`, 'ok');
+      await source.adapter.delete(path);
+      source.expanded.delete(path);
+      if (
+        browseSel?.source === source.key &&
+        (browseSel.path === path || browseSel.path.startsWith(`${path}/`))
+      ) {
+        browseSel = null;
+      }
+      log(`deleted ${path} on ${source.label}`, 'ok');
     } catch (error) {
       log(String(error), 'warn');
     }
     await render();
   }
 
-  /** The right-hand column: the roots that do not live in OPFS. */
-  function openCards(): HTMLElement {
-    const wrap = el('div', 'vfs-cards');
-    wrap.append(el('h3', undefined, 'Open a new root'));
-
-    const mem = el('button', 'vfs-card');
-    mem.append(
-      el('span', 'vfs-card-icon', BACKEND_ICON.memory),
-      cardText('New MemFS', BLURB.memory),
-    );
-    mem.addEventListener('click', () => void openMemFS());
-    wrap.append(mem);
-
-    if (wantsLocalFolder) {
-      const disk = el('button', 'vfs-card');
-      disk.append(
-        el('span', 'vfs-card-icon', BACKEND_ICON['local folder']),
-        cardText('Pick a folder from your system', BLURB['local folder']),
-      );
-      if (!isFSAAvailable()) {
-        disk.disabled = true;
-        disk.title = 'This browser has no File System Access API';
-      } else {
-        disk.addEventListener('click', () => void addLocalFolder());
-      }
-      wrap.append(disk);
+  async function removeSource(source: BrowseSource): Promise<void> {
+    for (const peer of peers.filter((p) => p.key.startsWith(`${source.key}:`))) {
+      await closePeer(peer);
     }
-
-    wrap.append(
-      el(
-        'p',
-        'vfs-hint',
-        'On the left is this origin’s private file system. Folders marked "vfs" already ' +
-          'hold a sync store and open straight into a tab; open a plain folder to initialise one.',
-      ),
-    );
-    return wrap;
+    const index = sources.indexOf(source);
+    if (index !== -1) sources.splice(index, 1);
+    if (activeSource === source.key) activeSource = sources[0]?.key ?? '';
+    if (browseSel?.source === source.key) browseSel = null;
+    log(`forgot ${source.label}`);
+    await render();
   }
 
-  function cardText(title: string, sub: string): HTMLElement {
-    const text = el('span', 'vfs-card-text');
-    text.append(el('span', 'vfs-card-title', title), el('span', 'vfs-card-sub', sub));
-    return text;
+  async function regrantSource(source: BrowseSource): Promise<void> {
+    if (!source.fsa) return;
+    if (await source.fsa.ensurePermission()) log(`${source.label} is readable again`, 'ok');
+    else log(`permission denied for ${source.label}`, 'warn');
+    await render();
   }
 
   // ------------------------------------------------------------ open roots
 
-  async function openOpfsFolder(path: string): Promise<void> {
-    const key = `opfs:${path}`;
+  async function adapterHasStore(adapter: VFSAdapter): Promise<boolean> {
+    return (await adapter.stat(CONTROL_DIR))?.kind === 'directory';
+  }
+
+  /**
+   * Opens a folder of a browsable FS as a tab. Tabs only ever hold vFS roots:
+   * a plain folder is refused unless `initialise` — the explicit gesture that
+   * writes its `.vfs` store.
+   */
+  async function openVfsTab(source: BrowseSource, path: string, initialise = false): Promise<void> {
+    if (!source.adapter) return;
+    const key = `${source.key}:${path}`;
     const existing = peerOf(key);
     if (existing) return activate(existing);
     try {
-      const label = basename(path) || path;
-      const adapter = await OPFSAdapter.open({
-        path: opfsRoot ? joinPath(opfsRoot, path) : path,
-        name: label,
-      });
-      const fresh = !(await adapterHasStore(adapter)) && (await walk(adapter)).length === 0;
-      const peer = await addPeer(key, label, adapter, 'OPFS');
+      const label = basename(path) || source.label;
+      const adapter = path ? new ScopedAdapter(source.adapter, path, label) : source.adapter;
+      const hasStore = await adapterHasStore(adapter);
+      if (!hasStore && !initialise) {
+        log(`${label} is not initialised as vFS`, 'warn');
+        return;
+      }
+      const fresh = !hasStore && (await walk(adapter)).length === 0;
+      const peer = await addPeer(key, label, adapter, source.backend, source.fsa);
       await maybeSeed(peer, fresh);
-      log(`opened ${label} as a root`, 'ok');
+      log(hasStore ? `opened ${label}` : `initialised ${label} as vFS`, 'ok');
       await activate(peer);
     } catch (error) {
       log(String(error), 'warn');
     }
   }
 
-  async function adapterHasStore(adapter: VFSAdapter): Promise<boolean> {
-    return (await adapter.stat(CONTROL_DIR))?.kind === 'directory';
+  /** "Pick FS": a folder from disk joins the switcher as a browsable FS. */
+  async function pickFsaSource(): Promise<void> {
+    try {
+      const adapter = await FSAAdapter.pick();
+      if (!(await adapter.ensurePermission())) {
+        log('permission denied for that folder', 'warn');
+        return;
+      }
+      const source: BrowseSource = {
+        key: `fsa:${++fsaSeq}`,
+        label: adapter.name || 'local',
+        icon: BACKEND_ICON['local folder'],
+        backend: 'local folder',
+        adapter,
+        fsa: adapter,
+        removable: true,
+        expanded: new Set(),
+      };
+      sources.push(source);
+      activeSource = source.key;
+      browseSel = null;
+      log(`browsing ${source.label} from disk`, 'ok');
+      await render();
+    } catch (error) {
+      if ((error as DOMException)?.name !== 'AbortError') log(String(error), 'warn');
+    }
   }
 
-  async function openMemFS(): Promise<void> {
-    memSeq++;
-    const label = `mem-${memSeq}`;
-    const peer = await addPeer(`mem:${memSeq}`, label, new MemoryAdapter(label), 'memory');
-    await maybeSeed(peer, true);
-    log(`opened ${label} — it lives until this page reloads`, 'ok');
-    await activate(peer);
-  }
-
-  async function addLocalFolder(): Promise<void> {
+  /** "Pick vFS": straight to a tab, offering to initialise a plain folder. */
+  async function pickFsaVfs(): Promise<void> {
     try {
       const adapter = await FSAAdapter.pick();
       if (!(await adapter.ensurePermission())) {
@@ -747,8 +968,14 @@ export function mountExplorer(
         return;
       }
       const label = adapter.name || 'local';
-      const peer = await addPeer(`local:${++localSeq}`, label, adapter, 'local folder', adapter);
-      log(`opened ${label} from disk`, 'ok');
+      const hasStore = await adapterHasStore(adapter);
+      if (!hasStore && !confirm(`${label} holds no .vfs store yet. Initialise it as a vFS root?`)) {
+        return;
+      }
+      const fresh = !hasStore && (await walk(adapter)).length === 0;
+      const peer = await addPeer(`fsav:${++fsaSeq}`, label, adapter, 'local folder', adapter);
+      await maybeSeed(peer, fresh);
+      log(hasStore ? `opened ${label} from disk` : `initialised ${label} as vFS`, 'ok');
       await activate(peer);
     } catch (error) {
       if ((error as DOMException)?.name !== 'AbortError') log(String(error), 'warn');

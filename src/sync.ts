@@ -34,6 +34,7 @@ export async function sync(a: VFSNode, b: VFSNode, options: SyncOptions = {}): P
 
   await a.commit();
   await b.commit();
+  await unifyStoreIds(a, b);
 
   const aHead = await a.head();
   const bHead = await b.head();
@@ -119,6 +120,27 @@ export async function sync(a: VFSNode, b: VFSNode, options: SyncOptions = {}): P
   await b.store.recordPeer(a.id, head, commit.timestamp);
 
   return { base, head, changed: true, conflicts, transferred };
+}
+
+/**
+ * Two folders that sync are the same dataset, so their `storeId`s converge:
+ * both adopt the lexicographically smaller of the two. Deterministic on both
+ * sides and transitive across edges, so a whole mesh settles on one id.
+ */
+async function unifyStoreIds(a: VFSNode, b: VFSNode): Promise<void> {
+  const aConfig = await a.store.readConfig();
+  const bConfig = await b.store.readConfig();
+  const ids = [aConfig.storeId, bConfig.storeId].filter((id): id is string => !!id).sort();
+  const shared = ids[0];
+  if (!shared) return;
+  if (aConfig.storeId !== shared) {
+    aConfig.storeId = shared;
+    await a.store.writeConfig(aConfig);
+  }
+  if (bConfig.storeId !== shared) {
+    bConfig.storeId = shared;
+    await b.store.writeConfig(bConfig);
+  }
 }
 
 export interface MeshEdge {
