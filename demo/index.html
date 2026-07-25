@@ -27,33 +27,8 @@
       </nav>
     </header>
 
-    <section class="toolbar">
-      <button id="sync-all" class="primary">Sync the whole chain</button>
-      <label class="switch">
-        <input type="checkbox" id="auto-sync" />
-        <span>Auto-sync every 3s</span>
-      </label>
-      <button id="add-local" hidden>Add a local folder as a 4th peer…</button>
-      <button id="reset" class="danger">Reset</button>
-      <span id="backend" class="badge"></span>
-    </section>
-
-    <main id="peers" class="peers"></main>
-
-    <section class="workbench">
-      <div class="editor" id="editor">
-        <div class="editor-head">
-          <span id="editor-title">Select a file to edit</span>
-          <button id="save" class="primary" disabled>Save</button>
-        </div>
-        <textarea id="content" spellcheck="false" disabled placeholder="No file selected"></textarea>
-      </div>
-
-      <div class="log">
-        <div class="log-head"><span>Activity</span><button id="clear-log">Clear</button></div>
-        <ol id="log-list"></ol>
-      </div>
-    </section>
+    <!-- The Preact app draws the toolbar, peer chain, editor and log in here. -->
+    <div id="app"></div>
 
     <footer>
       <p>
@@ -68,6 +43,6 @@
       </p>
     </footer>
 
-    <script type="module" src="./main.ts"></script>
+    <script type="module" src="./main.tsx"></script>
   </body>
 </html>

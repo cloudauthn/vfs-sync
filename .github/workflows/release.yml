@@ -108,8 +108,12 @@ jobs:
       - run: npm ci
 
       # Builds the demo into demo/dist and drops the HTML coverage report in
-      # demo/dist/coverage.
+      # demo/dist/coverage. VITE_GDRIVE_CLIENT_ID, when set, lights up the
+      # "Connect Drive" button in the explorer; it is a public OAuth client id,
+      # not a credential, so a repo variable is fine (a secret also works).
       - run: npm run pages:build
+        env:
+          VITE_GDRIVE_CLIENT_ID: ${{ vars.GDRIVE_CLIENT_ID }}
 
       - uses: actions/configure-pages@v5
 

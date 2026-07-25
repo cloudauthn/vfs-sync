@@ -6,6 +6,8 @@ import { HandleAdapter } from '../src/adapters/handle.js';
 import { MemoryAdapter } from '../src/adapters/memory.js';
 import { NodeFsAdapter } from '../src/adapters/node-fs.js';
 import { ScopedAdapter } from '../src/adapters/scoped.js';
+import { GDriveAdapter } from '../src/adapters/gdrive.js';
+import { makeFakeDrive } from './fake-drive.js';
 import { VFSNode } from '../src/vfs-node.js';
 import { sha256 } from '../src/hash.js';
 import { collect, readRange, readStream, writeStream } from '../src/stream.js';
@@ -46,6 +48,10 @@ const backends: Array<{ name: string; make: () => Promise<VFSAdapter> }> = [
   {
     name: 'ScopedAdapter (memory base)',
     make: async () => new ScopedAdapter(new MemoryAdapter('base'), 'scope/root'),
+  },
+  {
+    name: 'GDriveAdapter (fake Drive)',
+    make: async () => new GDriveAdapter({ token: 'test-token', fetch: makeFakeDrive().fetch }),
   },
 ];
 

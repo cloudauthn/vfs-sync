@@ -8,6 +8,7 @@ any other.
 | --- | --- | --- |
 | [`OPFSAdapter`](#opfsadapter) | `@cloudauthn/vfs-sync` | Browsers |
 | [`FSAAdapter`](#fsaadapter) | `@cloudauthn/vfs-sync` | Browsers (Chromium-based) |
+| [`GDriveAdapter`](#gdriveadapter) | `@cloudauthn/vfs-sync` | Anywhere with `fetch` |
 | [`NodeFsAdapter`](#nodefsadapter) | `@cloudauthn/vfs-sync/node` | Node 18+ |
 | [`MemoryAdapter`](#memoryadapter) | `@cloudauthn/vfs-sync` | Anywhere |
 
@@ -125,6 +126,92 @@ async function choose(): Promise<FSAAdapter> {
   return adapter;
 }
 ```
+
+---
+
+## GDriveAdapter
+
+Google Drive, driven **straight from the browser — no server of your own**. Drive's REST API is
+CORS-enabled, so with an access token the entire sync loop runs client-side.
+
+```ts
+import { GDriveAdapter, VFSNode } from '@cloudauthn/vfs-sync';
+
+const drive = new GDriveAdapter({ token: () => currentAccessToken() });
+const node = await VFSNode.open(drive);
+```
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `token` | — (required) | An access token, or a function returning one. The function form is called before every request, so a refreshing provider always hands back a live token. |
+| `space` | `'drive'` | `'drive'` for My Drive (visible to the user), or `'appDataFolder'` for hidden per-app storage. See [Visible vs. hidden](#visible-vs-hidden-storage). |
+| `rootFolderId` | `'root'` / `'appDataFolder'` | Drive id of the folder to use as the adapter root; defaults follow `space`. Point it at a dedicated folder to keep a sync tree out of the way. |
+| `name` | `'gdrive'` | Label used in logs and conflict-copy names. |
+| `fetch` | global `fetch` | Override the network, e.g. to add retry/backoff. |
+
+### Getting a token with no backend
+
+Use [Google Identity Services](https://developers.google.com/identity/oauth2/web/guides/overview)
+(GIS). You need one public OAuth **Client ID** and the `drive.file` scope — nothing server-side.
+Load `https://accounts.google.com/gsi/client`, then:
+
+```ts
+const client = google.accounts.oauth2.initTokenClient({
+  client_id: '<your-oauth-client-id>',
+  scope: 'https://www.googleapis.com/auth/drive.file',
+  callback: () => {},
+});
+
+// Returns a fresh access token; GIS shows the consent prompt the first time.
+const token = () =>
+  new Promise<string>((resolve, reject) => {
+    client.callback = (r) => (r.access_token ? resolve(r.access_token) : reject(r));
+    client.requestAccessToken();
+  });
+
+const drive = new GDriveAdapter({ token });
+```
+
+`drive.file` grants per-file access to what your app creates — the least privilege that works. Use
+full `drive` scope only if you must sync a folder the user made elsewhere, and even then set
+`rootFolderId` so a sync tree stays out of the rest of My Drive.
+
+### Visible vs. hidden storage
+
+`space` decides whether the user can see what you sync:
+
+| | `space: 'drive'` (default) | `space: 'appDataFolder'` |
+| --- | --- | --- |
+| Where files live | My Drive | a hidden per-app folder |
+| Visible at drive.google.com | **yes** — normal files the user can edit and delete | **no** — hidden from the Drive UI |
+| Scope to request | `drive.file` | `drive.appdata` |
+| Survives disconnecting the app | yes | no — wiped when the user removes access |
+
+The scope must match the space. The `drive` space is the right default for a file explorer, where the
+whole point is that the user sees their synced files as ordinary files. Reach for `appDataFolder` when
+the folder is sync *state* the user should never touch:
+
+```ts
+// hidden per-app storage — request the drive.appdata scope for the token
+const drive = new GDriveAdapter({ token, space: 'appDataFolder' });
+```
+
+### Native ids, so renames are free
+
+A Drive file is not identified by its path: it has a stable `fileId` and a set of parent folders.
+This adapter implements [`fileId()`](#native-ids), so the engine tracks a file across renames and
+moves with certainty and never needs the hash heuristic. The cost is that a path is *not* a primary
+key — resolving `a/b/c.txt` walks the folder tree by name — so the adapter keeps a path→id cache
+and invalidates it on every write, delete and rename.
+
+### Notes
+
+- **Large uploads.** `readRange`/`readStream` map onto Drive's `Range` support and are cheap, but
+  uploads currently buffer the whole file (no resumable/streaming upload yet), so a peer streaming a
+  file larger than memory *to* Drive holds it whole. Fine for typical documents and assets.
+- **Scope must match the space.** `drive`/`drive.file` for visible storage, `drive.appdata` for
+  the hidden app-data folder. Requesting a token whose scope does not cover the chosen `space` makes
+  every call 403.
 
 ---
 

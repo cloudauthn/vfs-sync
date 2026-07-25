@@ -6,6 +6,8 @@ const page = (name: string): string => fileURLToPath(new URL(name, import.meta.u
 export default defineConfig({
   // relative base so the built demo works from a GitHub Pages subpath
   base: './',
+  // Preact powers the demo UI; esbuild compiles JSX to its automatic runtime.
+  esbuild: { jsx: 'automatic', jsxImportSource: 'preact' },
   build: {
     outDir: 'dist',
     emptyOutDir: true,
