@@ -244,10 +244,13 @@ export class GDriveAdapter implements VFSAdapter {
         const childPath = base ? `${base}/${file.name}` : file.name;
         this.ids.set(childPath, file.id); // warm the cache while we are here
         this.absent.delete(childPath);
+        // The query already asked for size and modifiedTime, so every entry
+        // carries its stat: a walk of this folder needs no further requests.
         out.push({
           name: file.name,
           path: childPath,
           kind: file.mimeType === FOLDER_MIME ? 'directory' : 'file',
+          stat: statOf(file),
         });
       }
       pageToken = page.nextPageToken;
@@ -392,12 +395,7 @@ export class GDriveAdapter implements VFSAdapter {
       return null;
     }
     if (!res.ok) throw await driveError(res, path);
-    const file = (await res.json()) as DriveFile;
-    return {
-      kind: file.mimeType === FOLDER_MIME ? 'directory' : 'file',
-      size: file.size ? Number(file.size) : 0,
-      mtime: file.modifiedTime ? Date.parse(file.modifiedTime) : 0,
-    };
+    return statOf((await res.json()) as DriveFile);
   }
 
   async mkdir(path: string): Promise<void> {
@@ -408,6 +406,18 @@ export class GDriveAdapter implements VFSAdapter {
   async fileId(path: string): Promise<string | null> {
     return this.resolve(path);
   }
+}
+
+/**
+ * A Drive file's metadata as a stat. One place for the conversion, so a listed
+ * entry and a stat'd one can never disagree about the same file.
+ */
+function statOf(file: DriveFile): VFSStat {
+  return {
+    kind: file.mimeType === FOLDER_MIME ? 'directory' : 'file',
+    size: file.size ? Number(file.size) : 0,
+    mtime: file.modifiedTime ? Date.parse(file.modifiedTime) : 0,
+  };
 }
 
 /** Escape a name for use inside a Drive query string literal. */

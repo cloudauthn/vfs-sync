@@ -75,6 +75,10 @@ export const DEFAULT_SEED: Record<string, string> = {
 
 /** Above this the details pane streams the checksum instead of holding the file. */
 const STREAM_HASH_OVER = 4 * 1024 * 1024;
+/** How much decoded text the read cache may hold before the oldest is dropped. */
+const PEEK_BUDGET = 4 * 1024 * 1024;
+/** And how many entries, so hash-only ones (which hold no text) stay bounded too. */
+const PEEK_LIMIT = 512;
 /** Above this a file is not compared against the other roots byte for byte. */
 const COMPARE_LIMIT = 8 * 1024 * 1024;
 /** Above this the editor refuses to open a file, however text-like it is. */
@@ -247,6 +251,28 @@ export interface LogEntry {
   kind: LogKind;
 }
 
+/** One folder's cached children, plus the `.vfs` probe that rides along. */
+interface BrowseListing {
+  entries: VFSListEntry[];
+  /** `undefined` until this folder has been probed for a store. */
+  info?: { storeId: string } | null;
+  expiresAt: number;
+}
+
+/** One file, read once: its checksum and its text if it has any. */
+interface Peek {
+  hash: Hash | null;
+  text: string | null;
+}
+
+/**
+ * How much of a file the details pane wants back. `text` decodes because the
+ * name says it is text; `sniff` decodes only if the bytes read as text (a blob
+ * under `.vfs/objects/` is named after its hash, so there is nothing to go by);
+ * `hash` never decodes — it is what the across-roots comparison needs.
+ */
+type PeekMode = 'text' | 'sniff' | 'hash';
+
 /**
  * The explorer's whole state and behaviour, with no dependency on how it is
  * drawn. It mutates in place and calls {@link subscribe}rs on every change; a
@@ -311,12 +337,19 @@ export class ExplorerModel {
    * and invalidated per-path on our own mutations, so it never shows stale data
    * from an edit made here; a change made elsewhere shows on the next reopen.
    */
-  private readonly browseCache = new Map<
-    string,
-    { entries: VFSListEntry[]; expiresAt: number }
-  >();
+  private readonly browseCache = new Map<string, BrowseListing>();
   /** Browse-tree folders whose children are still being listed, keyed `sourceKey:path`. */
   private readonly browseLoading = new Set<string>();
+  /**
+   * Files already read for the details pane, keyed by root, path, mtime and size
+   * — the same identity the engine's own hash cache trusts, so an edited file
+   * misses on its new key instead of needing invalidation. Re-selecting a file,
+   * or comparing it against another root, then costs nothing rather than a
+   * download and a re-hash each. Bounded by {@link PEEK_BUDGET}.
+   */
+  private readonly peeks = new Map<string, Peek>();
+  /** Decoded text currently held in {@link peeks}, in UTF-16 units. */
+  private peekBytes = 0;
 
   /** Bumped on every selection change; a stale async load drops its result. */
   private detailToken = 0;
@@ -600,6 +633,10 @@ export class ExplorerModel {
     if (peer) {
       this.treeLoading = true;
       this.emit();
+      // Refreshing is the gesture that distrusts what we hold, so the cached
+      // reads go too — a file rewritten elsewhere at the same size and mtime
+      // would otherwise keep its old checksum here.
+      this.forgetPeeks(peer);
       const snapshot = await this.readSnapshot(peer, true);
       const merged = new Map(this.snapshots);
       merged.set(peer.key, snapshot);
@@ -631,6 +668,7 @@ export class ExplorerModel {
     if (this.active === peer.key) {
       this.active = (this.peers[index] ?? this.peers[index - 1])?.key ?? '';
     }
+    this.forgetPeeks(peer); // nothing will ask for this root's bytes again
     this.log(`closed ${peer.label}`);
     await this.render();
   }
@@ -676,7 +714,6 @@ export class ExplorerModel {
    */
   private async readVfsInfo(
     adapter: VFSAdapter,
-    path: string,
     children: VFSListEntry[],
   ): Promise<{ storeId: string } | null> {
     const control = children.find((c) => c.name === CONTROL_DIR && c.kind === 'directory');
@@ -690,6 +727,28 @@ export class ExplorerModel {
     }
   }
 
+  /**
+   * The `.vfs` probe for one folder, cached alongside its listing. The probe is
+   * a read of `.vfs/config.json` — a request of its own on Drive — and the tree
+   * is rebuilt on every fold, unfold and refresh, so without this every visible
+   * root is re-read each time. It shares the listing's expiry and its
+   * invalidation, so it can never outlive the children it was derived from.
+   */
+  private async browseInfo(
+    source: BrowseSource,
+    path: string,
+    children: VFSListEntry[],
+  ): Promise<{ storeId: string } | null> {
+    if (!source.adapter) return null;
+    const held = this.browseCache.get(`${source.key}:${normalizePath(path)}`);
+    if (held?.info !== undefined && Date.now() < held.expiresAt) return held.info;
+    const info = await this.readVfsInfo(source.adapter, children);
+    // Only attach it to the record the children came from; if that has since
+    // been dropped, the next probe reads again rather than reviving it.
+    if (held) held.info = info;
+    return info;
+  }
+
   /** A folder's listing, served from cache until it expires with the token. */
   private async browseList(source: BrowseSource, path: string): Promise<VFSListEntry[]> {
     if (!source.adapter) return [];
@@ -699,6 +758,19 @@ export class ExplorerModel {
     const entries = await source.adapter.list(path);
     this.browseCache.set(key, { entries, expiresAt: this.browseExpiry(source) });
     return entries;
+  }
+
+  /**
+   * A browsed file's stat. Backends whose listing carries sizes and times — Drive
+   * among them — answer this from the parent folder's cached listing, so clicking
+   * a row in the tree costs nothing; only the rest fall back to the backend.
+   */
+  private async browseStat(source: BrowseSource, path: string): Promise<VFSStat | null> {
+    if (!source.adapter) return null;
+    const listed = (await this.browseList(source, dirname(path))).find(
+      (entry) => entry.path === path,
+    );
+    return listed?.stat ?? (await source.adapter.stat(path));
   }
 
   /**
@@ -723,9 +795,13 @@ export class ExplorerModel {
 
   /** Drop a folder's listing and every listing beneath it. */
   private forgetSubtree(source: BrowseSource, path: string): void {
-    const prefix = `${source.key}:${normalizePath(path)}`;
+    const root = normalizePath(path);
+    const prefix = `${source.key}:${root}`;
+    // At the root, every key of this source is inside the subtree; deeper, only
+    // the folder itself and what is under its slash — `one` must not take `one-b`.
+    const under = root ? `${prefix}/` : prefix;
     for (const key of [...this.browseCache.keys()]) {
-      if (key === prefix || key.startsWith(`${prefix}/`)) this.browseCache.delete(key);
+      if (key === prefix || key.startsWith(under)) this.browseCache.delete(key);
     }
   }
 
@@ -748,7 +824,7 @@ export class ExplorerModel {
         // One listing per folder gives both the child count and the `.vfs`
         // probe; a separate stat would double the requests on Drive.
         const children = await this.browseList(source, entry.path);
-        const info = await this.readVfsInfo(source.adapter, entry.path, children);
+        const info = await this.browseInfo(source, entry.path, children);
         const visible = children.filter((c) => c.name !== CONTROL_DIR);
         const expanded = source.expanded.has(entry.path);
         out.push({
@@ -784,7 +860,7 @@ export class ExplorerModel {
     // The kind is already known from the row that was clicked, so a directory
     // needs no `stat` — only a file does, for its size and mtime.
     if (picked.kind === 'file') {
-      const stat = await adapter.stat(picked.path);
+      const stat = await this.browseStat(source, picked.path);
       if (!stat) {
         this.browseSel = null;
         return { kind: 'intro' };
@@ -801,7 +877,7 @@ export class ExplorerModel {
     // listing feeds the `.vfs` probe, so a directory's details cost is at most
     // one request — and none once the tree has already listed it.
     const children = await this.browseList(source, picked.path);
-    const info = await this.readVfsInfo(adapter, picked.path, children);
+    const info = await this.browseInfo(source, picked.path, children);
     return {
       kind: 'directory',
       path: picked.path,
@@ -893,11 +969,13 @@ export class ExplorerModel {
       if (!relative) return;
       const path = joinPath(base, relative);
       await source.adapter.mkdir(path);
-      // The base's listing gained a child; the new folder is known-empty. Seed
-      // that so the rebuild re-lists only the base, not the whole tree.
+      // The base's listing gained a child; the new folder is known-empty, and
+      // known to hold no store. Seed both so the rebuild re-lists only the base
+      // and does not probe a folder we just created.
       this.forgetListing(source, base);
       this.browseCache.set(`${source.key}:${path}`, {
         entries: [],
+        info: null,
         expiresAt: this.browseExpiry(source),
       });
       // reveal it: the base and every ancestor of the new folder unfold
@@ -1300,27 +1378,12 @@ export class ExplorerModel {
     if (!detail.stat) return detail;
 
     const size = detail.stat.size;
-    const wantsText = isTextMime(mime) && size <= EDIT_LIMIT;
-    try {
-      if (size <= STREAM_HASH_OVER) {
-        // Small enough to pull once: hash and (when text) decode from the same
-        // bytes, rather than downloading the file a second time for the editor.
-        const bytes = await peer.node.read(current.path);
-        detail.hash = await sha256(bytes);
-        if (wantsText) detail.text = this.decoder.decode(bytes);
-        else if (control && size <= EDIT_LIMIT) {
-          // A blob under `objects/` is named after its hash, so there is no
-          // extension to guess from: show it when the bytes read as text.
-          const text = this.decoder.decode(bytes);
-          if (looksTextual(text)) detail.text = text;
-        }
-      } else {
-        // Too big to hold whole: stream the checksum, never load it as text.
-        detail.hash = await sha256Stream(await peer.node.readStream(current.path));
-      }
-    } catch {
-      // unreadable — leave hash/text null, as hashOf would
-    }
+    const openable = size <= EDIT_LIMIT;
+    const mode: PeekMode =
+      openable && isTextMime(mime) ? 'text' : openable && control ? 'sniff' : 'hash';
+    const peeked = await this.peek(peer, current.path, detail.stat, mode);
+    detail.hash = peeked.hash;
+    detail.text = peeked.text;
 
     if (control) return detail;
     for (const other of this.peers) {
@@ -1334,8 +1397,72 @@ export class ExplorerModel {
     return { key: peer.key, label: peer.label, backend: peer.backend };
   }
 
+  /**
+   * One read of a file: its checksum, and its text when there is any to show.
+   * Remembered under mtime+size, so selecting the same file again — or comparing
+   * it across roots, which hashes every other copy — never downloads it twice.
+   * Anything past {@link STREAM_HASH_OVER} is streamed and never held whole.
+   */
+  private async peek(peer: Peer, path: string, stat: VFSStat, mode: PeekMode): Promise<Peek> {
+    const key = `${peer.key}:${path}:${stat.mtime}:${stat.size}`;
+    const hit = this.peeks.get(key);
+    if (hit) {
+      // Re-insert: iteration order is insertion order, which is the eviction
+      // order, so touching an entry makes it the last to go.
+      this.peeks.delete(key);
+      this.peeks.set(key, hit);
+      return hit;
+    }
+    const peeked: Peek = { hash: null, text: null };
+    try {
+      if (stat.size > STREAM_HASH_OVER) {
+        peeked.hash = await sha256Stream(await peer.node.readStream(path));
+      } else {
+        // Small enough to pull once: hash and (when text) decode from the same
+        // bytes, rather than downloading the file a second time for the editor.
+        const bytes = await peer.node.read(path);
+        peeked.hash = await sha256(bytes);
+        if (mode !== 'hash') {
+          const text = this.decoder.decode(bytes);
+          if (mode === 'text' || looksTextual(text)) peeked.text = text;
+        }
+      }
+    } catch {
+      return peeked; // unreadable, and not worth remembering as such
+    }
+    this.remember(key, peeked);
+    return peeked;
+  }
+
+  /** Drop one root's cached reads — on a refresh, and when its tab is closed. */
+  private forgetPeeks(peer: Peer): void {
+    for (const [key, held] of this.peeks) {
+      if (!key.startsWith(`${peer.key}:`)) continue;
+      this.peeks.delete(key);
+      this.peekBytes -= held.text?.length ?? 0;
+    }
+  }
+
+  /** Hold a peek, dropping the oldest ones until it is back inside its budget. */
+  private remember(key: string, peeked: Peek): void {
+    this.peeks.set(key, peeked);
+    this.peekBytes += peeked.text?.length ?? 0;
+    for (const [oldest, held] of this.peeks) {
+      if (this.peeks.size <= 1) break;
+      if (this.peekBytes <= PEEK_BUDGET && this.peeks.size <= PEEK_LIMIT) break;
+      this.peeks.delete(oldest);
+      this.peekBytes -= held.text?.length ?? 0;
+    }
+  }
+
   private async compare(other: Peer, path: string, detail: Details): Promise<Across> {
-    const stat = await other.adapter.stat(path);
+    // That root's own walk is a complete listing of its files, so it answers
+    // both "is it there" and "how big is it" without touching the backend. Only
+    // a root we hold no walk for is asked directly.
+    const held = this.snapshots.get(other.key);
+    const stat = held
+      ? (held.files.find((file) => file.path === path)?.stat ?? null)
+      : await other.adapter.stat(path);
     if (!stat || stat.kind !== 'file') {
       return { ...this.tag(other), state: 'missing', detail: 'not here' };
     }
@@ -1347,7 +1474,7 @@ export class ExplorerModel {
         detail: same ? `same size, ${formatAgo(stat.mtime)}` : formatBytes(stat.size),
       };
     }
-    const hash = await this.hashOf(other, path, stat.size);
+    const hash = (await this.peek(other, path, stat, 'hash')).hash;
     if (hash === detail.hash) return { ...this.tag(other), state: 'same', detail: 'identical' };
     const newer = detail.stat && stat.mtime > detail.stat.mtime;
     return {
@@ -1355,16 +1482,6 @@ export class ExplorerModel {
       state: 'differs',
       detail: `${newer ? 'newer' : 'older'} · ${formatAgo(stat.mtime)}`,
     };
-  }
-
-  /** Small files hash from bytes; big ones stream so nothing is held whole. */
-  private async hashOf(peer: Peer, path: string, size: number): Promise<Hash | null> {
-    try {
-      if (size > STREAM_HASH_OVER) return await sha256Stream(await peer.node.readStream(path));
-      return await sha256(await peer.node.read(path));
-    } catch {
-      return null;
-    }
   }
 
   /**

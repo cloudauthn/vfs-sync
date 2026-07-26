@@ -184,6 +184,12 @@ with a target selector and a **Sync** button: pick another root to sync the open
 *All roots* to run the whole chain until it converges. Switching roots keeps the open file
 selected, so the same path can be compared across filesystems.
 
+Browsing is built to be cheap on a backend where every call is a request. Folder listings and their
+`.vfs` probes are cached together, a file's size and time come from the listing that named it, and a
+file read is remembered under its mtime and size — so reselecting it, or comparing it against
+another root, costs nothing. On Drive the caches live as long as the access token that filled them;
+the ↻ button re-reads whatever is on screen straight from the backend.
+
 It draws itself into an element you give it, carries scoped styles, and reads nothing from the
 host page — the demo's `/explorer/` page is one `<main>` and one call:
 

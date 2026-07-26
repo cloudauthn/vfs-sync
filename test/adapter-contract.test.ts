@@ -12,12 +12,17 @@ import { VFSNode } from '../src/vfs-node.js';
 import { sha256 } from '../src/hash.js';
 import { collect, readRange, readStream, writeStream } from '../src/stream.js';
 import { sync } from '../src/sync.js';
-import type { VFSAdapter } from '../src/types.js';
+import type { VFSAdapter, VFSListEntry } from '../src/types.js';
 import { FakeDirectoryHandle } from './fake-handle.js';
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 const temporaries: string[] = [];
+
+/** The required part of a listing — `stat` is optional per backend. */
+function named(entries: VFSListEntry[]): Array<Omit<VFSListEntry, 'stat'>> {
+  return entries.map(({ name, path, kind }) => ({ name, path, kind }));
+}
 
 async function tempDir(): Promise<string> {
   const dir = await mkdtemp(join(tmpdir(), 'vfs-contract-'));
@@ -99,13 +104,28 @@ describe.each(backends)('$name', ({ make }) => {
     await adapter.write('sub/inner.txt', encoder.encode('y'));
 
     const root = (await adapter.list('')).sort((a, b) => a.name.localeCompare(b.name));
-    expect(root).toEqual([
+    expect(named(root)).toEqual([
       { name: 'sub', path: 'sub', kind: 'directory' },
       { name: 'top.txt', path: 'top.txt', kind: 'file' },
     ]);
-    expect(await adapter.list('sub')).toEqual([
+    expect(named(await adapter.list('sub'))).toEqual([
       { name: 'inner.txt', path: 'sub/inner.txt', kind: 'file' },
     ]);
+  });
+
+  it('a listed stat, where the backend gets one for free, agrees with stat()', async () => {
+    const adapter = await make();
+    await adapter.write('top.txt', encoder.encode('12345'));
+    await adapter.write('sub/inner.txt', encoder.encode('y'));
+
+    const entries = [...(await adapter.list('')), ...(await adapter.list('sub'))];
+    expect(entries.length).toBe(3);
+    for (const entry of entries) {
+      // Optional by design: a backend whose listing does not carry sizes and
+      // times omits it, and the consumer stats. Carrying a wrong one is the bug.
+      if (!entry.stat) continue;
+      expect(entry.stat).toEqual(await adapter.stat(entry.path));
+    }
   });
 
   it('lists a missing directory as empty rather than throwing', async () => {

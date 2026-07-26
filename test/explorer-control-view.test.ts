@@ -77,10 +77,13 @@ describe('explorer .vfs view', () => {
     await peer.node.commit();
     await openControl(model, peer);
 
+    // Ask the commit which object holds the file: a store also keeps its tree
+    // under objects/, and that one's hash moves with every run.
+    const blob = (await peer.node.headTree()).entries[0]?.hash;
     const object = (model.snapshotOf(peer.key).control ?? []).find((file) =>
-      file.path.includes('/objects/'),
+      file.path.endsWith(`/objects/${blob?.slice(0, 2)}/${blob}`),
     );
-    if (!object) throw new Error('commit stored no object');
+    if (!object) throw new Error('commit stored no object for the file');
     await model.select(peer, { path: object.path, kind: 'file' });
     expect(model.details?.hash).toBe(object.path.slice(object.path.lastIndexOf('/') + 1));
     // an extensionless blob still previews, because the bytes read as text

@@ -58,7 +58,12 @@ export class MemoryAdapter implements VFSAdapter {
       const isDir = slash !== -1 || this.dirs.has(key);
       const known = seen.get(child);
       if (!known || (isDir && known.kind === 'file')) {
-        seen.set(child, { name, path: child, kind: isDir ? 'directory' : 'file' });
+        const entry: VFSListEntry = { name, path: child, kind: isDir ? 'directory' : 'file' };
+        // The map holds the bytes and the mtime already, so a caller that would
+        // stat every entry (walk, a file browser) needs no second pass.
+        const held = isDir ? undefined : this.entries.get(child);
+        if (held) entry.stat = { kind: 'file', size: held.data.byteLength, mtime: held.mtime };
+        seen.set(child, entry);
       }
     }
     return [...seen.values()];

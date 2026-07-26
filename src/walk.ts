@@ -29,7 +29,9 @@ export async function walk(adapter: VFSAdapter, options: WalkOptions = {}): Prom
         await visit(entry.path);
         continue;
       }
-      const stat = await adapter.stat(entry.path);
+      // A listing that already carried the stat saves a call per file — on Drive
+      // that is a round trip per file, which is most of what walking one costs.
+      const stat = entry.stat ?? (await adapter.stat(entry.path));
       if (stat && stat.kind === 'file') files.push({ path: entry.path, stat });
     }
   };

@@ -15,6 +15,17 @@ export interface VFSListEntry {
   /** Path relative to the adapter root, POSIX separators, no leading slash. */
   path: string;
   kind: EntryKind;
+  /**
+   * The entry's stat, when the listing already carried it. Optional and purely
+   * an optimisation: a backend whose directory listing comes back with sizes and
+   * times attaches them here, and a consumer that would otherwise `stat()` every
+   * entry can skip the call. Drive is the reason it exists — its file list
+   * returns `size` and `modifiedTime` for every child in the one request, so a
+   * walk that re-stats each file pays a whole round trip per file for data it
+   * already has. When present it must equal what {@link VFSAdapter.stat} would
+   * return; when absent, nothing may be assumed.
+   */
+  stat?: VFSStat;
 }
 
 /**

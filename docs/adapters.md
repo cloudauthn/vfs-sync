@@ -358,13 +358,17 @@ The contract the engine relies on, in full:
 5. `rename` creates the destination's parent directories if needed.
 6. `read` throws for a missing file.
 7. `mtime` is milliseconds since the epoch and moves forward when content changes.
+8. A listed entry may carry a `stat`, and when it does it equals what `stat()` would return.
+   Optional, and purely an optimisation: attach it when your listing already knows the size and
+   time, omit it otherwise — never guess. `walk()` skips its own `stat` call for entries that have
+   one, which is why a Drive walk costs one request per folder instead of one per file.
 
 And, if you implement the streaming three:
 
-8. Ranges clamp rather than throw: a `start` past the end yields empty, an `end` past the end
+9. Ranges clamp rather than throw: a `start` past the end yields empty, an `end` past the end
    stops at the end, and `start >= end` yields empty.
-9. `readRange`/`readStream` throw for a missing file, exactly like `read`.
-10. `writeStream` truncates on open, and aborting the writer must not throw.
+10. `readRange`/`readStream` throw for a missing file, exactly like `read`.
+11. `writeStream` truncates on open, and aborting the writer must not throw.
 
 `test/adapter-contract.test.ts` encodes exactly this and runs against every built-in backend. Point
 it at yours and you will know it composes with the rest.

@@ -3,6 +3,7 @@ import { GDriveAdapter } from '../src/adapters/gdrive.js';
 import { MemoryAdapter } from '../src/adapters/memory.js';
 import { VFSNode } from '../src/vfs-node.js';
 import { sync } from '../src/sync.js';
+import { walk } from '../src/walk.js';
 import { makeFakeDrive } from './fake-drive.js';
 
 const encoder = new TextEncoder();
@@ -100,9 +101,34 @@ describe('GDriveAdapter', () => {
     expect(listings.length).toBeGreaterThan(0);
     expect(listings.every((u) => u.includes('spaces=appDataFolder'))).toBe(true);
     // The tree is anchored at the special appDataFolder root, not 'root'.
-    expect(await adapter.list('')).toEqual([
+    expect(await adapter.list('')).toMatchObject([
       { name: 'state', path: 'state', kind: 'directory' },
     ]);
+  });
+
+  it('lists with sizes and times attached, so a walk needs no stat per file', async () => {
+    let requests = 0;
+    const fake = makeFakeDrive();
+    const adapter = new GDriveAdapter({
+      token: 'tok',
+      fetch: (input, init) => {
+        requests += 1;
+        return fake.fetch(input, init);
+      },
+    });
+    await adapter.write('a.md', encoder.encode('aaa'));
+    await adapter.write('b.md', encoder.encode('bbbbb'));
+    await adapter.write('sub/c.md', encoder.encode('cc'));
+
+    requests = 0;
+    const files = await walk(adapter);
+    expect(files.map((file) => [file.path, file.stat.size])).toEqual([
+      ['a.md', 3],
+      ['b.md', 5],
+      ['sub/c.md', 2],
+    ]);
+    // Two folders, so two list queries — and not a single stat on top of them.
+    expect(requests).toBe(2);
   });
 
   it('syncs end-to-end with a memory peer', async () => {
