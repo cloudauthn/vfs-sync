@@ -364,6 +364,31 @@
   color: var(--vfs-conflict);
 }
 
+/*
+ * The read-only `.vfs` view: dimmed, so it reads as machinery sitting under the
+ * working tree rather than as files of the user's own.
+ */
+.vfs-explorer .vfs-row.vfs-control .vfs-entry {
+  opacity: 0.5;
+}
+
+.vfs-explorer .vfs-row.vfs-control:hover .vfs-entry,
+.vfs-explorer .vfs-row.vfs-control.vfs-selected .vfs-entry {
+  opacity: 0.85;
+}
+
+.vfs-explorer .vfs-row.vfs-control .vfs-name {
+  font-family: var(--vfs-mono);
+  font-size: 11.5px;
+}
+
+/* the store's own row, set apart from the working tree above it */
+.vfs-explorer .vfs-row.vfs-control-root {
+  margin-top: 6px;
+  border-top: 1px solid var(--vfs-line);
+  border-radius: 0 0 6px 6px;
+}
+
 /* "vfs" marker on folders that already hold a sync store */
 .vfs-explorer .vfs-chip {
   flex: 0 0 auto;
@@ -375,6 +400,11 @@
   border: 1px solid var(--vfs-accent);
   border-radius: 999px;
   padding: 0 6px;
+}
+
+.vfs-explorer .vfs-chip-muted {
+  color: var(--vfs-muted);
+  border-color: var(--vfs-line);
 }
 
 /* per-row actions in the OPFS browser (Open / delete) */
@@ -679,6 +709,12 @@
 .vfs-explorer .vfs-editor {
   flex: 1;
   min-height: 200px;
+}
+
+/* a store file is shown, never edited */
+.vfs-explorer .vfs-editor-ro textarea {
+  color: var(--vfs-muted);
+  resize: vertical;
 }
 
 .vfs-explorer .vfs-editor-head {

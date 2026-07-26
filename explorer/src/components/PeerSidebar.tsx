@@ -1,4 +1,5 @@
 import type { JSX } from 'preact';
+import { CONTROL_DIR } from '../../../src/index';
 import type { WalkedFile } from '../../../src/index';
 import { BACKEND_ICON } from '../model';
 import type { ExplorerModel, Peer } from '../model';
@@ -46,16 +47,34 @@ function selectedOn(model: ExplorerModel, path: string): boolean {
   return model.selection?.peer === model.active && model.selection.path === path;
 }
 
-function treeRows(model: ExplorerModel, peer: Peer, dir: TreeDir, depth: number): JSX.Element[] {
+/**
+ * One level of a root's tree. `control` draws the `.vfs` subtree instead of the
+ * working one: same rows, but folded by default (the store's `objects/` can hold
+ * thousands) and dimmed, since none of it is the user's to edit.
+ */
+function treeRows(
+  model: ExplorerModel,
+  peer: Peer,
+  dir: TreeDir,
+  depth: number,
+  control = false,
+): JSX.Element[] {
   const out: JSX.Element[] = [];
+  const dim = control ? ' vfs-control' : '';
   for (const name of [...dir.dirs.keys()].sort()) {
     const child = dir.dirs.get(name) as TreeDir;
-    const collapsed = peer.collapsed.has(child.path);
+    const collapsed = control
+      ? !peer.controlExpanded.has(child.path)
+      : peer.collapsed.has(child.path);
+    const toggle = (): void =>
+      control
+        ? model.toggleControl(peer, child.path)
+        : model.toggleDir(peer, child.path, collapsed);
     const selected = selectedOn(model, child.path);
     out.push(
       <li
         key={`d:${child.path}`}
-        class={`vfs-row vfs-dir${selected ? ' vfs-selected' : ''}`}
+        class={`vfs-row vfs-dir${dim}${selected ? ' vfs-selected' : ''}`}
         role="treeitem"
         aria-expanded={!collapsed}
         aria-selected={selected || undefined}
@@ -64,13 +83,13 @@ function treeRows(model: ExplorerModel, peer: Peer, dir: TreeDir, depth: number)
           class="vfs-entry"
           style={{ paddingLeft: depth * 14 + 6 }}
           onClick={() => void model.select(peer, { path: child.path, kind: 'directory' })}
-          onDblClick={() => model.toggleDir(peer, child.path, collapsed)}
+          onDblClick={toggle}
         >
           <span
             class="vfs-twisty"
             onClick={(event) => {
               event.stopPropagation();
-              model.toggleDir(peer, child.path, collapsed);
+              toggle();
             }}
           >
             {collapsed ? '▸' : '▾'}
@@ -81,7 +100,7 @@ function treeRows(model: ExplorerModel, peer: Peer, dir: TreeDir, depth: number)
         </button>
       </li>,
     );
-    if (!collapsed) out.push(...treeRows(model, peer, child, depth + 1));
+    if (!collapsed) out.push(...treeRows(model, peer, child, depth + 1, control));
   }
   for (const file of dir.files) {
     const name = file.path.slice(file.path.lastIndexOf('/') + 1);
@@ -89,7 +108,7 @@ function treeRows(model: ExplorerModel, peer: Peer, dir: TreeDir, depth: number)
     out.push(
       <li
         key={`f:${file.path}`}
-        class={`vfs-row${file.path.includes('(conflict ') ? ' vfs-conflict' : ''}${
+        class={`vfs-row${dim}${file.path.includes('(conflict ') ? ' vfs-conflict' : ''}${
           selected ? ' vfs-selected' : ''
         }`}
         role="treeitem"
@@ -110,6 +129,58 @@ function treeRows(model: ExplorerModel, peer: Peer, dir: TreeDir, depth: number)
     );
   }
   return out;
+}
+
+/**
+ * The store itself, under the working tree: folded, dimmed and read-only. It is
+ * the one place the machinery is visible — objects appearing as blobs are
+ * written, a JSON file per commit, the head moving in `config.json`.
+ */
+function ControlRows({ model, peer }: { model: ExplorerModel; peer: Peer }): JSX.Element {
+  const files = model.snapshotOf(peer.key).control;
+  const open = peer.controlExpanded.has(CONTROL_DIR);
+  const selected = selectedOn(model, CONTROL_DIR);
+  // buildTree keeps full paths, so the `.vfs` node of the built tree is exactly
+  // the subtree to draw — one level in, rows still addressed as `.vfs/…`.
+  const inner = files ? buildTree(files).dirs.get(CONTROL_DIR) : undefined;
+  return (
+    <>
+      <li
+        class={`vfs-row vfs-dir vfs-control vfs-control-root${selected ? ' vfs-selected' : ''}`}
+        role="treeitem"
+        aria-expanded={open}
+        aria-selected={selected || undefined}
+      >
+        <button
+          class="vfs-entry"
+          title="The sync store — shown read-only, the engine is its only writer"
+          onClick={() => void model.select(peer, { path: CONTROL_DIR, kind: 'directory' })}
+          onDblClick={() => model.toggleControl(peer, CONTROL_DIR)}
+        >
+          <span
+            class="vfs-twisty"
+            onClick={(event) => {
+              event.stopPropagation();
+              model.toggleControl(peer, CONTROL_DIR);
+            }}
+          >
+            {open ? '▾' : '▸'}
+          </span>
+          <span class="vfs-icon-cell">{open ? '📂' : '📁'}</span>
+          <span class="vfs-name">{CONTROL_DIR}</span>
+          <span class="vfs-meta">{files ? `${files.length}` : 'store'}</span>
+        </button>
+      </li>
+      {open &&
+        (files === null ? (
+          <li class="vfs-tree-loading">Loading…</li>
+        ) : inner ? (
+          treeRows(model, peer, inner, 1, true)
+        ) : (
+          <li class="vfs-tree-loading">Nothing to show — the store is unreadable</li>
+        ))}
+    </>
+  );
 }
 
 export function PeerSidebar({ model, peer }: { model: ExplorerModel; peer: Peer }): JSX.Element {
@@ -146,10 +217,15 @@ export function PeerSidebar({ model, peer }: { model: ExplorerModel; peer: Peer 
       <ul class="vfs-tree" role="tree">
         {model.treeLoading ? (
           <li class="vfs-empty">Loading…</li>
-        ) : snapshot.files.length === 0 ? (
-          <li class="vfs-empty">This folder is empty</li>
         ) : (
-          treeRows(model, peer, buildTree(snapshot.files), 0)
+          <>
+            {snapshot.files.length === 0 ? (
+              <li class="vfs-empty">This folder is empty</li>
+            ) : (
+              treeRows(model, peer, buildTree(snapshot.files), 0)
+            )}
+            <ControlRows model={model} peer={peer} />
+          </>
         )}
       </ul>
       <div class="vfs-sidebar-foot">

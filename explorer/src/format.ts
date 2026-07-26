@@ -70,6 +70,23 @@ export function mimeOf(path: string): string {
   return 'application/octet-stream';
 }
 
+/**
+ * Does this decode as text? For a name-based MIME guess this is never needed —
+ * but a blob under `.vfs/objects/` is named after its hash, so its name says
+ * nothing at all. Control characters (bar tab and the newlines) or the
+ * decoder's replacement char mean it was not text to begin with.
+ */
+export function looksTextual(text: string): boolean {
+  const end = Math.min(text.length, 4096);
+  for (let i = 0; i < end; i++) {
+    const code = text.charCodeAt(i);
+    if (code === 9 || code === 10 || code === 13) continue; // tab, LF, CR
+    // 0xfffd is what the decoder leaves where the bytes were not UTF-8 at all.
+    if (code < 32 || code === 0xfffd) return false;
+  }
+  return true;
+}
+
 export function isTextMime(mime: string): boolean {
   return (
     mime.startsWith('text/') ||

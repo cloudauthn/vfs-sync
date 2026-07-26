@@ -5,6 +5,7 @@ import {
   formatSize,
   iconOf,
   isTextMime,
+  looksTextual,
   mimeOf,
 } from '../explorer/src/format';
 
@@ -34,6 +35,18 @@ describe('explorer format helpers', () => {
     expect(isTextMime('image/svg+xml')).toBe(true);
     expect(isTextMime('image/png')).toBe(false);
     expect(isTextMime('application/octet-stream')).toBe(false);
+  });
+
+  it('sniffs text for the blobs whose name is only a hash', () => {
+    const decoder = new TextDecoder();
+    expect(looksTextual('# Notes\n\ttabbed\r\n')).toBe(true);
+    expect(looksTextual('')).toBe(true);
+    // a PNG header: NUL bytes, and bytes that are not UTF-8 at all
+    const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13]);
+    expect(looksTextual(decoder.decode(png))).toBe(false);
+    // only the first 4 KB is sampled, so a huge blob costs no more than a small one
+    expect(looksTextual(`${'a'.repeat(4096)}\u0000`)).toBe(true);
+    expect(looksTextual(`${'a'.repeat(4095)}\u0000`)).toBe(false);
   });
 
   it('gives every mime family an icon', () => {

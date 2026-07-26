@@ -34,7 +34,7 @@ import type {
   VFSStat,
   WalkedFile,
 } from '../../src/index';
-import { formatAgo, formatBytes, isTextMime, mimeOf } from './format';
+import { formatAgo, formatBytes, isTextMime, looksTextual, mimeOf } from './format';
 
 export type LogKind = 'info' | 'ok' | 'warn' | 'conflict';
 
@@ -107,6 +107,12 @@ export const BLURB: Record<Backend, string> = {
     'your own. Its native fileId tracks renames and moves with certainty.',
 };
 
+/** Shown when the read-only `.vfs` view, or anything inside it, is selected. */
+export const CONTROL_BLURB =
+  'The sync store. Blobs live under objects/ addressed by the SHA-256 of their ' +
+  'bytes, every commit is a JSON file, and config.json holds this root’s ' +
+  'identity and head. The explorer only reads it — the engine is its writer.';
+
 export interface Peer {
   key: string;
   label: string;
@@ -117,11 +123,24 @@ export interface Peer {
   fsa?: FSAAdapter;
   /** Directories this root has folded away. */
   collapsed: Set<string>;
+  /**
+   * Rows unfolded inside the read-only `.vfs` view — including `.vfs` itself,
+   * which is what makes its listing worth reading at all. Inverted against
+   * {@link collapsed} on purpose: the store's own files start folded away, so an
+   * `objects/` folder of thousands is never listed unless it is asked for.
+   */
+  controlExpanded: Set<string>;
 }
 
 /** What one render pass needs to know about a root. */
 export interface Snapshot {
   files: WalkedFile[];
+  /**
+   * The `.vfs` store's own files, or `null` while its row is folded — it is only
+   * read when open, since on a remote backend every folder in there is a round
+   * trip and none of it is part of the working tree.
+   */
+  control: WalkedFile[] | null;
   head: Hash | null;
   /** Committed state, by path — what the last commit says about each file. */
   tracked: Map<string, TreeEntry>;
@@ -154,6 +173,8 @@ export interface Details {
   hash: Hash | null;
   entry: TreeEntry | undefined;
   across: Across[];
+  /** Inside `.vfs`: the store's own metadata, which the explorer only reads. */
+  control: boolean;
   /** Loaded file text, or `null` when the file is binary or too large. */
   text: string | null;
   /** Directory rollup. */
@@ -416,7 +437,15 @@ export class ExplorerModel {
       id: label,
       reconstructBlobs: backend === 'GDrive',
     });
-    const peer: Peer = { key, label, backend, adapter, node, collapsed: new Set() };
+    const peer: Peer = {
+      key,
+      label,
+      backend,
+      adapter,
+      node,
+      collapsed: new Set(),
+      controlExpanded: new Set(),
+    };
     if (fsa) peer.fsa = fsa;
     this.peers.push(peer);
     this.rebuildEdges();
@@ -456,7 +485,7 @@ export class ExplorerModel {
     return this.peers.find((peer) => peer.key === key);
   }
 
-  private async readSnapshot(peer: Peer): Promise<Snapshot> {
+  private async readSnapshot(peer: Peer, freshControl = false): Promise<Snapshot> {
     const files = await walk(peer.adapter);
     const tracked = new Map<string, TreeEntry>();
     try {
@@ -469,11 +498,42 @@ export class ExplorerModel {
     const config = await peer.node.store.readConfig();
     return {
       files,
+      control: peer.controlExpanded.has(CONTROL_DIR)
+        ? await this.controlListing(peer, freshControl)
+        : null,
       head: await peer.node.head(),
       tracked,
       peers: config.peers ?? {},
       bytes: files.reduce((total, file) => total + file.stat.size, 0),
     };
+  }
+
+  /**
+   * The `.vfs` listing for one repaint. A local backend re-walks it, so objects
+   * appear in the view as they are written — which is the point of having it. On
+   * Drive that would be a request per object on every repaint (and a repaint
+   * every auto-sync tick), so the listing it already has stands until the
+   * refresh button asks for a new one, or the row is folded and opened again.
+   */
+  private async controlListing(peer: Peer, fresh: boolean): Promise<WalkedFile[]> {
+    const held = this.snapshots.get(peer.key)?.control;
+    if (held && !fresh && peer.backend === 'GDrive') return held;
+    return this.readControl(peer);
+  }
+
+  /**
+   * The store's own files, for the read-only `.vfs` view. `walk()` skips the
+   * control folder by design — the engine must never sync its own metadata — so
+   * this walks it through a scoped adapter and puts the prefix back on, which
+   * keeps `.vfs` invisible to the engine and visible to the explorer.
+   */
+  private async readControl(peer: Peer): Promise<WalkedFile[]> {
+    try {
+      const files = await walk(new ScopedAdapter(peer.adapter, CONTROL_DIR, CONTROL_DIR));
+      return files.map((file) => ({ path: `${CONTROL_DIR}/${file.path}`, stat: file.stat }));
+    } catch {
+      return []; // a root whose store is unreadable still lists its working tree
+    }
   }
 
   /** Recompute every snapshot (and the new-tab view, when open) and repaint. */
@@ -507,7 +567,14 @@ export class ExplorerModel {
 
   snapshotOf(key: string): Snapshot {
     return (
-      this.snapshots.get(key) ?? { files: [], head: null, tracked: new Map(), peers: {}, bytes: 0 }
+      this.snapshots.get(key) ?? {
+        files: [],
+        control: null,
+        head: null,
+        tracked: new Map(),
+        peers: {},
+        bytes: 0,
+      }
     );
   }
 
@@ -533,7 +600,7 @@ export class ExplorerModel {
     if (peer) {
       this.treeLoading = true;
       this.emit();
-      const snapshot = await this.readSnapshot(peer);
+      const snapshot = await this.readSnapshot(peer, true);
       const merged = new Map(this.snapshots);
       merged.set(peer.key, snapshot);
       this.snapshots = merged;
@@ -1069,6 +1136,42 @@ export class ExplorerModel {
     this.emit();
   }
 
+  /** `true` for the store's own files, which the explorer never writes to. */
+  isControlPath(path: string): boolean {
+    return path === CONTROL_DIR || path.startsWith(`${CONTROL_DIR}/`);
+  }
+
+  /**
+   * Unfold or fold a row of the `.vfs` view. Only `.vfs` itself costs anything:
+   * opening it reads the whole store listing, and every folder inside is then
+   * served from that.
+   */
+  toggleControl(peer: Peer, path: string): void {
+    if (peer.controlExpanded.has(path)) {
+      peer.controlExpanded.delete(path);
+      this.emit();
+      return;
+    }
+    peer.controlExpanded.add(path);
+    if (path !== CONTROL_DIR || this.snapshotOf(peer.key).control !== null) {
+      this.emit(); // already listed: flipping the twisty is the whole change
+      return;
+    }
+    this.emit(); // twisty and placeholder now, listing when it lands
+    void this.loadControl(peer);
+  }
+
+  /** Read the `.vfs` listing into the peer's snapshot. */
+  private async loadControl(peer: Peer): Promise<void> {
+    const control = await this.readControl(peer);
+    // Folded again while we were reading — the rows would have nowhere to go.
+    if (!peer.controlExpanded.has(CONTROL_DIR)) return;
+    const merged = new Map(this.snapshots);
+    merged.set(peer.key, { ...this.snapshotOf(peer.key), control });
+    this.snapshots = merged;
+    this.emit();
+  }
+
   // ---------------------------------------------------------------- actions
 
   /**
@@ -1124,6 +1227,13 @@ export class ExplorerModel {
     // Paint the row highlight straight away; the checksum arrives after.
     this.detailsLoading = !this.dirty;
     this.emit();
+    // A `.vfs` path can be picked while the store is still unlisted — following
+    // the selection onto another root does it — and its rollup needs that list.
+    if (this.isControlPath(entry.path) && this.snapshotOf(peer.key).control === null) {
+      peer.controlExpanded.add(CONTROL_DIR);
+      await this.loadControl(peer);
+      if (token !== this.detailToken) return;
+    }
     const loaded = await this.loadDetails(peer, this.selection);
     if (token !== this.detailToken) return;
     if (unsaved !== null) loaded.text = unsaved;
@@ -1140,6 +1250,7 @@ export class ExplorerModel {
   private async loadDetails(peer: Peer, current: Selection): Promise<Details> {
     const snapshot = this.snapshotOf(peer.key);
     const mime = mimeOf(current.path);
+    const control = this.isControlPath(current.path);
     const detail: Details = {
       peer: peer.key,
       path: current.path,
@@ -1149,15 +1260,20 @@ export class ExplorerModel {
       hash: null,
       entry: snapshot.tracked.get(current.path),
       across: [],
+      control,
       text: null,
       count: 0,
       bytes: 0,
     };
+    // The store's own files live in their own listing, are never tracked, and
+    // are not compared across roots — every root's `.vfs` differs by design.
+    const listing = control ? (snapshot.control ?? []) : snapshot.files;
 
     if (current.kind === 'directory') {
-      const inside = snapshot.files.filter((file) => file.path.startsWith(`${current.path}/`));
+      const inside = listing.filter((file) => file.path.startsWith(`${current.path}/`));
       detail.count = inside.length;
       detail.bytes = inside.reduce((total, file) => total + file.stat.size, 0);
+      if (control) return detail;
       detail.across = this.peers
         .filter((other) => other.key !== peer.key)
         .map((other) => {
@@ -1179,7 +1295,7 @@ export class ExplorerModel {
 
     // The tree walk already stat'd every file, so reuse it instead of asking
     // the backend again; only fall back to a stat if the path is not in it.
-    const walked = snapshot.files.find((file) => file.path === current.path);
+    const walked = listing.find((file) => file.path === current.path);
     detail.stat = walked?.stat ?? (await peer.adapter.stat(current.path));
     if (!detail.stat) return detail;
 
@@ -1192,6 +1308,12 @@ export class ExplorerModel {
         const bytes = await peer.node.read(current.path);
         detail.hash = await sha256(bytes);
         if (wantsText) detail.text = this.decoder.decode(bytes);
+        else if (control && size <= EDIT_LIMIT) {
+          // A blob under `objects/` is named after its hash, so there is no
+          // extension to guess from: show it when the bytes read as text.
+          const text = this.decoder.decode(bytes);
+          if (looksTextual(text)) detail.text = text;
+        }
       } else {
         // Too big to hold whole: stream the checksum, never load it as text.
         detail.hash = await sha256Stream(await peer.node.readStream(current.path));
@@ -1200,6 +1322,7 @@ export class ExplorerModel {
       // unreadable — leave hash/text null, as hashOf would
     }
 
+    if (control) return detail;
     for (const other of this.peers) {
       if (other.key === peer.key) continue;
       detail.across.push(await this.compare(other, current.path, detail));
@@ -1244,7 +1367,19 @@ export class ExplorerModel {
     }
   }
 
+  /**
+   * The engine is the only writer inside `.vfs`; the explorer shows it and
+   * nothing more. The UI offers no way through here, but the model is the
+   * public surface, so every mutation checks rather than trusting the view.
+   */
+  private refuseControl(path: string): boolean {
+    if (!this.isControlPath(path)) return false;
+    this.log(`${CONTROL_DIR} is read-only — the store is the engine's to write`, 'warn');
+    return true;
+  }
+
   async write(peer: Peer, path: string, text: string): Promise<void> {
+    if (this.refuseControl(path)) return;
     await peer.node.write(path, this.encoder.encode(text));
     this.dirty = false;
     this.log(`saved ${path} on ${peer.label}`, 'ok');
@@ -1261,7 +1396,7 @@ export class ExplorerModel {
 
   async newFile(peer: Peer): Promise<void> {
     const name = prompt('File name (a / creates a folder)', 'untitled.md');
-    if (!name) return;
+    if (!name || this.refuseControl(normalizePath(name))) return;
     await peer.node.write(name, this.encoder.encode(''));
     this.log(`created ${name} on ${peer.label}`);
     await this.render();
@@ -1269,8 +1404,9 @@ export class ExplorerModel {
   }
 
   async renameFile(peer: Peer, path: string): Promise<void> {
+    if (this.refuseControl(path)) return;
     const name = prompt('Rename to', path);
-    if (!name || name === path) return;
+    if (!name || name === path || this.refuseControl(normalizePath(name))) return;
     // Goes through the node, not the adapter, so the rename is recorded as
     // intent and travels as a rename rather than as delete + create.
     await peer.node.rename(path, name);
@@ -1280,6 +1416,7 @@ export class ExplorerModel {
   }
 
   async deleteFile(peer: Peer, path: string): Promise<void> {
+    if (this.refuseControl(path)) return;
     if (!confirm(`Delete ${path} from ${peer.label}?`)) return;
     await peer.node.delete(path);
     this.log(`deleted ${path} on ${peer.label}`);
