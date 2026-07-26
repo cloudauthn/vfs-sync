@@ -178,8 +178,9 @@ modified / untracked, entry id, last editor) and how the same path stands on eve
 plus an inline editor for text files. Under the working tree sits `.vfs` itself, dimmed, folded and
 read-only: unfold it to watch objects appear as blobs are written, read a commit's JSON, or check
 that an object's checksum really is the name it is filed under. Nothing in there is editable — the
-engine is its only writer, and it is only listed while it is open, so a remote backend pays for it
-on request. The footer is a status bar — state, current head, last sync —
+engine is its only writer — and it is read one folder at a time, as each row is unfolded: `objects/`
+is a folder per two-character hash prefix, so a store of a few hundred blobs would otherwise spend
+hundreds of requests on one click. The footer is a status bar — state, current head, last sync —
 with a target selector and a **Sync** button: pick another root to sync the open one against, or
 *All roots* to run the whole chain until it converges. Switching roots keeps the open file
 selected, so the same path can be compared across filesystems.

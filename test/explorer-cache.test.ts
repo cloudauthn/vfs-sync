@@ -2,57 +2,12 @@ import { describe, expect, it, vi } from 'vitest';
 import { MemoryAdapter } from '../src/adapters/memory.js';
 import { ScopedAdapter } from '../src/adapters/scoped.js';
 import { VFSNode } from '../src/vfs-node.js';
-import type { ByteRange, VFSAdapter } from '../src/types.js';
 import { ExplorerModel } from '../explorer/src/model';
 import type { BrowseSource } from '../explorer/src/model';
+import { counting } from './helpers.js';
+import type { Calls } from './helpers.js';
 
 const encoder = new TextEncoder();
-
-interface Calls {
-  list: string[];
-  read: string[];
-  stat: string[];
-  reset(): void;
-}
-
-/**
- * A pass-through adapter that tallies what it was asked for. Every call it
- * records is a network round trip on Drive, so these counts are the thing the
- * explorer's caches exist to keep down.
- */
-function counting(base: VFSAdapter): { adapter: VFSAdapter; calls: Calls } {
-  const calls: Calls = {
-    list: [],
-    read: [],
-    stat: [],
-    reset() {
-      this.list.length = 0;
-      this.read.length = 0;
-      this.stat.length = 0;
-    },
-  };
-  const adapter: VFSAdapter = {
-    name: base.name,
-    list: (path) => {
-      calls.list.push(path);
-      return base.list(path);
-    },
-    read: (path) => {
-      calls.read.push(path);
-      return base.read(path);
-    },
-    stat: (path) => {
-      calls.stat.push(path);
-      return base.stat(path);
-    },
-    write: (path, data) => base.write(path, data),
-    delete: (path) => base.delete(path),
-    rename: (from, to) => base.rename(from, to),
-    mkdir: (path) => base.mkdir?.(path) ?? Promise.resolve(),
-    readRange: (path, range?: ByteRange) => base.readRange?.(path, range) ?? base.read(path),
-  };
-  return { adapter, calls };
-}
 
 /**
  * A booted model browsing one counted filesystem that already holds two vFS

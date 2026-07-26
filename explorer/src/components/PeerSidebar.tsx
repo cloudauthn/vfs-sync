@@ -1,6 +1,6 @@
 import type { JSX } from 'preact';
 import { CONTROL_DIR } from '../../../src/index';
-import type { WalkedFile } from '../../../src/index';
+import type { VFSListEntry, WalkedFile } from '../../../src/index';
 import { BACKEND_ICON } from '../model';
 import type { ExplorerModel, Peer } from '../model';
 import { formatBytes, iconOf, mimeOf } from '../format';
@@ -47,34 +47,16 @@ function selectedOn(model: ExplorerModel, path: string): boolean {
   return model.selection?.peer === model.active && model.selection.path === path;
 }
 
-/**
- * One level of a root's tree. `control` draws the `.vfs` subtree instead of the
- * working one: same rows, but folded by default (the store's `objects/` can hold
- * thousands) and dimmed, since none of it is the user's to edit.
- */
-function treeRows(
-  model: ExplorerModel,
-  peer: Peer,
-  dir: TreeDir,
-  depth: number,
-  control = false,
-): JSX.Element[] {
+function treeRows(model: ExplorerModel, peer: Peer, dir: TreeDir, depth: number): JSX.Element[] {
   const out: JSX.Element[] = [];
-  const dim = control ? ' vfs-control' : '';
   for (const name of [...dir.dirs.keys()].sort()) {
     const child = dir.dirs.get(name) as TreeDir;
-    const collapsed = control
-      ? !peer.controlExpanded.has(child.path)
-      : peer.collapsed.has(child.path);
-    const toggle = (): void =>
-      control
-        ? model.toggleControl(peer, child.path)
-        : model.toggleDir(peer, child.path, collapsed);
+    const collapsed = peer.collapsed.has(child.path);
     const selected = selectedOn(model, child.path);
     out.push(
       <li
         key={`d:${child.path}`}
-        class={`vfs-row vfs-dir${dim}${selected ? ' vfs-selected' : ''}`}
+        class={`vfs-row vfs-dir${selected ? ' vfs-selected' : ''}`}
         role="treeitem"
         aria-expanded={!collapsed}
         aria-selected={selected || undefined}
@@ -83,13 +65,13 @@ function treeRows(
           class="vfs-entry"
           style={{ paddingLeft: depth * 14 + 6 }}
           onClick={() => void model.select(peer, { path: child.path, kind: 'directory' })}
-          onDblClick={toggle}
+          onDblClick={() => model.toggleDir(peer, child.path, collapsed)}
         >
           <span
             class="vfs-twisty"
             onClick={(event) => {
               event.stopPropagation();
-              toggle();
+              model.toggleDir(peer, child.path, collapsed);
             }}
           >
             {collapsed ? '▸' : '▾'}
@@ -100,7 +82,7 @@ function treeRows(
         </button>
       </li>,
     );
-    if (!collapsed) out.push(...treeRows(model, peer, child, depth + 1, control));
+    if (!collapsed) out.push(...treeRows(model, peer, child, depth + 1));
   }
   for (const file of dir.files) {
     const name = file.path.slice(file.path.lastIndexOf('/') + 1);
@@ -108,7 +90,7 @@ function treeRows(
     out.push(
       <li
         key={`f:${file.path}`}
-        class={`vfs-row${dim}${file.path.includes('(conflict ') ? ' vfs-conflict' : ''}${
+        class={`vfs-row${file.path.includes('(conflict ') ? ' vfs-conflict' : ''}${
           selected ? ' vfs-selected' : ''
         }`}
         role="treeitem"
@@ -132,17 +114,88 @@ function treeRows(
 }
 
 /**
+ * One unfolded folder of the store, drawn straight from its listing — no tree is
+ * built, because none is held: a folded folder has never been read. Dimmed and
+ * read-only throughout, none of it being the user's to edit.
+ */
+function controlRows(model: ExplorerModel, peer: Peer, dir: string, depth: number): JSX.Element[] {
+  const entries = model.snapshotOf(peer.key).control?.get(dir);
+  const indent = depth * 14 + 6;
+  if (!entries) {
+    return [
+      <li key={`l:${dir}`} class="vfs-tree-loading" style={{ paddingLeft: indent + 20 }}>
+        Loading…
+      </li>,
+    ];
+  }
+  return entries.flatMap((entry) => {
+    const selected = selectedOn(model, entry.path);
+    const open = peer.controlExpanded.has(entry.path);
+    const rows = [
+      <li
+        key={`c:${entry.path}`}
+        class={`vfs-row vfs-control${entry.kind === 'directory' ? ' vfs-dir' : ''}${
+          selected ? ' vfs-selected' : ''
+        }`}
+        role="treeitem"
+        aria-expanded={entry.kind === 'directory' ? open : undefined}
+        aria-selected={selected || undefined}
+      >
+        <button
+          class="vfs-entry"
+          style={{ paddingLeft: indent }}
+          title={entry.path}
+          onClick={() => void model.select(peer, { path: entry.path, kind: entry.kind })}
+          onDblClick={() => entry.kind === 'directory' && model.toggleControl(peer, entry.path)}
+        >
+          {entry.kind === 'directory' ? (
+            <span
+              class="vfs-twisty"
+              onClick={(event) => {
+                event.stopPropagation();
+                model.toggleControl(peer, entry.path);
+              }}
+            >
+              {open ? '▾' : '▸'}
+            </span>
+          ) : (
+            <span class="vfs-twisty" />
+          )}
+          <span class="vfs-icon-cell">
+            {entry.kind === 'directory' ? (open ? '📂' : '📁') : iconOf(mimeOf(entry.path))}
+          </span>
+          <span class="vfs-name">{entry.name}</span>
+          <span class="vfs-meta">{controlMeta(model, peer, entry)}</span>
+        </button>
+      </li>,
+    ];
+    if (entry.kind === 'directory' && open) {
+      rows.push(...controlRows(model, peer, entry.path, depth + 1));
+    }
+    return rows;
+  });
+}
+
+/**
+ * A file shows its size; a folder shows how many children it holds, but only once
+ * it has been unfolded — a count for a folder nobody has listed would be a guess.
+ */
+function controlMeta(model: ExplorerModel, peer: Peer, entry: VFSListEntry): string {
+  if (entry.kind === 'file') return entry.stat ? formatBytes(entry.stat.size) : '';
+  const listed = model.snapshotOf(peer.key).control?.get(entry.path);
+  return listed ? `${listed.length}` : '';
+}
+
+/**
  * The store itself, under the working tree: folded, dimmed and read-only. It is
  * the one place the machinery is visible — objects appearing as blobs are
  * written, a JSON file per commit, the head moving in `config.json`.
  */
 function ControlRows({ model, peer }: { model: ExplorerModel; peer: Peer }): JSX.Element {
-  const files = model.snapshotOf(peer.key).control;
+  const listings = model.snapshotOf(peer.key).control;
   const open = peer.controlExpanded.has(CONTROL_DIR);
   const selected = selectedOn(model, CONTROL_DIR);
-  // buildTree keeps full paths, so the `.vfs` node of the built tree is exactly
-  // the subtree to draw — one level in, rows still addressed as `.vfs/…`.
-  const inner = files ? buildTree(files).dirs.get(CONTROL_DIR) : undefined;
+  const inside = listings?.get(CONTROL_DIR);
   return (
     <>
       <li
@@ -168,16 +221,14 @@ function ControlRows({ model, peer }: { model: ExplorerModel; peer: Peer }): JSX
           </span>
           <span class="vfs-icon-cell">{open ? '📂' : '📁'}</span>
           <span class="vfs-name">{CONTROL_DIR}</span>
-          <span class="vfs-meta">{files ? `${files.length}` : 'store'}</span>
+          <span class="vfs-meta">{inside ? `${inside.length}` : 'store'}</span>
         </button>
       </li>
       {open &&
-        (files === null ? (
-          <li class="vfs-tree-loading">Loading…</li>
-        ) : inner ? (
-          treeRows(model, peer, inner, 1, true)
-        ) : (
+        (listings && listings.size === 0 ? (
           <li class="vfs-tree-loading">Nothing to show — the store is unreadable</li>
+        ) : (
+          controlRows(model, peer, CONTROL_DIR, 1)
         ))}
     </>
   );

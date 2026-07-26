@@ -140,11 +140,13 @@ export interface Peer {
 export interface Snapshot {
   files: WalkedFile[];
   /**
-   * The `.vfs` store's own files, or `null` while its row is folded — it is only
-   * read when open, since on a remote backend every folder in there is a round
-   * trip and none of it is part of the working tree.
+   * The store, one folder's listing per unfolded row, keyed by folder path —
+   * `null` while `.vfs` itself is folded. A level at a time on purpose:
+   * `objects/` is a folder per two-character hash prefix, so walking it whole is
+   * a request per bucket on a remote backend, and a store of a few hundred blobs
+   * would spend hundreds of them on one click.
    */
-  control: WalkedFile[] | null;
+  control: Map<string, VFSListEntry[]> | null;
   head: Hash | null;
   /** Committed state, by path — what the last commit says about each file. */
   tracked: Map<string, TreeEntry>;
@@ -532,7 +534,7 @@ export class ExplorerModel {
     return {
       files,
       control: peer.controlExpanded.has(CONTROL_DIR)
-        ? await this.controlListing(peer, freshControl)
+        ? await this.readControl(peer, this.snapshots.get(peer.key)?.control ?? null, freshControl)
         : null,
       head: await peer.node.head(),
       tracked,
@@ -542,31 +544,61 @@ export class ExplorerModel {
   }
 
   /**
-   * The `.vfs` listing for one repaint. A local backend re-walks it, so objects
-   * appear in the view as they are written — which is the point of having it. On
-   * Drive that would be a request per object on every repaint (and a repaint
-   * every auto-sync tick), so the listing it already has stands until the
-   * refresh button asks for a new one, or the row is folded and opened again.
+   * The store as the read-only view needs it: one listing per unfolded folder,
+   * `.vfs` first and down through whatever is open beneath it. A folded folder
+   * is never listed, which is the whole point — `objects/` fans out into a folder
+   * per hash prefix, and on Drive each one is a request.
+   *
+   * `held` is what the last pass read. A local backend re-lists anyway, so a
+   * commit's new objects show up on their own; on Drive re-listing every open
+   * folder on every repaint (and there is a repaint per auto-sync tick) is what
+   * we are avoiding, so the listings it already has stand until the refresh
+   * button asks for new ones. Either way a folder just unfolded is listed now.
    */
-  private async controlListing(peer: Peer, fresh: boolean): Promise<WalkedFile[]> {
-    const held = this.snapshots.get(peer.key)?.control;
-    if (held && !fresh && peer.backend === 'GDrive') return held;
-    return this.readControl(peer);
+  private async readControl(
+    peer: Peer,
+    held: Map<string, VFSListEntry[]> | null,
+    fresh: boolean,
+  ): Promise<Map<string, VFSListEntry[]>> {
+    const keep = !fresh && peer.backend === 'GDrive';
+    const listings = new Map<string, VFSListEntry[]>();
+    const visit = async (dir: string): Promise<void> => {
+      const reused = keep ? held?.get(dir) : undefined;
+      const entries = reused ?? (await this.listControl(peer, dir));
+      listings.set(dir, entries);
+      for (const entry of entries) {
+        if (entry.kind === 'directory' && peer.controlExpanded.has(entry.path)) {
+          await visit(entry.path);
+        }
+      }
+    };
+    try {
+      await visit(CONTROL_DIR);
+    } catch {
+      // a root whose store is unreadable still lists its working tree
+    }
+    return listings;
   }
 
   /**
-   * The store's own files, for the read-only `.vfs` view. `walk()` skips the
-   * control folder by design — the engine must never sync its own metadata — so
-   * this walks it through a scoped adapter and puts the prefix back on, which
-   * keeps `.vfs` invisible to the engine and visible to the explorer.
+   * One folder of the store, sorted for display, with a size on every file it
+   * holds. Backends whose listing already carries sizes (Drive, memory) pay
+   * nothing for that; the rest stat the files of this one folder, which is local
+   * and cheap on every backend where it happens.
    */
-  private async readControl(peer: Peer): Promise<WalkedFile[]> {
-    try {
-      const files = await walk(new ScopedAdapter(peer.adapter, CONTROL_DIR, CONTROL_DIR));
-      return files.map((file) => ({ path: `${CONTROL_DIR}/${file.path}`, stat: file.stat }));
-    } catch {
-      return []; // a root whose store is unreadable still lists its working tree
+  private async listControl(peer: Peer, dir: string): Promise<VFSListEntry[]> {
+    const entries: VFSListEntry[] = [];
+    for (const entry of await peer.adapter.list(dir)) {
+      if (entry.kind === 'file' && !entry.stat) {
+        const stat = await peer.adapter.stat(entry.path);
+        entries.push(stat ? { ...entry, stat } : entry);
+      } else {
+        entries.push(entry);
+      }
     }
+    return entries.sort((a, b) =>
+      a.kind === b.kind ? (a.name < b.name ? -1 : 1) : a.kind === 'directory' ? -1 : 1,
+    );
   }
 
   /** Recompute every snapshot (and the new-tab view, when open) and repaint. */
@@ -1220,9 +1252,9 @@ export class ExplorerModel {
   }
 
   /**
-   * Unfold or fold a row of the `.vfs` view. Only `.vfs` itself costs anything:
-   * opening it reads the whole store listing, and every folder inside is then
-   * served from that.
+   * Unfold or fold a row of the `.vfs` view. Unfolding costs the one listing of
+   * that folder — folding costs nothing and keeps it, so opening the row again is
+   * instant. Nothing below a folded row is ever read.
    */
   toggleControl(peer: Peer, path: string): void {
     if (peer.controlExpanded.has(path)) {
@@ -1231,17 +1263,14 @@ export class ExplorerModel {
       return;
     }
     peer.controlExpanded.add(path);
-    if (path !== CONTROL_DIR || this.snapshotOf(peer.key).control !== null) {
-      this.emit(); // already listed: flipping the twisty is the whole change
-      return;
-    }
-    this.emit(); // twisty and placeholder now, listing when it lands
+    this.emit(); // twisty and placeholder now, the listing when it lands
     void this.loadControl(peer);
   }
 
-  /** Read the `.vfs` listing into the peer's snapshot. */
+  /** Re-read the unfolded folders of the store into the peer's snapshot. */
   private async loadControl(peer: Peer): Promise<void> {
-    const control = await this.readControl(peer);
+    const snapshot = this.snapshotOf(peer.key);
+    const control = await this.readControl(peer, snapshot.control, false);
     // Folded again while we were reading — the rows would have nowhere to go.
     if (!peer.controlExpanded.has(CONTROL_DIR)) return;
     const merged = new Map(this.snapshots);
@@ -1343,15 +1372,21 @@ export class ExplorerModel {
       count: 0,
       bytes: 0,
     };
-    // The store's own files live in their own listing, are never tracked, and
-    // are not compared across roots — every root's `.vfs` differs by design.
-    const listing = control ? (snapshot.control ?? []) : snapshot.files;
+    if (control && current.kind === 'directory') {
+      // Immediate children, not a rollup: the store is listed a folder at a time,
+      // so a total would mean walking everything under here — which is exactly
+      // what this view no longer does. Its own listing, or one call for it.
+      const inside =
+        snapshot.control?.get(current.path) ?? (await this.listControl(peer, current.path));
+      detail.count = inside.length;
+      detail.bytes = inside.reduce((total, entry) => total + (entry.stat?.size ?? 0), 0);
+      return detail;
+    }
 
     if (current.kind === 'directory') {
-      const inside = listing.filter((file) => file.path.startsWith(`${current.path}/`));
+      const inside = snapshot.files.filter((file) => file.path.startsWith(`${current.path}/`));
       detail.count = inside.length;
       detail.bytes = inside.reduce((total, file) => total + file.stat.size, 0);
-      if (control) return detail;
       detail.across = this.peers
         .filter((other) => other.key !== peer.key)
         .map((other) => {
@@ -1371,10 +1406,13 @@ export class ExplorerModel {
       return detail;
     }
 
-    // The tree walk already stat'd every file, so reuse it instead of asking
-    // the backend again; only fall back to a stat if the path is not in it.
-    const walked = listing.find((file) => file.path === current.path);
-    detail.stat = walked?.stat ?? (await peer.adapter.stat(current.path));
+    // The listing this row came from already carries the size and time — the
+    // tree walk for a working file, the folder's own listing inside `.vfs` — so
+    // reuse it and only fall back to a stat if the path is not in it.
+    const listed = control
+      ? snapshot.control?.get(dirname(current.path))?.find((e) => e.path === current.path)?.stat
+      : snapshot.files.find((file) => file.path === current.path)?.stat;
+    detail.stat = listed ?? (await peer.adapter.stat(current.path));
     if (!detail.stat) return detail;
 
     const size = detail.stat.size;

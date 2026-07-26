@@ -1,8 +1,55 @@
 import { MemoryAdapter } from '../src/adapters/memory.js';
 import { VFSNode } from '../src/vfs-node.js';
+import type { ByteRange, VFSAdapter } from '../src/types.js';
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
+
+export interface Calls {
+  list: string[];
+  read: string[];
+  stat: string[];
+  reset(): void;
+}
+
+/**
+ * A pass-through adapter that tallies what it was asked for. On a remote backend
+ * every one of these is a round trip, so the tallies are what the explorer's
+ * caches and its lazy listings exist to keep down.
+ */
+export function counting(base: VFSAdapter): { adapter: VFSAdapter; calls: Calls } {
+  const calls: Calls = {
+    list: [],
+    read: [],
+    stat: [],
+    reset() {
+      this.list.length = 0;
+      this.read.length = 0;
+      this.stat.length = 0;
+    },
+  };
+  const adapter: VFSAdapter = {
+    name: base.name,
+    list: (path) => {
+      calls.list.push(path);
+      return base.list(path);
+    },
+    read: (path) => {
+      calls.read.push(path);
+      return base.read(path);
+    },
+    stat: (path) => {
+      calls.stat.push(path);
+      return base.stat(path);
+    },
+    write: (path, data) => base.write(path, data),
+    delete: (path) => base.delete(path),
+    rename: (from, to) => base.rename(from, to),
+    mkdir: (path) => base.mkdir?.(path) ?? Promise.resolve(),
+    readRange: (path, range?: ByteRange) => base.readRange?.(path, range) ?? base.read(path),
+  };
+  return { adapter, calls };
+}
 
 export interface Peer {
   node: VFSNode;
