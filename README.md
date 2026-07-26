@@ -142,6 +142,7 @@ threshold knob and the two caveats.
 | [**API reference**](./docs/api.md) | Every export, with examples. |
 | [**Recipes**](./docs/recipes.md) | Background loops, topologies, large files, partial reads, progress, history, testing, CLI. |
 | [**Design notes**](./docs/design.md) | The original design this implements (Spanish). |
+| [**Design v2**](./docs/design-v2.md) | Proposed successor: a two-file `.vfs`, sync by metadata, no blob store (Spanish). |
 
 ## Demo
 
