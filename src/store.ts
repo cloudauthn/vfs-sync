@@ -46,6 +46,24 @@ export interface VFSStoreOptions {
   reconstruct?: boolean;
 }
 
+/**
+ * How many commits and trees a store keeps decoded in memory. A hash is its
+ * content, so a memo of them can never be wrong — the bound is only about
+ * memory. Note that *existence* is deliberately not remembered: an object or a
+ * commit can vanish from disk, and noticing that is how the engine repairs it.
+ */
+const MEMO_LIMIT = 64;
+
+/** Insertion order is eviction order: keep a bounded memo of the newest reads. */
+function memoize<K, V>(map: Map<K, V>, key: K, value: V, limit: number): V {
+  map.set(key, value);
+  if (map.size > limit) {
+    const oldest = map.keys().next();
+    if (!oldest.done) map.delete(oldest.value);
+  }
+  return value;
+}
+
 export class VFSStore {
   readonly adapter: VFSAdapter;
   readonly root: string;
@@ -56,6 +74,13 @@ export class VFSStore {
   private config: NodeConfig | null = null;
   /** Lazy hash→working-path index, rebuilt from the cache. Reconstruct mode only. */
   private reverse: Map<Hash, string> | null = null;
+  /**
+   * Decoded commits and trees, by hash. A hash *is* its content, so what came
+   * back once can never have changed — and a sync walks the same commits and
+   * trees several times over while it negotiates.
+   */
+  private readonly commits = new Map<Hash, Commit>();
+  private readonly trees = new Map<Hash, Tree>();
 
   constructor(adapter: VFSAdapter, root = CONTROL_DIR, options: VFSStoreOptions = {}) {
     this.adapter = adapter;
@@ -63,8 +88,15 @@ export class VFSStore {
     this.reconstruct = options.reconstruct ?? false;
   }
 
-  /** A working file whose content is `hash`, from the cache. Reconstruct mode only. */
-  private async reconstructPath(hash: Hash): Promise<string | null> {
+  /**
+   * A working file whose content is `hash`, from the cache. Reconstruct mode only.
+   *
+   * `verify` confirms the file is still where the cache says, at the price of a
+   * `stat` — a request of its own on a remote backend. A caller that copes with
+   * a miss on its own (it reads through something that returns `null`, or falls
+   * back to `objects/`) passes `false` and lets the read be the check.
+   */
+  private async reconstructPath(hash: Hash, verify = true): Promise<string | null> {
     if (!this.reconstruct) return null;
     if (!this.reverse) {
       const cache = await this.hashCache();
@@ -73,6 +105,7 @@ export class VFSStore {
     }
     const path = this.reverse.get(hash);
     if (!path) return null;
+    if (!verify) return path;
     // The cache can lag the disk; make sure the file is still there.
     return (await this.adapter.stat(path)) ? path : null;
   }
@@ -85,10 +118,21 @@ export class VFSStore {
     return this.path('objects', hash.slice(0, 2), hash);
   }
 
+  /**
+   * Reads a file of the store, or `null` when it is not there. Reads first and
+   * asks afterwards: a hit is one call instead of `stat` + `read`, which on a
+   * remote backend halves the cost of every object, commit and config read. The
+   * `stat` only happens when the read failed, where it still decides whether the
+   * file was simply absent or the backend genuinely broke.
+   */
   private async readFile(path: string): Promise<Uint8Array | null> {
-    const stat = await this.adapter.stat(path);
-    if (!stat || stat.kind !== 'file') return null;
-    return this.adapter.read(path);
+    try {
+      return await this.adapter.read(path);
+    } catch (error) {
+      const stat = await this.adapter.stat(path);
+      if (stat && stat.kind === 'file') throw error;
+      return null;
+    }
   }
 
   // ---------------------------------------------------------------- config
@@ -110,7 +154,10 @@ export class VFSStore {
   async init(id?: string): Promise<NodeConfig> {
     const existing = await this.readFile(this.path('config.json'));
     if (existing) {
-      const config = await this.readConfig();
+      // Decode what we just read rather than asking readConfig, which would
+      // fetch the same file a second time before memoizing it.
+      const config = decodeJSON<NodeConfig>(existing);
+      this.config = config;
       // stores written before storeId existed pick one up on first open
       if (!config.storeId) {
         config.storeId = randomId();
@@ -164,13 +211,25 @@ export class VFSStore {
   }
 
   async getObject(hash: Hash): Promise<Uint8Array> {
+    // In reconstruct mode the working folder *is* the blob store, so read from
+    // there first: `objects/` only holds what the working tree cannot supply, and
+    // probing it first spends a miss — a lookup per path segment — on every blob.
+    //
+    // The bytes are checked against the address they were asked for, which is
+    // what makes the order safe: the hash→path index can be *stale in content*,
+    // not just in existence (a conflict loser is pinned into `objects/` precisely
+    // because its working file is about to be overwritten). A mismatch falls
+    // through to `objects/` rather than handing back the wrong blob.
+    if (this.reconstruct) {
+      const working = await this.reconstructPath(hash, false);
+      const reconstructed = working ? await this.readFile(working) : null;
+      if (reconstructed && (await sha256(reconstructed)) === hash) return reconstructed;
+    }
     const data = await this.readFile(this.objectPath(hash));
     if (data) return data;
-    const path = await this.reconstructPath(hash);
-    if (path) {
-      const reconstructed = await this.readFile(path);
-      if (reconstructed) return reconstructed;
-    }
+    // No unverified last resort: the working file has already been tried above,
+    // and reading it again without checking the digest is how a stale hash cache
+    // hands back the wrong blob.
     throw new Error(`missing object ${hash} in ${this.adapter.name}`);
   }
 
@@ -278,22 +337,33 @@ export class VFSStore {
   // ------------------------------------------------------------ trees
 
   async getTree(hash: Hash): Promise<Tree> {
-    return decodeJSON<Tree>(await this.getObject(hash));
+    const held = this.trees.get(hash);
+    if (held) return held;
+    // A tree is always written into `objects/` and is never a working file, so
+    // read it straight from there: going through getObject would load the
+    // reconstruction index for nothing. The fallback covers the pathological
+    // case where a working file happened to hold these very bytes, which would
+    // have let putTree skip the write.
+    const data = (await this.readFile(this.objectPath(hash))) ?? (await this.getObject(hash));
+    return memoize(this.trees, hash, decodeJSON<Tree>(data), MEMO_LIMIT);
   }
 
   async putTree(tree: Tree): Promise<Hash> {
     const canonical = canonicalTree(tree);
     const hash = await hashJSON(canonical);
     await this.putObjectAt(hash, encodeJSON(canonical));
+    memoize(this.trees, hash, canonical, MEMO_LIMIT);
     return hash;
   }
 
   // ----------------------------------------------------------- commits
 
   async getCommit(hash: Hash): Promise<Commit> {
+    const held = this.commits.get(hash);
+    if (held) return held;
     const data = await this.readFile(this.path('commits', `${hash}.json`));
     if (!data) throw new Error(`missing commit ${hash} in ${this.adapter.name}`);
-    return decodeJSON<Commit>(data);
+    return memoize(this.commits, hash, decodeJSON<Commit>(data), MEMO_LIMIT);
   }
 
   async hasCommit(hash: Hash): Promise<boolean> {
@@ -310,6 +380,7 @@ export class VFSStore {
     if (!(await this.hasCommit(hash))) {
       await this.adapter.write(this.path('commits', `${hash}.json`), encodeJSON(commit));
     }
+    memoize(this.commits, hash, commit, MEMO_LIMIT);
     await this.addKnown({ hash, timestamp: commit.timestamp, parents: commit.parents });
   }
 

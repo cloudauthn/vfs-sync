@@ -57,9 +57,10 @@ export class VFSNode {
   private readonly ignore: ((path: string) => boolean) | undefined;
   private readonly now: () => number;
 
-  private constructor(adapter: VFSAdapter, id: string, options: VFSNodeOptions) {
+  private constructor(adapter: VFSAdapter, id: string, options: VFSNodeOptions, store?: VFSStore) {
     this.adapter = adapter;
-    this.store = new VFSStore(adapter, undefined, { reconstruct: options.reconstructBlobs ?? false });
+    this.store =
+      store ?? new VFSStore(adapter, undefined, { reconstruct: options.reconstructBlobs ?? false });
     this.id = id;
     this.ignore = options.ignore;
     this.now = options.now ?? (() => Date.now());
@@ -73,10 +74,14 @@ export class VFSNode {
 
   /** Opens (creating `.vfs/` if needed) the folder behind `adapter`. */
   static async open(adapter: VFSAdapter, options: VFSNodeOptions = {}): Promise<VFSNode> {
-    const store = new VFSStore(adapter);
+    // The store that runs `init` is the one the node keeps. Opening through a
+    // throwaway threw away its cached config with it, so the first `head()` read
+    // `config.json` all over again — a round trip on a remote backend.
+    const store = new VFSStore(adapter, undefined, {
+      reconstruct: options.reconstructBlobs ?? false,
+    });
     const config = await store.init(options.id);
-    const node = new VFSNode(adapter, config.id, options);
-    return node;
+    return new VFSNode(adapter, config.id, options, store);
   }
 
   get name(): string {

@@ -221,6 +221,30 @@ Leave it off for local backends (OPFS, node, memory), where the extra copy is ch
 `objects/` layout is simplest. It composes with any backend, so a Drive node can sync with a normal
 one.
 
+Reconstruct mode also changes where a read looks first: the working folder, not `objects/`, because
+that is where the blobs are. The bytes are checked against the hash they were asked for before being
+handed back — the hash→path index can be stale in *content*, not just in existence (a conflict loser
+is pinned into `objects/` precisely because its working file is about to be overwritten), and a
+mismatch falls through to `objects/` instead of returning the wrong blob.
+
+### What a Drive operation costs
+
+Every call is a round trip, and a CORS preflight on top, so the request count is the performance.
+Where they go:
+
+- **A path lookup** is one query per unresolved segment. The path→id cache and `list()` (which warms
+  every child it returns) mean this is normally paid once per path per session.
+- **A `stat`** is free of a metadata fetch when the lookup that resolved the path just returned it —
+  the name query asks for `size` and `modifiedTime` along with the id.
+- **A store read** — object, commit, config — is one read, not a `stat` and then a read. The `stat`
+  only happens if the read failed, to tell an absent file from a backend that broke.
+- **Commits and trees** are content-addressed, so a store keeps the ones it has decoded. Repainting a
+  file tree or negotiating a sync walks the same handful of them repeatedly.
+- **A walk** is one `list` per folder, with no `stat` per file.
+
+`test/gdrive-traffic.test.ts` asserts these as upper bounds on real flows — opening a root, walking
+it, syncing it — so a change that puts a round trip back fails with the number it regressed to.
+
 ### Notes
 
 - **Large uploads.** `readRange`/`readStream` map onto Drive's `Range` support and are cheap, but

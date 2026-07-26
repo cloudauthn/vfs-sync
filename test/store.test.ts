@@ -24,6 +24,24 @@ describe('object store', () => {
     await expect(store.getObject('deadbeef')).rejects.toThrow(/missing object deadbeef in device-a/);
   });
 
+  it('tells a backend that broke apart from a file that is not there', async () => {
+    // Store reads go straight to `read` and only ask `stat` if it failed, so
+    // that question has to be answered right: a flaky backend must not read as
+    // an empty store, which would mint a fresh identity over a real one.
+    const base = new MemoryAdapter('flaky');
+    const store = new VFSStore(base);
+    await store.init('device-a');
+    const broken = Object.create(base) as MemoryAdapter;
+    broken.read = () => Promise.reject(new Error('502 from the backend'));
+
+    const over = new VFSStore(broken);
+    await expect(over.readConfig()).rejects.toThrow(/502 from the backend/);
+    // ...whereas a file that genuinely is not there is still just absent.
+    await expect(new VFSStore(broken, '.other').readConfig()).resolves.toMatchObject({
+      head: null,
+    });
+  });
+
   it('names the backend when a commit is missing', async () => {
     const store = new VFSStore(new MemoryAdapter('device-a'));
     await expect(store.getCommit('deadbeef')).rejects.toThrow(/missing commit deadbeef in device-a/);

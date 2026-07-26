@@ -148,10 +148,20 @@ export class GDriveAdapter implements VFSAdapter {
 
   /** Resolves a path to a fileId, or `null` if no such entry exists. */
   private async resolve(path: string): Promise<string | null> {
+    return (await this.locate(path))?.id ?? null;
+  }
+
+  /**
+   * Resolves a path, and hands back the metadata when the lookup had to fetch it
+   * — the name query returns size and modifiedTime along with the id, so a
+   * `stat` of a path nobody has resolved yet needs no second request. `file` is
+   * absent when the id came from the cache, where the metadata may have moved on.
+   */
+  private async locate(path: string): Promise<{ id: string; file?: DriveFile } | null> {
     const p = normalizePath(path);
-    if (p === '') return this.rootId;
+    if (p === '') return { id: this.rootId };
     const cached = this.ids.get(p);
-    if (cached) return cached;
+    if (cached) return { id: cached };
     const parent = await this.resolve(dirname(p));
     if (!parent) return null;
     const child = await this.childByName(parent, basename(p));
@@ -161,7 +171,7 @@ export class GDriveAdapter implements VFSAdapter {
     }
     this.ids.set(p, child.id);
     this.absent.delete(p);
-    return child.id;
+    return { id: child.id, file: child };
   }
 
   /**
@@ -386,8 +396,12 @@ export class GDriveAdapter implements VFSAdapter {
   async stat(path: string): Promise<VFSStat | null> {
     const target = normalizePath(path);
     if (target === '') return { kind: 'directory', size: 0, mtime: 0 };
-    const id = await this.resolve(target);
-    if (!id) return null;
+    const found = await this.locate(target);
+    if (!found) return null;
+    // The query that just resolved this path returned its metadata too; only a
+    // path whose id was already cached has to be fetched.
+    if (found.file) return statOf(found.file);
+    const id = found.id;
     const res = await this.authorized(`/drive/v3/files/${id}?fields=id,mimeType,size,modifiedTime`);
     if (res.status === 404) {
       this.forget(target);
