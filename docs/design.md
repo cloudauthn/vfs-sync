@@ -1,5 +1,9 @@
 # VFS Sync — Diseño de sincronización multi-peer (OPFS / File System Access API / Google Drive)
 
+> Este es el diseño de lo que está implementado hoy. [`design-v2.md`](./design-v2.md) propone
+> sustituir sus secciones 3, 5, 6, 7 y 8: `.vfs` de dos ficheros, sync por metadatos y sin almacén
+> de blobs. Las secciones 1, 2 y 4 siguen vigentes en v2.
+
 ## Objetivo
 
 Mecanismo de sincronización de carpetas entre cualquier combinación de proveedores:

@@ -67,8 +67,8 @@ function PeerCard({ model, view }: { model: DemoModel; view: PeerView }): JSX.El
       </ul>
       <div class="peer-actions">
         <button onClick={() => peer && void model.newFile(peer)}>+ new file</button>
-        <span class="commit" title={view.head ?? ''}>
-          {view.head ? `@ ${view.head.slice(0, 7)}` : 'no commits'}
+        <span class="commit" title={view.state ?? ''}>
+          {view.state ? `@ ${view.state.slice(0, 7)}` : 'nothing recorded'}
         </span>
       </div>
     </article>

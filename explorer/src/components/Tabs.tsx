@@ -37,7 +37,7 @@ function Tab({ model, peer }: { model: ExplorerModel; peer: Peer }): JSX.Element
       role="tab"
       tabIndex={0}
       aria-selected={peer.key === model.active}
-      title={`${peer.backend}${snapshot.head ? ` @ ${snapshot.head.slice(0, 7)}` : ''}`}
+      title={`${peer.backend}${snapshot.state ? ` @ ${snapshot.state.slice(0, 7)}` : ''}`}
       onClick={activate}
       onKeyDown={(event) => {
         if (event.key === 'Enter' || event.key === ' ') {

@@ -38,30 +38,43 @@ export class FakeFileHandle {
     });
   }
 
-  async createWritable(): Promise<{
-    write(chunk: Uint8Array): Promise<void>;
+  /**
+   * `keepExistingData` plus positional writes are what make a real append cheap
+   * on OPFS and FSA, so the fake models both — otherwise the adapter's native
+   * append path would never be exercised outside a browser.
+   */
+  async createWritable(options: { keepExistingData?: boolean } = {}): Promise<{
+    write(chunk: Uint8Array | { type: 'write'; position?: number; data: Uint8Array }): Promise<void>;
     close(): Promise<void>;
     abort(reason?: unknown): Promise<void>;
   }> {
-    const chunks: Uint8Array[] = [];
+    let buffer = options.keepExistingData ? this.data.slice() : new Uint8Array();
+    let cursor = 0;
+    let aborted = false;
+    const put = (data: Uint8Array, position: number) => {
+      const end = position + data.byteLength;
+      if (end > buffer.byteLength) {
+        const grown = new Uint8Array(end);
+        grown.set(buffer);
+        buffer = grown;
+      }
+      buffer.set(data, position);
+      cursor = end;
+    };
     return {
-      write: async (chunk: Uint8Array) => {
-        chunks.push(chunk.slice());
+      write: async (chunk) => {
+        if (chunk instanceof Uint8Array) put(chunk.slice(), cursor);
+        else put(chunk.data.slice(), chunk.position ?? cursor);
       },
       close: async () => {
-        const size = chunks.reduce((total, chunk) => total + chunk.byteLength, 0);
-        const merged = new Uint8Array(size);
-        let offset = 0;
-        for (const chunk of chunks) {
-          merged.set(chunk, offset);
-          offset += chunk.byteLength;
-        }
-        this.data = merged;
+        if (aborted) return;
+        this.data = buffer;
         this.lastModified = this.parent.clock();
       },
       // A discarded writable leaves the file untouched, like the real thing.
       abort: async () => {
-        chunks.length = 0;
+        aborted = true;
+        buffer = new Uint8Array();
       },
     };
   }

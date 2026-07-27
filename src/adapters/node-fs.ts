@@ -55,6 +55,17 @@ export class NodeFsAdapter implements VFSAdapter {
     await fs.writeFile(target, data);
   }
 
+  async mkdir(path: string): Promise<void> {
+    await fs.mkdir(this.resolve(path), { recursive: true });
+  }
+
+  /** Real append: the commit log grows by the bytes added, not by its size. */
+  async append(path: string, data: Uint8Array): Promise<void> {
+    const target = this.resolve(path);
+    await fs.mkdir(nodePath.dirname(target), { recursive: true });
+    await fs.appendFile(target, data);
+  }
+
   /** Positional read: seeks straight to `start`, never reads the rest. */
   async readRange(path: string, range: ByteRange = {}): Promise<Uint8Array> {
     const handle = await fs.open(this.resolve(path), 'r');

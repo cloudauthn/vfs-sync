@@ -1,5 +1,6 @@
 import {
   CONTROL_DIR,
+  HEADER_PROBE,
   FSAAdapter,
   GDriveAdapter,
   MemoryAdapter,
@@ -11,6 +12,8 @@ import {
   isOPFSAvailable,
   joinPath,
   normalizePath,
+  parseHeader,
+  readRange,
   sha256,
   sha256Stream,
   sync,
@@ -27,8 +30,9 @@ import type {
   ConflictReport,
   Hash,
   MeshEdge,
-  NodeConfig,
-  TreeEntry,
+  PeerMark,
+  PendingConflict,
+  VFSEntry,
   VFSAdapter,
   VFSListEntry,
   VFSStat,
@@ -113,9 +117,10 @@ export const BLURB: Record<Backend, string> = {
 
 /** Shown when the read-only `.vfs` view, or anything inside it, is selected. */
 export const CONTROL_BLURB =
-  'The sync store. Blobs live under objects/ addressed by the SHA-256 of their ' +
-  'bytes, every commit is a JSON file, and config.json holds this root’s ' +
-  'identity and head. The explorer only reads it — the engine is its writer.';
+  'The sync store. vfs.json is the mirror of this folder — a header, then a row ' +
+  'per path — and commits is the append-only log of operations behind it. There ' +
+  'is no object store: the working file is the content. The explorer only reads ' +
+  'this folder — the engine is its writer.';
 
 export interface Peer {
   key: string;
@@ -147,10 +152,15 @@ export interface Snapshot {
    * would spend hundreds of them on one click.
    */
   control: Map<string, VFSListEntry[]> | null;
-  head: Hash | null;
-  /** Committed state, by path — what the last commit says about each file. */
-  tracked: Map<string, TreeEntry>;
-  peers: NodeConfig['peers'];
+  /** Digest of the live entries — two roots agree when these match. */
+  state: Hash | null;
+  /** The mirror, by path: what `vfs.json` says about each file. */
+  tracked: Map<string, VFSEntry>;
+  peers: Record<string, PeerMark>;
+  /** Conflicts waiting for a person, straight out of `vfs.json`. */
+  conflicts: PendingConflict[];
+  /** When the mirror was last checked against the disk (§6). */
+  verifiedAt: number | null;
   bytes: number;
 }
 
@@ -177,7 +187,7 @@ export interface Details {
   stat: VFSStat | null;
   mime: string;
   hash: Hash | null;
-  entry: TreeEntry | undefined;
+  entry: VFSEntry | undefined;
   across: Across[];
   /** Inside `.vfs`: the store's own metadata, which the explorer only reads. */
   control: boolean;
@@ -466,12 +476,7 @@ export class ExplorerModel {
     backend: Backend,
     fsa?: FSAAdapter,
   ): Promise<Peer> {
-    // On Drive every object is a network write, so let its store treat the
-    // working folder as the blob store instead of duplicating every file.
-    const node = await VFSNode.open(adapter, {
-      id: label,
-      reconstructBlobs: backend === 'GDrive',
-    });
+    const node = await VFSNode.open(adapter, { id: label });
     const peer: Peer = {
       key,
       label,
@@ -522,23 +527,33 @@ export class ExplorerModel {
 
   private async readSnapshot(peer: Peer, freshControl = false): Promise<Snapshot> {
     const files = await walk(peer.adapter);
-    const tracked = new Map<string, TreeEntry>();
+    const tracked = new Map<string, VFSEntry>();
+    let state: Hash | null = null;
+    let peers: Record<string, PeerMark> = {};
+    let conflicts: PendingConflict[] = [];
+    let verifiedAt: number | null = null;
     try {
-      for (const entry of (await peer.node.headTree()).entries) {
-        if (!entry.deleted) tracked.set(entry.path, entry);
-      }
+      // §6: the tree is painted from `vfs.json`, never from a walk of the
+      // store. One read carries entries, peers and the pending conflicts.
+      const file = await peer.node.file();
+      for (const entry of file.entries) if (!entry.deleted) tracked.set(entry.path, entry);
+      state = file.state;
+      peers = file.peers ?? {};
+      verifiedAt = file.local.verifiedAt ?? null;
+      conflicts = await peer.node.conflicts();
     } catch {
-      // a root whose commit is unreadable still lists its files
+      // a root whose store is unreadable still lists its files
     }
-    const config = await peer.node.store.readConfig();
     return {
       files,
       control: peer.controlExpanded.has(CONTROL_DIR)
         ? await this.readControl(peer, this.snapshots.get(peer.key)?.control ?? null, freshControl)
         : null,
-      head: await peer.node.head(),
+      state,
       tracked,
-      peers: config.peers ?? {},
+      peers,
+      conflicts,
+      verifiedAt,
       bytes: files.reduce((total, file) => total + file.stat.size, 0),
     };
   }
@@ -635,9 +650,11 @@ export class ExplorerModel {
       this.snapshots.get(key) ?? {
         files: [],
         control: null,
-        head: null,
+        state: null,
         tracked: new Map(),
         peers: {},
+        conflicts: [],
+        verifiedAt: null,
         bytes: 0,
       }
     );
@@ -751,9 +768,10 @@ export class ExplorerModel {
     const control = children.find((c) => c.name === CONTROL_DIR && c.kind === 'directory');
     if (!control) return null;
     try {
-      const raw = this.decoder.decode(await adapter.read(`${control.path}/config.json`));
-      const config = JSON.parse(raw) as Partial<NodeConfig>;
-      return { storeId: config.storeId ?? config.id ?? 'unknown' };
+      // Only the header is needed, and it comes first in the file — so this
+      // stays a few hundred bytes even when `entries` runs to megabytes.
+      const prefix = await readRange(adapter, `${control.path}/vfs.json`, { end: HEADER_PROBE });
+      return { storeId: parseHeader(prefix)?.storeId ?? 'unknown' };
     } catch {
       return { storeId: 'unknown' };
     }
@@ -761,7 +779,7 @@ export class ExplorerModel {
 
   /**
    * The `.vfs` probe for one folder, cached alongside its listing. The probe is
-   * a read of `.vfs/config.json` — a request of its own on Drive — and the tree
+   * a range read of `.vfs/vfs.json` — a request of its own on Drive — and the tree
    * is rebuilt on every fold, unfold and refresh, so without this every visible
    * root is re-read each time. It shares the listing's expiry and its
    * invalidation, so it can never outlive the children it was derived from.
@@ -1579,6 +1597,29 @@ export class ExplorerModel {
     await this.select(peer, null);
   }
 
+  /**
+   * Settles one pending conflict (§4).
+   *
+   * The engine does the two operations — write the winner, delete the copy — in
+   * one batch, so from here it is an ordinary edit: nothing to reconcile, no
+   * state machine, and the answer propagates on the next sync like any write.
+   */
+  async resolveConflict(peer: Peer, uuid: string, choice: 'mine' | 'theirs'): Promise<void> {
+    const pending = (await peer.node.conflicts()).find((item) => item.uuid === uuid);
+    if (!pending) return;
+    if (pending.held && pending.held !== peer.node.id && choice === 'theirs') {
+      this.log(`that version stayed on ${pending.held} — sync with it first`, 'warn');
+      return;
+    }
+    await peer.node.resolve(uuid, choice);
+    this.log(
+      `resolved ${pending.path} on ${peer.label} — kept ${choice === 'mine' ? 'this side' : pending.copyPath}`,
+      'ok',
+    );
+    await this.render();
+    await this.reselect();
+  }
+
   // -------------------------------------------------------------------- sync
 
   setSyncTarget(key: string): void {
@@ -1633,7 +1674,7 @@ export class ExplorerModel {
     const winner = conflict.winner === 'a' ? conflict.a : conflict.b;
     this.log(
       `conflict on ${conflict.path} (${conflict.kind}) — ` +
-        `${winner.peer ?? conflict.winner} has the newer version` +
+        `${winner?.peer ?? conflict.winner} has the newer version` +
         (conflict.copy ? `, kept ${conflict.copy.path}` : ''),
       'conflict',
     );

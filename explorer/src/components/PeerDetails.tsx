@@ -1,5 +1,6 @@
 import type { JSX } from 'preact';
 import { CONTROL_DIR } from '../../../src/index';
+import type { PendingConflict } from '../../../src/index';
 import { BACKEND_ICON, BLURB, CONTROL_BLURB, EDIT_LIMIT } from '../model';
 import type { Details, ExplorerModel, Peer } from '../model';
 import { formatAgo, formatBytes, formatSize, formatTime, iconOf } from '../format';
@@ -37,9 +38,9 @@ export function PeerDetails({ model, peer }: { model: ExplorerModel; peer: Peer 
 
 function RootDetails({ model, peer }: { model: ExplorerModel; peer: Peer }): JSX.Element {
   const snapshot = model.snapshotOf(peer.key);
-  const history: Array<[string, string]> = Object.entries(snapshot.peers).map(([id, info]) => [
+  const history: Array<[string, string]> = Object.entries(snapshot.peers).map(([id, mark]) => [
     id,
-    `${formatAgo(info.lastSync)} @ ${info.head ? info.head.slice(0, 7) : '—'}`,
+    `${formatAgo(mark.lastSync)} @ ${mark.digest ? mark.digest.slice(0, 7) : '—'}`,
   ]);
   return (
     <div class="vfs-details-inner">
@@ -61,16 +62,85 @@ function RootDetails({ model, peer }: { model: ExplorerModel; peer: Peer }): JSX
           ]}
         />
         <Section
-          title="Commit"
+          title="Mirror"
           rows={[
-            ['Head', snapshot.head ?? 'no commits yet'],
-            ['Tracked files', String(snapshot.tracked.size)],
+            ['State', snapshot.state || 'nothing recorded yet'],
+            ['Tracked entries', String(snapshot.tracked.size)],
+            // The mirror is what the engine wrote, not what is on disk: as soon
+            // as anything writes around it the two drift, and there is no way to
+            // know without looking. Saying when it was last checked is the honest
+            // version of that (§6).
+            ['Verified', snapshot.verifiedAt ? formatAgo(snapshot.verifiedAt) : 'never'],
+            ['Pending conflicts', String(snapshot.conflicts.length)],
           ]}
         />
+        {snapshot.conflicts.length > 0 && (
+          <ConflictSection model={model} peer={peer} conflicts={snapshot.conflicts} />
+        )}
         <Section title="Sync history" rows={history.length ? history : [['—', 'never synced']]} />
         <p class="vfs-hint">Select a file on the left to inspect it.</p>
       </div>
     </div>
+  );
+}
+
+/** What each `reason` actually means, in the words the UI should use. */
+const REASON_BLURB: Record<PendingConflict['reason'], string> = {
+  binary: 'two edits of content that cannot be merged',
+  block: 'text whose edits overlap',
+  'delete-edit': 'one side deleted it, the other edited it',
+  kind: 'a file and a folder claiming the same path',
+};
+
+/**
+ * The pending decisions, straight out of `vfs.json`.
+ *
+ * This is the half of §4 the explorer could not do before: conflicts existed
+ * only as the return value of `sync()`, and their copies were spotted by the
+ * shape of a filename. Now they are entries with `conflictOf`, so they can be
+ * listed without syncing and settled without a sync either.
+ */
+function ConflictSection({
+  model,
+  peer,
+  conflicts,
+}: {
+  model: ExplorerModel;
+  peer: Peer;
+  conflicts: PendingConflict[];
+}): JSX.Element {
+  return (
+    <section class="vfs-section">
+      <h3>Pending conflicts</h3>
+      {conflicts.map((conflict) => (
+        <div key={conflict.uuid} class="vfs-pending">
+          <div class="vfs-pending-head" title={conflict.copyPath}>
+            <span class="vfs-pending-path">{conflict.path}</span>
+            <span class="vfs-pending-why">{REASON_BLURB[conflict.reason]}</span>
+          </div>
+          <div class="vfs-details-actions">
+            <button
+              class="vfs-ghost"
+              title={`Keep what is at ${conflict.path}`}
+              onClick={() => void model.resolveConflict(peer, conflict.uuid, 'mine')}
+            >
+              Keep mine
+            </button>
+            <button
+              class="vfs-ghost"
+              title={
+                conflict.held
+                  ? `${conflict.peer} kept the bytes — sync with it first`
+                  : `Promote ${conflict.copyPath}`
+              }
+              onClick={() => void model.resolveConflict(peer, conflict.uuid, 'theirs')}
+            >
+              {conflict.held ? `Keep ${conflict.peer}’s (remote)` : `Keep ${conflict.peer}’s`}
+            </button>
+          </div>
+        </div>
+      ))}
+    </section>
   );
 }
 
@@ -140,22 +210,33 @@ function FolderSections({ detail }: { detail: Details }): JSX.Element {
 
 /** One line per part of the store, keyed by its path inside `.vfs`. */
 const CONTROL_NOTES: Record<string, string> = {
-  objects:
-    'Blobs, named after the SHA-256 of their bytes and bucketed by its first two ' +
-    'characters. Identical content is one object, however many paths hold it.',
+  'vfs.json':
+    'The mirror of this folder. A header first — store id, the state digest, ' +
+    'what each peer was last seen at — then one row per path, so a peer can read ' +
+    'the header with a range read and never touch the entries.',
   commits:
-    'One JSON file per commit: the tree it snapshots, its parents and the peer ' +
-    'that wrote it.',
-  'config.json':
-    'This root’s id and head commit, plus what it knows of every peer it has ' +
-    'synced with.',
-  'known-commits.log':
-    'Every commit this root has ever seen. It turns common-ancestor negotiation ' +
-    'into a set intersection instead of a walk of the graph.',
-  'hash-cache.json':
-    'mtime+size → hash, so a scan only re-reads what actually changed. Local ' +
-    'bookkeeping: it never travels to a peer.',
+    'The append-only log: one JSON object per line, one line per operation. Rows ' +
+    'are identified and immutable, so merging two logs is set union.',
+  base:
+    'Previous versions of text files, kept for a three-way merge. Local ' +
+    'bookkeeping: it never travels to a peer, and losing it only costs a ' +
+    'conflict copy that need not have happened.',
 };
+
+/** Prefix matches, for the files that carry a rotation timestamp in their name. */
+const CONTROL_PREFIXES: Array<[string, string]> = [
+  [
+    'commits-',
+    'A closed log segment, frozen when the active one outgrew its budget. ' +
+      'Immutable, read only in the cold path, and safe to delete.',
+  ],
+  [
+    'vfs-',
+    'The cumulative snapshot taken when that segment closed: the last known ' +
+      'state of every entry that has ever existed, tombstones included. It is ' +
+      'what makes pruning a tombstone from vfs.json safe.',
+  ],
+];
 
 /**
  * What the opened part of the store is for. The `.vfs` view exists to be read,
@@ -163,30 +244,30 @@ const CONTROL_NOTES: Record<string, string> = {
  */
 function ControlNote({ path }: { path: string }): JSX.Element | null {
   const inside = path === CONTROL_DIR ? '' : path.slice(CONTROL_DIR.length + 1);
-  // Anything under objects/ or commits/ is described by the folder it is in.
-  const note = CONTROL_NOTES[inside] ?? CONTROL_NOTES[inside.split('/')[0] ?? ''];
+  // Anything under base/ is described by the folder it is in.
+  const note =
+    CONTROL_NOTES[inside] ??
+    CONTROL_NOTES[inside.split('/')[0] ?? ''] ??
+    CONTROL_PREFIXES.find(([prefix]) => inside.startsWith(prefix))?.[1];
   return note === undefined ? null : <p class="vfs-hint">{note}</p>;
 }
 
 /** The same hash means something different per row, so the hint says which. */
 function checksumHint(detail: Details): string {
   const { control, entry, hash, path } = detail;
-  // A blob's own name is its hash, so on an object row the checksum is a proof:
-  // re-hashing the bytes lands back on the path they were read from.
+  // A base copy is named after the hash of what it holds, so the checksum on
+  // that row is a proof: re-hashing the bytes lands on the name they are under.
   if (control && hash !== null && path.endsWith(hash)) {
-    return (
-      'SHA-256 of these bytes — the very hash this object is filed under, ' +
-      'which is what content-addressed means.'
-    );
+    return 'SHA-256 of these bytes — the very hash this copy is filed under.';
   }
   if (control) return 'SHA-256 of these bytes.';
   if (entry?.hash && hash && entry.hash !== hash) {
     return (
-      'SHA-256 of the file on disk — it differs from the committed blob, so ' +
-      'this edit has not been committed yet.'
+      'SHA-256 of the file on disk — it differs from what vfs.json records, so ' +
+      'this edit has not been reconciled yet.'
     );
   }
-  return 'SHA-256 of the file on disk. It is the address the blob is stored under.';
+  return 'SHA-256 of the file on disk — what a peer checks against on arrival.';
 }
 
 function FileSections({
@@ -227,12 +308,14 @@ function FileSections({
             rows={[
               [
                 'State',
-                entry ? (entry.hash === detail.hash ? 'committed' : 'modified') : 'untracked',
+                entry ? (entry.hash === detail.hash ? 'recorded' : 'modified') : 'untracked',
               ],
-              ['Entry id', entry?.id ?? '—'],
-              ['Logical mtime', entry ? formatTime(entry.mtime) : '—'],
+              ['Entry uuid', entry?.uuid ?? '—'],
+              ['Updated', entry ? formatTime(entry.updated) : '—'],
               ['Last edited by', entry?.peer ?? '—'],
-              ['Renamed from', entry?.renamedFrom ?? '—'],
+              ['Previous version', entry?.prev ? entry.prev.slice(0, 12) : '—'],
+              ['Moved from', entry?.prevPath ?? '—'],
+              ['Backend id', entry?.native ?? '—'],
             ]}
           />
           <AcrossSection across={detail.across} />

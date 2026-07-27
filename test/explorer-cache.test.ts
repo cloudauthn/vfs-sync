@@ -42,26 +42,31 @@ async function browsing(): Promise<{
   return { model, source, calls };
 }
 
-const configReads = (calls: Calls): string[] =>
-  calls.read.filter((path) => path.endsWith('config.json'));
+/**
+ * Probes of a folder's store. In v2 that is a range read of the header of
+ * `vfs.json` — the header comes first in the file, so the probe never pulls in
+ * the entries however many there are.
+ */
+const storeProbes = (calls: Calls): string[] =>
+  calls.read.filter((path) => path.endsWith('vfs.json'));
 
 describe('explorer caches', () => {
   it('probes each folder for a .vfs store once, not on every tree rebuild', async () => {
     const { model, source, calls } = await browsing();
     // The first build is behind us; both roots are already probed and cached.
-    expect(configReads(calls)).toEqual([]);
+    expect(storeProbes(calls)).toEqual([]);
 
     model.toggleBrowseDir(source, 'one', false);
     await vi.waitFor(() => expect(model.newTab?.rows?.length).toBeGreaterThan(2));
     model.toggleBrowseDir(source, 'one', true);
     await vi.waitFor(() => expect(model.newTab?.rows?.length).toBe(2));
-    // Two full rebuilds of the tree, and not one re-read of a store's config.
-    expect(configReads(calls)).toEqual([]);
+    // Two full rebuilds of the tree, and not one re-read of a store's header.
+    expect(storeProbes(calls)).toEqual([]);
     expect(model.newTab?.rows?.[0]?.info?.storeId).toBeTruthy();
 
     // The refresh button is the escape hatch: it re-reads everything.
     await model.reload();
-    expect(configReads(calls)).toEqual(['one/.vfs/config.json', 'two/.vfs/config.json']);
+    expect(storeProbes(calls)).toEqual(['one/.vfs/vfs.json', 'two/.vfs/vfs.json']);
   });
 
   it('takes a browsed file’s size and time from the listing it came from', async () => {

@@ -79,6 +79,16 @@ export class MemoryAdapter implements VFSAdapter {
     this.entries.set(normalizePath(path), { data: data.slice(), mtime: this.clock() });
   }
 
+  async append(path: string, data: Uint8Array): Promise<void> {
+    const target = normalizePath(path);
+    const held = this.entries.get(target);
+    if (!held) {
+      await this.write(target, data);
+      return;
+    }
+    this.entries.set(target, { data: concat([held.data, data.slice()]), mtime: this.clock() });
+  }
+
   async delete(path: string): Promise<void> {
     const target = normalizePath(path);
     for (const key of [...this.entries.keys()]) {

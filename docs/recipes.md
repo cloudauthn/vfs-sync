@@ -109,8 +109,8 @@ async function withSyncLock<T>(run: () => Promise<T>): Promise<T | undefined> {
 await withSyncLock(() => sync(local, remote));
 ```
 
-A node memoises `config.json`, the commit index and the hash cache, so if another tab wrote to the
-same folder, drop the memo before reading:
+A node memoises `vfs.json`, the active log segment and the rotation snapshot, so if another tab
+wrote to the same folder, drop the memo before reading:
 
 ```ts
 node.store.invalidate();
@@ -339,47 +339,48 @@ const total = (await node.scan()).entries.filter((e) => !e.deleted).length;
 
 ## Inspecting history
 
+There is no repository-level DAG in v2. History is **per file**, and it lives in the merged commit
+log: one row per operation, grouped into batches by whatever produced them.
+
 ```ts
-for (const commit of await node.log(20)) {
-  const kind = commit.parents.length > 1 ? 'merge' : 'commit';
+import { sortRows } from '@cloudauthn/vfs-sync';
+
+for (const row of sortRows(await node.store.logRows()).slice(-20)) {
   console.log(
-    commit.hash.slice(0, 7),
-    kind.padEnd(6),
-    commit.peer.padEnd(12),
-    new Date(commit.timestamp).toISOString(),
+    row.op.slice(0, 7),
+    row.type.padEnd(6),
+    row.peer.padEnd(12),
+    new Date(row.at).toISOString(),
+    row.path,
   );
 }
 ```
 
-What a specific file has been through:
+What a specific file has been through — the rows for its `uuid`, newest last:
 
 ```ts
 async function historyOf(node: VFSNode, path: string) {
-  const out: Array<{ commit: string; path: string; hash: string | null }> = [];
-  let id: string | undefined;
-
-  for (const commit of await node.log(100)) {
-    const tree = await node.store.getTree(commit.tree);
-    const entry = id
-      ? tree.entries.find((e) => e.id === id)
-      : tree.entries.find((e) => e.path === path);
-    if (!entry) continue;
-    id ??= entry.id; // lock onto the identity, then follow it through renames
-    out.push({ commit: commit.hash.slice(0, 7), path: entry.path, hash: entry.hash });
-  }
-  return out;
+  const entry = (await node.live()).find((item) => item.path === path);
+  if (!entry) return [];
+  const rows = [...(await node.store.logRows()), ...(await node.store.readSnapshot())];
+  return sortRows(rows.filter((row) => row.uuid === entry.uuid));
 }
 ```
 
-Recovering an old version, since blobs are kept:
+Rows from before the last rotation are in the closed segments, which are immutable and listed in
+`file.log.archives`:
 
 ```ts
-const previous = await node.store.getTree(commit.tree);
-const entry = previous.entries.find((e) => e.path === 'notes.md');
-if (entry?.hash) {
-  await node.write('notes.restored.md', await node.store.getObject(entry.hash));
+const file = await node.file();
+for (const segment of file.log.archives ?? []) {
+  const rows = await node.store.readArchive(segment);   // cached forever once read
+  console.log(`segment ${segment}: ${rows.length} row(s)`);
 }
 ```
+
+Old content is **not** recoverable: there is no object store, and the working file is the content.
+`.vfs/base/<hash>` keeps the last text versions for three-way merges only — local, pruned, and not
+an archive.
 
 ---
 
@@ -395,17 +396,20 @@ async function peer(id: string) {
   return { fs, node: await VFSNode.open(fs, { id }) };
 }
 
+// `updated` is a hybrid logical clock stamped when a node *records* a change, so
+// ordering two edits means controlling when each one is committed — not the
+// adapter's mtime, which only feeds the "did this file change?" fast filter.
+
 it('resolves a conflict in favour of the newer edit', async () => {
   const a = await peer('device-a');
   const b = await peer('device-b');
 
-  await a.node.write('notes.md', encode('shared'));
+  await a.node.write('notes.bin', encode('shared'));
   await sync(a.node, b.node);
 
-  await a.node.write('notes.md', encode('from A'));
-  a.fs.setMtime('notes.md', 1_000);          // script the ordering exactly
-  await b.node.write('notes.md', encode('from B'));
-  b.fs.setMtime('notes.md', 2_000);
+  await a.node.write('notes.bin', encode('from A'));
+  await a.node.commit();                     // A records first, so B's edit is the newer one
+  await b.node.write('notes.bin', encode('from B'));
 
   const { conflicts } = await sync(a.node, b.node);
 
@@ -414,8 +418,9 @@ it('resolves a conflict in favour of the newer edit', async () => {
 });
 ```
 
-`snapshot()` returns `{ path: text }` with the control folder excluded, which makes "did both
-peers end up the same?" a one-line assertion.
+`snapshot()` returns `{ path: text }` with the control folder excluded, which makes "did both peers
+end up the same?" a one-line assertion. `await node.state()` is the same question one level up: two
+peers whose live entries agree produce the same digest.
 
 For a real filesystem, `NodeFsAdapter` over a temp directory:
 

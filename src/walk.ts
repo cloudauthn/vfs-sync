@@ -10,11 +10,17 @@ export interface WalkOptions {
   /** Extra paths/prefixes to skip. `.vfs` is always skipped. */
   ignore?: (path: string) => boolean;
   controlDir?: string;
+  /**
+   * Include directories in the result. v2 records them as entries of their own
+   * — an empty folder did not sync in v1, which is a real hole once `vfs.json`
+   * claims to be the mirror of the tree.
+   */
+  directories?: boolean;
 }
 
 /**
- * Recursive listing of every file under the adapter root, with the control
- * folder excluded — otherwise the engine would try to sync its own metadata.
+ * Recursive listing under the adapter root, with the control folder excluded —
+ * otherwise the engine would try to sync its own metadata.
  */
 export async function walk(adapter: VFSAdapter, options: WalkOptions = {}): Promise<WalkedFile[]> {
   const controlDir = options.controlDir ?? CONTROL_DIR;
@@ -26,6 +32,9 @@ export async function walk(adapter: VFSAdapter, options: WalkOptions = {}): Prom
       if (entry.path === controlDir || entry.path.startsWith(`${controlDir}/`)) continue;
       if (ignore?.(entry.path)) continue;
       if (entry.kind === 'directory') {
+        if (options.directories) {
+          files.push({ path: entry.path, stat: entry.stat ?? { kind: 'directory', size: 0, mtime: 0 } });
+        }
         await visit(entry.path);
         continue;
       }

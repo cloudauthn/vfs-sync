@@ -1,7 +1,7 @@
 # @cloudauthn/vfs-sync
 
-Multi-peer folder sync for the browser and Node, with a git-shaped core: content-addressed blobs,
-tree snapshots, and merge commits.
+Multi-peer folder sync for the browser and Node. The working folder *is* the content, `.vfs/` holds
+only metadata, and the whole state of a folder is one file a peer reads in one request.
 
 Any backend syncs with any other — OPFS, a real folder picked through the File System Access API,
 Google Drive (client-side, no server of your own), a Node directory, or plain memory. Peers form a
@@ -34,11 +34,12 @@ const phone = await VFSNode.open(await OPFSAdapter.open({ path: 'backup' }));
 await laptop.write('notes.md', new TextEncoder().encode('# Notes'));
 
 const result = await sync(laptop, phone);
-// { base: null, head: '4a1c…', changed: true, conflicts: [], transferred: { toA: 0, toB: 1 } }
+// { changed: true, conflicts: [], transferred: { toA: 0, toB: 1 }, merged: 0, state: '4a28fc…' }
 ```
 
-Both folders now hold the same files and point at the same merge commit. `sync` commits both sides
-for you.
+Both folders now hold the same files and the same `state` digest. `sync` reconciles both sides for
+you — and a sync with nothing to do is **one range read per peer**, because that digest sits in the
+header of `vfs.json` and answers "is there anything to do?" on its own.
 
 ### Editing and syncing back
 
@@ -66,17 +67,31 @@ The newer edit wins, and the other is kept beside it rather than being overwritt
 ```ts
 const encode = (text: string) => new TextEncoder().encode(text);
 
-await laptop.write('notes.md', encode('written on the laptop'));
-await phone.write('notes.md', encode('written on the phone'));
+await laptop.write('cover.jpg', encode('taken on the laptop'));
+await phone.write('cover.jpg', encode('taken on the phone'));
 
 const { conflicts } = await sync(laptop, phone);
 
 conflicts[0].kind;        // 'content'
-conflicts[0].copy?.path;  // 'notes (conflict device-a b34883c4).md'
+conflicts[0].copy?.path;  // 'cover (conflict device-a b34883c4).jpg'
 ```
 
 Both peers end up with the same two files. Nothing is lost silently, and nothing needs a server to
-adjudicate. See [conflicts.md](./docs/conflicts.md) for the full rules and how to change them.
+adjudicate.
+
+Text is different: for extensions on the store's `text` list (`xml`, `nfo`, `m3u`, `cue`, `md`, …)
+a **three-way merge** is attempted first, so two people editing different parts of the same
+`gamelist.xml` both keep their edits and there is no copy at all.
+
+What cannot be settled automatically becomes a **pending decision**, not a stalled sync — the bytes
+always converge, and the conflict copy *is* the durable record of what is still undecided:
+
+```ts
+const pending = await laptop.conflicts();          // reads vfs.json; no network
+await laptop.resolve(pending[0].uuid, 'theirs');   // one write and one delete, in a batch
+```
+
+See [conflicts.md](./docs/conflicts.md) for the full rules and how to change them.
 
 ### Chains and meshes
 
@@ -127,21 +142,23 @@ const trailer = await node.readRange('track.mp3', { start: size - 128 });
 await (await node.readStream('movie.mkv')).pipeTo(await node.writeStream('copy.mkv'));
 ```
 
-Blobs from 4 MiB up are hashed, stored and synced as streams rather than buffered, so peak memory
-is a chunk rather than a file. Adapters that cannot seek get both emulated on top of `read`/`write`
-— always correct, just not always cheap. [recipes.md](./docs/recipes.md#large-files) has the
-threshold knob and the two caveats.
+Files from 4 MiB up are hashed and synced as streams rather than buffered, so peak memory is a chunk
+rather than a file, and everything that arrives is re-hashed against what the sender declared — a
+truncated transfer cannot land as "the newest version". Adapters that cannot seek get streams and
+ranges emulated on top of `read`/`write` — always correct, just not always cheap.
+[recipes.md](./docs/recipes.md#large-files) has the threshold knob and the two caveats.
 
 ## Documentation
 
 | | |
 | --- | --- |
 | [**Adapters**](./docs/adapters.md) | Every backend, its options and quirks, and how to write your own. |
-| [**Architecture**](./docs/architecture.md) | The `.vfs` folder, change detection, file identity, and the sync algorithm. |
+| [**Architecture**](./docs/architecture.md) | `vfs.json`, the commit log, change detection, file identity, and the sync algorithm. |
 | [**Conflicts**](./docs/conflicts.md) | Resolution rules, conflict copies, policies, and custom merging. |
 | [**API reference**](./docs/api.md) | Every export, with examples. |
 | [**Recipes**](./docs/recipes.md) | Background loops, topologies, large files, partial reads, progress, history, testing, CLI. |
-| [**Design notes**](./docs/design.md) | The original design this implements (Spanish). |
+| [**Design v2**](./docs/design-v2.md) | The design this implements: a two-file `.vfs`, sync by metadata, no blob store (Spanish). |
+| [**Design v1**](./docs/design.md) | Its predecessor, kept for context (Spanish). |
 
 ## Demo
 
@@ -173,21 +190,24 @@ deleted in place. The right column offers the other backends: a fresh **MemFS**,
 from disk through the File System Access API.
 
 Each opened root is a closable tab. Under the tabs sit two columns: the file tree on the left, and
-a details pane on the right showing size, mime type, SHA-256 checksum, tracking state (committed /
-modified / untracked, entry id, last editor) and how the same path stands on every other root —
-plus an inline editor for text files. Under the working tree sits `.vfs` itself, dimmed, folded and
-read-only: unfold it to watch objects appear as blobs are written, read a commit's JSON, or check
-that an object's checksum really is the name it is filed under. Nothing in there is editable — the
-engine is its only writer — and it is read one folder at a time, as each row is unfolded: `objects/`
-is a folder per two-character hash prefix, so a store of a few hundred blobs would otherwise spend
-hundreds of requests on one click. The footer is a status bar — state, current head, last sync —
-with a target selector and a **Sync** button: pick another root to sync the open one against, or
-*All roots* to run the whole chain until it converges. Switching roots keeps the open file
+a details pane on the right showing size, mime type, SHA-256 checksum, tracking state (recorded /
+modified / untracked, entry uuid, previous version, last editor) and how the same path stands on
+every other root — plus an inline editor for text files. The root view lists **pending conflicts**
+with a button per side, so a decision can be settled without syncing anything.
+
+The tree is painted from `vfs.json`, so opening a root costs one read rather than a listing per
+folder — and because that is a mirror of what the engine wrote rather than of the disk, the pane
+says when it was last verified. Under the working tree sits `.vfs` itself, dimmed, folded and
+read-only: two files on the normal path, plus the rotated segments and their snapshots. Nothing in
+there is editable — the engine is its only writer. The footer is a status bar — state digest, last
+sync — with a target selector and a **Sync** button: pick another root to sync the open one against,
+or *All roots* to run the whole chain until it converges. Switching roots keeps the open file
 selected, so the same path can be compared across filesystems.
 
 Browsing is built to be cheap on a backend where every call is a request. Folder listings and their
-`.vfs` probes are cached together, a file's size and time come from the listing that named it, and a
-file read is remembered under its mtime and size — so reselecting it, or comparing it against
+`.vfs` probes are cached together — and a probe is a *range read of the header*, so it stays a few
+hundred bytes however large the tree is. A file's size and time come from the listing that named it,
+and a file read is remembered under its mtime and size, so reselecting it, or comparing it against
 another root, costs nothing. On Drive the caches live as long as the access token that filled them;
 the ↻ button re-reads whatever is on screen straight from the backend.
 
@@ -221,9 +241,10 @@ renames and moves are tracked with certainty and the engine stays untouched. See
 [docs/adapters.md](docs/adapters.md#gdriveadapter) for the token setup (Google Identity Services,
 no backend).
 
-Not implemented: garbage collection over `objects/` for blobs unreachable from any commit,
-resumable/streaming uploads to Drive (uploads buffer whole), and delta transfer — streaming bounds
-memory, not bytes moved, so a blob still travels in full.
+Not implemented: historical content (there is no object store, so a previous version cannot be
+recovered), deduplication between identical files, resumable/streaming uploads to Drive (uploads
+buffer whole), and delta transfer — streaming bounds memory, not bytes moved, so a file still
+travels in full.
 
 ## License
 

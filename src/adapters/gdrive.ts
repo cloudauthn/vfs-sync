@@ -1,6 +1,13 @@
 import { basename, dirname, normalizePath } from '../path.js';
 import { chunked } from '../stream.js';
-import type { ByteRange, VFSAdapter, VFSListEntry, VFSStat } from '../types.js';
+import type {
+  ByteRange,
+  VFSAdapter,
+  VFSChange,
+  VFSChangeFeed,
+  VFSListEntry,
+  VFSStat,
+} from '../types.js';
 
 /**
  * An OAuth access token, or a function that returns one. The function form is
@@ -419,6 +426,118 @@ export class GDriveAdapter implements VFSAdapter {
   /** The stable native id, which is what makes renames heuristic-free. */
   async fileId(path: string): Promise<string | null> {
     return this.resolve(path);
+  }
+
+  // ----------------------------------------------------------- conditional
+
+  /** Current `etag` of a file, the token {@link writeIf} checks against. */
+  async tag(path: string): Promise<string | null> {
+    const id = await this.resolve(path);
+    if (!id) return null;
+    const res = await this.authorized(`/drive/v3/files/${id}?fields=id`);
+    if (!res.ok) return null;
+    return res.headers.get('etag');
+  }
+
+  /**
+   * Write that only lands if the file still carries `tag`.
+   *
+   * Drive has no append, so extending the commit log is a full re-upload — and a
+   * full re-upload is exactly where two peers appending at once lose rows. With
+   * `If-Match` the check-then-act of §3 stops being a race the engine merely
+   * narrows and becomes one it actually wins or loses: `null` back means the
+   * caller has to re-read and retry.
+   */
+  async writeIf(path: string, data: Uint8Array, tag: string | null): Promise<string | null> {
+    const target = normalizePath(path);
+    const id = await this.resolve(target);
+    if (!id) {
+      // Nothing there to conflict with; a plain create is the whole operation.
+      if (tag !== null) return null;
+      await this.write(target, data);
+      return this.tag(target);
+    }
+    const headers = new Headers();
+    if (tag !== null) headers.set('If-Match', tag);
+    const res = await this.authorized(`/upload/drive/v3/files/${id}?uploadType=media`, {
+      method: 'PATCH',
+      headers,
+      body: data as unknown as BodyInit,
+    });
+    if (res.status === 412) return null; // somebody else got there first
+    if (!res.ok) throw await driveError(res, path);
+    return res.headers.get('etag') ?? (await this.tag(target));
+  }
+
+  // -------------------------------------------------------------- changes
+
+  /**
+   * The changes feed (§7) — in **one** request it says whether anything moved,
+   * instead of a listing per folder.
+   *
+   * Two honest caveats. The feed is account-wide and cannot be filtered by
+   * folder, so the caller filters client-side by `fileId` against the `native`
+   * of its entries — which is what that field is for — and a change inside a
+   * subfolder that has never been resolved cannot be attributed and is ignored
+   * until the next walk. And the token expires: Drive answers `410 Gone` when it
+   * has fallen too far behind, which comes back as `reset` and means the caller
+   * takes the full-walk path that has always existed.
+   */
+  async changes(token: string | null): Promise<VFSChangeFeed> {
+    if (token === null) {
+      const { startPageToken } = await this.json<{ startPageToken: string }>(
+        `/drive/v3/changes/startPageToken?spaces=${this.space}`,
+      );
+      return { changes: [], token: startPageToken };
+    }
+
+    const changes: VFSChange[] = [];
+    let pageToken: string | undefined = token;
+    let next = token;
+    while (pageToken) {
+      const url =
+        `/drive/v3/changes?pageToken=${encodeURIComponent(pageToken)}&pageSize=1000` +
+        `&spaces=${this.space}&restrictToMyDrive=true` +
+        '&fields=newStartPageToken,nextPageToken,' +
+        encodeURIComponent(
+          'changes(fileId,removed,file(id,name,parents,mimeType,size,modifiedTime,trashed))',
+        );
+      const res = await this.authorized(url);
+      // The token fell out of Drive's retention window: there is no delta to be
+      // had, only a fresh start and a full walk.
+      if (res.status === 410) {
+        const { startPageToken } = await this.json<{ startPageToken: string }>(
+          `/drive/v3/changes/startPageToken?spaces=${this.space}`,
+        );
+        return { changes: [], token: startPageToken, reset: true };
+      }
+      if (!res.ok) throw await driveError(res, 'changes');
+      const page = (await res.json()) as {
+        changes?: Array<{ fileId: string; removed?: boolean; file?: DriveFile & { trashed?: boolean } }>;
+        nextPageToken?: string;
+        newStartPageToken?: string;
+      };
+      for (const change of page.changes ?? []) {
+        const gone = change.removed === true || change.file?.trashed === true || !change.file;
+        const path = this.pathOf(change.fileId);
+        changes.push({
+          native: change.fileId,
+          ...(path !== null ? { path } : {}),
+          ...(gone ? { removed: true as const } : { stat: statOf(change.file as DriveFile) }),
+        });
+      }
+      pageToken = page.nextPageToken;
+      // Only the token that closes the cycle is worth persisting: on Drive every
+      // write of `vfs.json` is a full re-upload, so paging is not the moment.
+      if (page.newStartPageToken) next = page.newStartPageToken;
+    }
+    return { changes, token: next };
+  }
+
+  /** Reverse of the id cache: the path we know this id under, if any. */
+  private pathOf(id: string): string | null {
+    for (const [path, held] of this.ids) if (held === id) return path;
+    return null;
   }
 }
 
