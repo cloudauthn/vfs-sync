@@ -1,143 +1,395 @@
-import { EMPTY_TREE, type KnownCommit, type VFSStore } from './store.js';
-import { canStream } from './stream.js';
-import { mergeTrees } from './merge.js';
+import { decodeText, encodeText, randomId, sha256 } from './hash.js';
+import { History } from './history.js';
+import { MAX_TEXT_MERGE, diff3 } from './diff3.js';
+import { makeRow, missingRows } from './log.js';
+import { HELD_AT, mergeEntries } from './merge.js';
 import type { ConflictCopyPolicy, ConflictNameInfo, ConflictReport } from './merge.js';
-import type { Commit, Hash, Tree } from './types.js';
-import type { VFSNode } from './vfs-node.js';
+import { extensionOf } from './vfs-file.js';
+import type { ContentHandle, ContentSource, VFSNode } from './vfs-node.js';
+import type { Hash, LogRow, VFSEntry, VFSFile } from './types.js';
+
+export interface TextConflictInfo {
+  path: string;
+  /** Common ancestor, when one was found. */
+  base: string | null;
+  a: string;
+  b: string;
+  peerA: string;
+  peerB: string;
+}
 
 export interface SyncOptions {
   conflictCopies?: ConflictCopyPolicy;
   conflictName?: (info: ConflictNameInfo) => string;
   now?: () => number;
+  /** Size from which a conflict copy stays on the peer that made it (§4). */
+  heldAt?: number;
+  /** Turn off the automatic three-way merge of text files. */
+  autoMerge?: boolean;
+  /**
+   * Interactive resolution for a text conflict. Returning content settles it;
+   * returning `null` — or leaving the hook out — takes the headless path of
+   * last-writer-wins, a copy, and a pending decision.
+   */
+  resolveText?: (info: TextConflictInfo) => Promise<string | null>;
 }
 
 export interface SyncResult {
-  /** Most recent commit both heads descend from, `null` on a first encounter. */
-  base: Hash | null;
-  /** The commit both peers point at once the sync finishes. */
-  head: Hash | null;
   /** False when both folders were already identical. */
   changed: boolean;
   conflicts: ConflictReport[];
-  /** Blob copies performed in each direction. */
+  /** Content copies performed in each direction. */
   transferred: { toA: number; toB: number };
+  /** Text conflicts settled by a three-way merge instead of a copy. */
+  merged: number;
+  /** The digest both peers end on, or `null` when the pair is empty. */
+  state: Hash | null;
 }
 
 /**
- * Syncs one edge of the mesh. Both peers end up on the same merge commit with
- * identical content; nothing is assumed about who else either of them talks to,
- * which is what lets changes travel along chains (A <-> B <-> C) one edge at a
- * time.
+ * Syncs one edge of the mesh (§5). No ancestor negotiation: both peers read the
+ * other's header, compare one digest, and only go further if it differs.
+ *
+ * Nothing is assumed about who else either peer talks to, which is what lets
+ * changes travel down a chain (A <-> B <-> C) one edge at a time — and the log
+ * is deliberately not per-peer, so A also carries B's operations when it meets
+ * C, and both sides decide conflicts from the same information.
  */
 export async function sync(a: VFSNode, b: VFSNode, options: SyncOptions = {}): Promise<SyncResult> {
   const now = options.now ?? (() => Date.now());
+  const nothing: SyncResult['transferred'] = { toA: 0, toB: 0 };
 
+  // The mirror is only as good as its last reconciliation, and a scan is
+  // obligatory here anyway: it is what turns disk state into entries.
   await a.commit();
   await b.commit();
-  await unifyStoreIds(a, b);
+  if (a === b) {
+    return { changed: false, conflicts: [], transferred: nothing, merged: 0, state: await a.state() };
+  }
 
-  const aHead = await a.head();
-  const bHead = await b.head();
+  const fileA = await a.file();
+  const fileB = await b.file();
 
-  // 1. common ancestor: the newest commit both heads descend from
-  const aKnown = await a.store.known();
-  const bKnown = await b.store.known();
-  const graph = new Map([...aKnown, ...bKnown]);
-  const base = mergeBase(graph, (hash) => aKnown.has(hash) && bKnown.has(hash), aHead, bHead);
+  // ---- 2. config converges: storeId on the smaller, `text` by union
+  const storeId = [fileA.storeId, fileB.storeId].sort()[0] as string;
+  const text = [...new Set([...fileA.text, ...fileB.text])].sort();
+  const configChanged =
+    fileA.storeId !== storeId ||
+    fileB.storeId !== storeId ||
+    fileA.text.join() !== text.join() ||
+    fileB.text.join() !== text.join();
+  fileA.storeId = fileB.storeId = storeId;
+  fileA.text = [...text];
+  fileB.text = [...text];
 
-  // 2. exchange the commits each side is missing, so both keep a complete index
-  await copyCommits(a, b, [...aKnown.keys()].filter((h) => !bKnown.has(h)));
-  await copyCommits(b, a, [...bKnown.keys()].filter((h) => !aKnown.has(h)));
+  // ---- 3. one comparison decides whether there is anything to do at all
+  const at = now();
+  if (fileA.state === fileB.state && fileA.log.digest === fileB.log.digest) {
+    await close(a, b, fileA, fileB, [], [], at);
+    return {
+      changed: configChanged,
+      conflicts: [],
+      transferred: nothing,
+      merged: 0,
+      state: fileA.state,
+    };
+  }
 
-  const baseTree = base ? await treeOf(a.store, base) : EMPTY_TREE;
-  const aTree = await a.headTree();
-  const bTree = await b.headTree();
+  // ---- 4/5. entries, and the log only where the entries cannot answer alone
+  const sources: Array<Iterable<LogRow> | Iterable<VFSEntry>> = [fileA.entries, fileB.entries];
+  let rowsA: LogRow[] = [];
+  let rowsB: LogRow[] = [];
+  // Each side's *own* knowledge, which is what the path fallback turns on: the
+  // shared history below is the union of both and would vouch for everything.
+  const ownA = History.from([fileA.entries]);
+  const ownB = History.from([fileB.entries]);
 
-  // 3. merge
-  const { tree, conflicts } = mergeTrees(baseTree, aTree, bTree, {
-    peerA: a.id,
-    peerB: b.id,
+  if (needsLog(fileA.entries, fileB.entries)) {
+    rowsA = await a.store.logRows();
+    rowsB = await readPeerLog(b, fileA.peers[b.id]);
+    const snapA = await a.store.readSnapshot(fileA);
+    const snapB = await b.store.readSnapshot(fileB);
+    ownA.add(rowsA).add(snapA);
+    ownB.add(rowsB).add(snapB);
+    sources.push(rowsA, rowsB, snapA, snapB);
+  }
+  const history = History.from(sources);
+
+  const sides = { peer: a.id, entries: fileA.entries, knows: (uuid: string) => ownA.knows(uuid) };
+  const other = { peer: b.id, entries: fileB.entries, knows: (uuid: string) => ownB.knows(uuid) };
+
+  // ---- merge
+  const merge = mergeEntries(sides, other, {
+    history,
+    heldAt: options.heldAt ?? HELD_AT,
+    text: (path) => {
+      const extension = extensionOf(path);
+      return extension !== '' && text.includes(extension);
+    },
     ...(options.conflictCopies !== undefined ? { conflictCopies: options.conflictCopies } : {}),
     ...(options.conflictName ? { conflictName: options.conflictName } : {}),
   });
 
-  // 4. move the blobs the merged tree needs to whichever side lacks them
+  // ---- text: try to settle a content conflict rather than park a copy
+  const overlay = new Map<Hash, Uint8Array>();
+  const extra: Array<Omit<LogRow, 'op'>> = [];
+  const batch = randomId();
+  const merged = await autoMergeText(a, b, merge, history, {
+    overlay,
+    rows: extra,
+    batch,
+    at,
+    enabled: options.autoMerge !== false,
+    ...(options.resolveText ? { resolveText: options.resolveText } : {}),
+  });
+
+  const target = merge.entries;
+
+  // ---- 6. content moves, verified on arrival
   const transferred = { toA: 0, toB: 0 };
-  // A blob only streams if *both* ends can: the slower peer sets the terms.
-  const threshold = Math.min(a.streamThreshold, b.streamThreshold);
-  for (const entry of tree.entries) {
-    if (!entry.hash) continue;
-    const big = entry.size >= threshold;
-    if (await copyObject(b.store, a.store, entry.hash, big)) transferred.toA++;
-    else if (await copyObject(a.store, b.store, entry.hash, big)) transferred.toB++;
+  const beforeB = fileB.entries;
+  await a.apply(target, chain(overlay, [{ node: b, entries: beforeB }], () => transferred.toA++));
+  await b.apply(
+    target,
+    chain(
+      overlay,
+      [
+        { node: a, entries: target },
+        { node: a, entries: fileA.entries },
+      ],
+      () => transferred.toB++,
+    ),
+  );
+
+  // ---- 7. close: content is on disk, then the logs, then the two headers
+  const rowsForA = [...(await Promise.all(extra.map(makeRow)))];
+  const rowsForB = [...rowsForA];
+  if (rowsA.length > 0 || rowsB.length > 0) {
+    rowsForA.push(...missingRows(rowsA, rowsB));
+    rowsForB.push(...missingRows(rowsB, rowsA));
   }
 
-  const treeHash = await a.store.putTree(tree);
-  await b.store.putTree(tree);
+  await a.adopt(target, fileA);
+  await b.adopt(target, fileB);
+  await close(a, b, fileA, fileB, rowsForA, rowsForB, at);
 
-  const aTreeHash = aHead ? await commitTree(a.store, aHead) : null;
-  const bTreeHash = bHead ? await commitTree(b.store, bHead) : null;
-
-  if (aHead === null && bHead === null && tree.entries.length === 0) {
-    return { base, head: null, changed: false, conflicts, transferred };
-  }
-
-  // 5. content already agrees — only the history differs
-  if (aTreeHash === treeHash && bTreeHash === treeHash) {
-    if (aHead === bHead) {
-      return { base, head: aHead, changed: false, conflicts, transferred };
-    }
-    // Committing a merge here would be pointless work, and in a chain it would
-    // never settle: every pass would mint a commit for the next pass to merge.
-    // Both peers instead adopt the same existing commit, chosen by a rule they
-    // can both apply without talking: newest first, hash as tiebreak.
-    const head = await newerCommit(a, aHead as Hash, bHead as Hash);
-    const at = now();
-    await a.store.finalizeSync(head, b.id, head, at);
-    await b.store.finalizeSync(head, a.id, head, at);
-    return { base, head, changed: true, conflicts, transferred };
-  }
-
-  // 6. one merge commit, byte-identical on both peers, so both converge on the
-  //    same hash without another round trip
-  const parents = [aHead, bHead].filter((h): h is Hash => h !== null).sort();
-  const commit: Commit = {
-    tree: treeHash,
-    parents: [...new Set(parents)],
-    timestamp: now(),
-    peer: a.id,
+  return {
+    changed: true,
+    conflicts: merge.conflicts,
+    transferred,
+    merged,
+    state: (await a.file()).state,
   };
-  const head = await a.store.putCommit(commit);
-
-  await a.applyTree(tree);
-  await a.store.finalizeSync(head, b.id, head, commit.timestamp);
-
-  await b.store.putCommitAt(head, commit);
-  await b.applyTree(tree);
-  await b.store.finalizeSync(head, a.id, head, commit.timestamp);
-
-  return { base, head, changed: true, conflicts, transferred };
 }
 
 /**
- * Two folders that sync are the same dataset, so their `storeId`s converge:
- * both adopt the lexicographically smaller of the two. Deterministic on both
- * sides and transitive across edges, so a whole mesh settles on one id.
+ * Appends what each log is missing and writes both headers, in that order.
+ *
+ * The order is the recovery plan: if the process dies halfway, `vfs.json` comes
+ * up short — declaring less than what is on disk — and the next reconciliation
+ * catches up. The opposite, a `vfs.json` claiming content that never arrived,
+ * must not be reachable.
  */
-async function unifyStoreIds(a: VFSNode, b: VFSNode): Promise<void> {
-  const aConfig = await a.store.readConfig();
-  const bConfig = await b.store.readConfig();
-  const ids = [aConfig.storeId, bConfig.storeId].filter((id): id is string => !!id).sort();
-  const shared = ids[0];
-  if (!shared) return;
-  if (aConfig.storeId !== shared) {
-    aConfig.storeId = shared;
-    await a.store.writeConfig(aConfig);
+async function close(
+  a: VFSNode,
+  b: VFSNode,
+  fileA: VFSFile,
+  fileB: VFSFile,
+  rowsForA: LogRow[],
+  rowsForB: LogRow[],
+  at: number,
+): Promise<void> {
+  if (rowsForA.length > 0) await a.store.append(rowsForA, fileA);
+  if (rowsForB.length > 0) await b.store.append(rowsForB, fileB);
+
+  fileA.peers[b.id] = {
+    lastSync: at,
+    segment: fileB.log.segment,
+    offset: fileB.log.size,
+    digest: fileB.log.digest,
+  };
+  fileB.peers[a.id] = {
+    lastSync: at,
+    segment: fileA.log.segment,
+    offset: fileA.log.size,
+    digest: fileA.log.digest,
+  };
+  await a.store.write(fileA);
+  await b.store.write(fileB);
+}
+
+/**
+ * Whether the log has to be opened at all.
+ *
+ * Two questions need it, and only two: an entry that exists on one side and not
+ * the other may be a delete whose tombstone was pruned, and a hash divergence
+ * has to be told apart from a propagation. Everything else `vfs.json` answers
+ * on its own.
+ */
+function needsLog(left: VFSEntry[], right: VFSEntry[]): boolean {
+  const byUuid = new Map(right.map((entry) => [entry.uuid, entry]));
+  for (const entry of left) {
+    const held = byUuid.get(entry.uuid);
+    if (!held || held.hash !== entry.hash) return true;
   }
-  if (bConfig.storeId !== shared) {
-    bConfig.storeId = shared;
-    await b.store.writeConfig(bConfig);
+  const mine = new Set(left.map((entry) => entry.uuid));
+  return right.some((entry) => !mine.has(entry.uuid));
+}
+
+/** The tail of a peer's active segment, or the whole of it when the peer rotated. */
+async function readPeerLog(peer: VFSNode, mark?: { segment: number; offset: number; digest: Hash }) {
+  const file = await peer.file();
+  if (mark && mark.digest === file.log.digest) return peer.store.logRows();
+  if (!mark || mark.segment !== file.log.segment) return peer.store.logRows();
+  return peer.store.rowsSince(mark.offset);
+}
+
+interface AutoMergeContext {
+  overlay: Map<Hash, Uint8Array>;
+  rows: Array<Omit<LogRow, 'op'>>;
+  batch: string;
+  at: number;
+  enabled: boolean;
+  resolveText?: (info: TextConflictInfo) => Promise<string | null>;
+}
+
+/**
+ * Tries a three-way merge on the content conflicts the merge flagged as text.
+ *
+ * Computed on one side only — `sync()` has both nodes in front of it, so there
+ * is no need for two implementations to agree byte for byte forever. The result
+ * travels as an ordinary write whose row carries `prev` *and* `prev2`: two
+ * parents, which is what stops a third peer from reclassifying the merge as a
+ * fresh conflict on every pass.
+ */
+async function autoMergeText(
+  a: VFSNode,
+  b: VFSNode,
+  merge: { entries: VFSEntry[]; conflicts: ConflictReport[] },
+  history: History,
+  context: AutoMergeContext,
+): Promise<number> {
+  let count = 0;
+  for (const report of merge.conflicts) {
+    if (!report.text || !report.a || !report.b) continue;
+    if (!context.enabled && !context.resolveText) continue;
+    const left = report.a;
+    const right = report.b;
+    if (left.size > MAX_TEXT_MERGE || right.size > MAX_TEXT_MERGE) continue;
+
+    const ancestor = report.base ?? history.commonAncestor(report.uuid, left, right);
+    const baseBytes = ancestor
+      ? ((await a.baseOf(ancestor)) ?? (await b.baseOf(ancestor)))
+      : null;
+    const mine = await readAt(a, left.path);
+    const theirs = await readAt(b, right.path);
+    if (!mine || !theirs) continue;
+
+    const baseText = baseBytes ? decodeText(baseBytes) : null;
+    let text: string | null = null;
+    if (context.enabled && baseText !== null) {
+      const attempt = diff3(baseText, decodeText(mine), decodeText(theirs));
+      if (attempt.ok) text = attempt.text;
+    }
+    if (text === null && context.resolveText) {
+      text = await context.resolveText({
+        path: report.path,
+        base: baseText,
+        a: decodeText(mine),
+        b: decodeText(theirs),
+        peerA: a.id,
+        peerB: b.id,
+      });
+    }
+    if (text === null) continue;
+
+    const data = encodeText(text);
+    const hash = await sha256(data);
+    context.overlay.set(hash, data);
+
+    const winner = report.winner === 'a' ? left : right;
+    const loser = report.winner === 'a' ? right : left;
+    const entry = merge.entries.find((item) => item.uuid === report.uuid);
+    if (!entry) continue;
+    entry.hash = hash;
+    entry.size = data.byteLength;
+    entry.updated = Math.max(context.at, left.updated, right.updated) + 1;
+    entry.peer = a.id;
+    entry.prev = winner.hash;
+    if (loser.hash) entry.prev2 = loser.hash;
+
+    // The copy was only ever the pending decision; the merge settled it.
+    if (report.copy) {
+      const at = merge.entries.indexOf(report.copy);
+      if (at >= 0) merge.entries.splice(at, 1);
+      delete report.copy;
+    }
+    report.text = true;
+    context.rows.push({
+      batch: context.batch,
+      at: entry.updated,
+      peer: a.id,
+      uuid: entry.uuid,
+      type: 'write',
+      kind: 'file',
+      path: entry.path,
+      hash,
+      size: data.byteLength,
+      prev: winner.hash ?? null,
+      ...(loser.hash ? { prev2: loser.hash } : {}),
+    });
+    count++;
   }
+  return count;
+}
+
+async function readAt(node: VFSNode, path: string): Promise<Uint8Array | null> {
+  try {
+    return await node.read(path);
+  } catch {
+    return null;
+  }
+}
+
+interface Candidate {
+  node: VFSNode;
+  entries: VFSEntry[];
+}
+
+/** Overlay first, then each candidate holder in turn. `onHit` tallies transfers. */
+function chain(
+  overlay: Map<Hash, Uint8Array>,
+  candidates: Candidate[],
+  onHit: () => void,
+): ContentSource {
+  return {
+    async open(hash: Hash): Promise<ContentHandle | null> {
+      const held = overlay.get(hash);
+      if (held) {
+        return {
+          size: held.byteLength,
+          read: async () => held,
+          stream: async () => new Response(held as BodyInit).body as ReadableStream<Uint8Array>,
+        };
+      }
+      for (const candidate of candidates) {
+        const entry = candidate.entries.find(
+          (item) => !item.deleted && item.kind === 'file' && item.hash === hash && !item.held,
+        );
+        if (!entry) continue;
+        const stat = await candidate.node.stat(entry.path);
+        if (!stat || stat.kind !== 'file') continue;
+        onHit();
+        const path = entry.path;
+        return {
+          size: stat.size,
+          read: () => candidate.node.read(path),
+          stream: () => candidate.node.readStream(path),
+        };
+      }
+      return null;
+    },
+  };
 }
 
 export interface MeshEdge {
@@ -156,9 +408,7 @@ export interface MeshResult {
  */
 export async function syncMesh(edges: MeshEdge[], options: SyncOptions = {}): Promise<MeshResult[]> {
   const results: MeshResult[] = [];
-  for (const edge of edges) {
-    results.push({ edge, result: await sync(edge.a, edge.b, options) });
-  }
+  for (const edge of edges) results.push({ edge, result: await sync(edge.a, edge.b, options) });
   return results;
 }
 
@@ -172,131 +422,7 @@ export async function syncUntilStable(
   for (let round = 0; round < maxRounds; round++) {
     const results = await syncMesh(edges, options);
     rounds.push(results);
-    if (!results.some((r) => r.result.changed)) break;
+    if (!results.some((item) => item.result.changed)) break;
   }
   return rounds;
-}
-
-/**
- * Every commit reachable from `head` through parent links, `head` included. A
- * commit missing from the index ends that branch of the walk instead of
- * throwing: an incomplete index can only make the base older, never wrong.
- */
-function ancestorsOf(graph: Map<Hash, KnownCommit>, head: Hash): Set<Hash> {
-  const seen = new Set<Hash>([head]);
-  const stack: Hash[] = [head];
-  while (stack.length > 0) {
-    const entry = graph.get(stack.pop() as Hash);
-    if (!entry) continue;
-    for (const parent of entry.parents) {
-      if (seen.has(parent)) continue;
-      seen.add(parent);
-      stack.push(parent);
-    }
-  }
-  return seen;
-}
-
-/**
- * Newest commit both heads descend from.
- *
- * Ancestry has to be walked rather than inferred from timestamps. Two peers
- * commit inside the same millisecond routinely, and "newest commit both peers
- * know about" is not the same thing as "newest commit both peers descend from":
- * after one sync each peer knows the other's first commit, which is an ancestor
- * of neither head. Using one of those as the base means resolving changes
- * against a tree this pair never shared — the entry is simply absent from it, so
- * `mergeTrees` has no ancestor path to compare against and a rename decays into
- * an mtime coin-flip.
- *
- * `shared` keeps candidates to commits both peers have on disk, since the base
- * tree has to be readable locally.
- */
-function mergeBase(
-  graph: Map<Hash, KnownCommit>,
-  shared: (hash: Hash) => boolean,
-  aHead: Hash | null,
-  bHead: Hash | null,
-): Hash | null {
-  if (!aHead || !bHead) return null;
-
-  const inB = ancestorsOf(graph, bHead);
-  const common = [...ancestorsOf(graph, aHead)].filter((hash) => inB.has(hash) && shared(hash));
-  if (common.length <= 1) return common[0] ?? null;
-
-  // A candidate that another candidate descends from carries no information the
-  // descendant does not already carry. What survives is the frontier.
-  const redundant = new Set<Hash>();
-  for (const candidate of common) {
-    for (const parent of graph.get(candidate)?.parents ?? []) {
-      for (const hash of ancestorsOf(graph, parent)) redundant.add(hash);
-    }
-  }
-  const frontier = common.filter((hash) => !redundant.has(hash));
-
-  // Criss-cross histories can leave more than one candidate on the frontier.
-  // Any of them is a valid base; the ordering only has to be one both peers
-  // compute identically, so an edge merges the same way whichever side
-  // initiates it. (A frontier can only come back empty if the index contains a
-  // parent cycle, which means it is corrupt — fall back rather than fail.)
-  const pool = frontier.length > 0 ? frontier : common;
-  return (
-    [...pool].sort(
-      (x, y) => (graph.get(y)?.timestamp ?? 0) - (graph.get(x)?.timestamp ?? 0) || (x < y ? -1 : 1),
-    )[0] ?? null
-  );
-}
-
-async function treeOf(store: VFSStore, commitHash: Hash): Promise<Tree> {
-  return store.getTree((await store.getCommit(commitHash)).tree);
-}
-
-async function commitTree(store: VFSStore, commitHash: Hash): Promise<Hash> {
-  return (await store.getCommit(commitHash)).tree;
-}
-
-/**
- * Which of two commits both peers adopt when their content already agrees.
- *
- * A descendant beats its own ancestor — it contains that history already, so
- * taking the ancestor would throw commits away. Otherwise newest wins, with the
- * hash as tiebreak: a rule applied to the same inputs on both sides, so both
- * reach the same answer without another round trip.
- */
-async function newerCommit(node: VFSNode, left: Hash, right: Hash): Promise<Hash> {
-  const known = await node.store.known();
-  if (ancestorsOf(known, left).has(right)) return left;
-  if (ancestorsOf(known, right).has(left)) return right;
-  const leftAt = known.get(left)?.timestamp ?? (await node.store.getCommit(left)).timestamp;
-  const rightAt = known.get(right)?.timestamp ?? (await node.store.getCommit(right)).timestamp;
-  if (leftAt !== rightAt) return leftAt > rightAt ? left : right;
-  return left > right ? left : right;
-}
-
-async function copyCommits(from: VFSNode, to: VFSNode, hashes: Hash[]): Promise<void> {
-  for (const hash of hashes) {
-    const commit = await from.store.getCommit(hash);
-    // the tree travels with the commit: the ancestor negotiation needs to be
-    // able to read any commit in the index, blobs stay on demand
-    await copyObject(from.store, to.store, commit.tree);
-    await to.store.putCommitAt(hash, commit);
-  }
-}
-
-async function copyObject(
-  from: VFSStore,
-  to: VFSStore,
-  hash: Hash,
-  stream = false,
-): Promise<boolean> {
-  if (await to.hasObject(hash)) return false;
-  if (!(await from.hasObject(hash))) return false;
-  if (stream && canStream(from.adapter) && canStream(to.adapter)) {
-    // Verified on arrival, so a truncated transfer cannot land as a valid
-    // object — putObjectStreamAt re-hashes what it wrote.
-    await to.putObjectStreamAt(hash, await from.getObjectStream(hash));
-  } else {
-    await to.putObjectAt(hash, await from.getObject(hash));
-  }
-  return true;
 }

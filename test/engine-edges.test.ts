@@ -4,10 +4,7 @@ import { sync } from '../src/sync.js';
 import { VFSNode } from '../src/vfs-node.js';
 import { walk } from '../src/walk.js';
 import type { VFSAdapter } from '../src/types.js';
-import { files, get, peer, put } from './helpers.js';
-
-const encoder = new TextEncoder();
-const decoder = new TextDecoder();
+import { decoder, encoder, entryAt, files, get, peer, put } from './helpers.js';
 
 describe('VFSNode basics', () => {
   it('exposes the backend name', async () => {
@@ -24,32 +21,33 @@ describe('VFSNode basics', () => {
     expect(second.id).toBe(first.id);
   });
 
-  it('walks history through first parents', async () => {
+  it('keeps one step of history inline, in place of a commit graph', async () => {
     const a = await peer('device-a');
     await put(a, 'notes.md', 'v1');
     await a.node.commit();
+    const first = await entryAt(a, 'notes.md');
+
     await put(a, 'notes.md', 'v2');
     await a.node.commit();
 
-    const log = await a.node.log();
-    expect(log).toHaveLength(2);
-    expect(log[0]?.parents).toEqual([log[1]?.hash]);
-    expect(log[1]?.parents).toEqual([]);
-    expect(await a.node.log(1)).toHaveLength(1);
+    expect((await entryAt(a, 'notes.md'))?.prev).toBe(first?.hash);
+    const rows = await a.node.store.logRows();
+    expect(rows.map((row) => row.type)).toEqual(['write', 'write']);
+    expect(rows[1]?.prev).toBe(first?.hash);
   });
 
-  it('restores a blob that went missing from the object store', async () => {
+  it('re-reads a file the mirror can no longer vouch for', async () => {
     const a = await peer('device-a');
-    await put(a, 'notes.md', 'recoverable');
-    const tree = await a.node.scan();
-    const hash = tree.entries[0]?.hash as string;
+    await put(a, 'notes.md', 'original');
+    await a.node.commit();
 
-    // the cache still vouches for the file, but the object is gone
-    await a.fs.delete(`.vfs/objects/${hash.slice(0, 2)}/${hash}`);
-    expect(await a.node.store.hasObject(hash)).toBe(false);
+    // Something wrote through the back door; the mirror is now stale, and the
+    // next scan is what repairs it (§6).
+    await a.fs.write('notes.md', encoder.encode('changed outside'));
+    await a.node.commit();
 
-    await a.node.scan();
-    expect(decoder.decode(await a.node.store.getObject(hash))).toBe('recoverable');
+    expect(await get(a, 'notes.md')).toBe('changed outside');
+    expect((await entryAt(a, 'notes.md'))?.size).toBe('changed outside'.length);
   });
 });
 
@@ -60,8 +58,8 @@ describe('native file ids', () => {
     private next = 0;
 
     override async write(path: string, data: Uint8Array): Promise<void> {
-      // control files are excluded from sync, so they get no id — this keeps
-      // the numbering in the assertions readable
+      // Control files are excluded from sync, so they get no id — this keeps
+      // the numbering in the assertions readable.
       if (!path.startsWith('.vfs') && !this.ids.has(path)) {
         this.ids.set(path, `drive-${this.next++}`);
       }
@@ -82,13 +80,15 @@ describe('native file ids', () => {
     }
   }
 
-  it('uses the backend id instead of a synthetic one', async () => {
+  it('records the backend id alongside the logical identity', async () => {
     const adapter = new NativeIdAdapter('drive');
     const node = await VFSNode.open(adapter, { id: 'drive' });
     await node.write('notes.md', encoder.encode('hello'));
+    await node.commit();
 
-    const tree = await node.scan();
-    expect(tree.entries[0]?.id).toBe('drive-0');
+    const [entry] = await node.live();
+    expect(entry?.native).toBe('drive-0');
+    expect(entry?.uuid).not.toBe('drive-0'); // the uuid stays the logical one
   });
 
   it('tracks a rename with no heuristic at all', async () => {
@@ -96,16 +96,18 @@ describe('native file ids', () => {
     const node = await VFSNode.open(adapter, { id: 'drive' });
     await node.write('notes.md', encoder.encode('hello'));
     await node.commit();
+    const before = (await node.live())[0];
 
-    // straight to the adapter, so no rename intent is recorded anywhere
+    // Straight to the adapter, so no rename intent is recorded anywhere.
     await adapter.rename('notes.md', 'moved.md');
-    const tree = await node.scan();
+    const { entries } = await node.scan();
 
-    expect(tree.entries).toHaveLength(1);
-    expect(tree.entries[0]).toMatchObject({
-      id: 'drive-0',
+    expect(entries).toHaveLength(1);
+    expect(entries[0]).toMatchObject({
+      uuid: before?.uuid,
+      native: 'drive-0',
       path: 'moved.md',
-      renamedFrom: 'notes.md',
+      prevPath: 'notes.md',
     });
   });
 });
@@ -118,17 +120,16 @@ describe('tricky renames', () => {
     await put(a, 'second.txt', 'TWO');
     await sync(a.node, b.node);
 
-    const before = await a.node.headTree();
-    const idOfOne = before.entries.find((e) => e.path === 'first.txt')?.id;
-    const idOfTwo = before.entries.find((e) => e.path === 'second.txt')?.id;
+    const one = (await entryAt(a, 'first.txt'))?.uuid;
+    const two = (await entryAt(a, 'second.txt'))?.uuid;
 
     await a.node.rename('first.txt', 'tmp.txt');
     await a.node.rename('second.txt', 'first.txt');
     await a.node.rename('tmp.txt', 'second.txt');
 
-    const after = await a.node.scan();
-    expect(after.entries.find((e) => e.id === idOfOne)?.path).toBe('second.txt');
-    expect(after.entries.find((e) => e.id === idOfTwo)?.path).toBe('first.txt');
+    const { entries } = await a.node.scan();
+    expect(entries.find((entry) => entry.uuid === one)?.path).toBe('second.txt');
+    expect(entries.find((entry) => entry.uuid === two)?.path).toBe('first.txt');
   });
 
   it('applies a swap on the other peer without losing either file', async () => {
@@ -143,8 +144,8 @@ describe('tricky renames', () => {
     await a.node.rename('tmp.txt', 'second.txt');
     await sync(a.node, b.node);
 
-    // both destinations were occupied, so applyTree had to park through a
-    // scratch path rather than clobbering one of them
+    // Both destinations were occupied, so apply had to park through a scratch
+    // path rather than clobbering one of them.
     expect(await get(b, 'first.txt')).toBe('TWO');
     expect(await get(b, 'second.txt')).toBe('ONE');
     expect(Object.keys(files(b)).sort()).toEqual(['first.txt', 'second.txt']);
@@ -154,15 +155,15 @@ describe('tricky renames', () => {
     const a = await peer('device-a');
     await put(a, 'notes.md', 'original');
     await a.node.commit();
-    const originalId = (await a.node.headTree()).entries[0]?.id;
+    const original = (await entryAt(a, 'notes.md'))?.uuid;
 
     await a.node.rename('notes.md', 'archive.md');
     await put(a, 'notes.md', 'brand new file');
-    const tree = await a.node.scan();
+    const { entries } = await a.node.scan();
 
-    expect(tree.entries.find((e) => e.path === 'archive.md')?.id).toBe(originalId);
-    expect(tree.entries.find((e) => e.path === 'notes.md')?.id).not.toBe(originalId);
-    expect(tree.entries).toHaveLength(2);
+    expect(entries.find((entry) => entry.path === 'archive.md')?.uuid).toBe(original);
+    expect(entries.find((entry) => entry.path === 'notes.md')?.uuid).not.toBe(original);
+    expect(entries.filter((entry) => entry.kind === 'file')).toHaveLength(2);
   });
 
   it('gives duplicate content distinct identities', async () => {
@@ -173,11 +174,11 @@ describe('tricky renames', () => {
 
     await a.node.delete('one.txt');
     await put(a, 'three.txt', 'identical');
-    const tree = await a.node.scan();
+    const { entries } = await a.node.scan();
 
-    const live = tree.entries.filter((e) => !e.deleted);
-    expect(new Set(live.map((e) => e.id)).size).toBe(live.length);
-    expect(live.map((e) => e.path).sort()).toEqual(['three.txt', 'two.txt']);
+    const live = entries.filter((entry) => !entry.deleted && entry.kind === 'file');
+    expect(new Set(live.map((entry) => entry.uuid)).size).toBe(live.length);
+    expect(live.map((entry) => entry.path).sort()).toEqual(['three.txt', 'two.txt']);
   });
 });
 
@@ -191,7 +192,7 @@ describe('walk', () => {
     const walked = await walk(adapter, {
       ignore: (path) => path === 'build' || path.endsWith('.tmp'),
     });
-    expect(walked.map((f) => f.path)).toEqual(['keep.txt']);
+    expect(walked.map((file) => file.path)).toEqual(['keep.txt']);
   });
 
   it('keeps ignored paths out of sync entirely', async () => {
@@ -214,11 +215,25 @@ describe('walk', () => {
     await adapter.write('a/deep/c.txt', encoder.encode('x'));
     await adapter.write('a/b.txt', encoder.encode('x'));
 
-    expect((await walk(adapter)).map((f) => f.path)).toEqual([
+    expect((await walk(adapter)).map((file) => file.path)).toEqual([
       'a/b.txt',
       'a/deep/c.txt',
       'b.txt',
     ]);
+  });
+
+  it('reports directories when asked, so empty folders can sync', async () => {
+    const adapter = new MemoryAdapter('m');
+    await adapter.mkdir('empty/inner');
+    await adapter.write('a/b.txt', encoder.encode('x'));
+
+    expect((await walk(adapter, { directories: true })).map((file) => file.path)).toEqual([
+      'a',
+      'a/b.txt',
+      'empty',
+      'empty/inner',
+    ]);
+    expect((await walk(adapter)).map((file) => file.path)).toEqual(['a/b.txt']);
   });
 });
 
@@ -252,6 +267,13 @@ describe('MemoryAdapter specifics', () => {
     expect(adapter.snapshot()).toEqual({ 'keep.txt': 'K' });
   });
 
+  it('appends without rewriting the file', async () => {
+    const adapter = new MemoryAdapter('m');
+    await adapter.append('log', encoder.encode('one\n'));
+    await adapter.append('log', encoder.encode('two\n'));
+    expect(decoder.decode(await adapter.read('log'))).toBe('one\ntwo\n');
+  });
+
   it('hides the control folder from snapshots', async () => {
     const adapter = new MemoryAdapter('m');
     const node = await VFSNode.open(adapter, { id: 'm' });
@@ -269,43 +291,26 @@ describe('MemoryAdapter specifics', () => {
   });
 });
 
-describe('degenerate syncs', () => {
-  it('does nothing when both peers are empty', async () => {
-    const a = await peer('device-a');
-    const b = await peer('device-b');
-
-    const result = await sync(a.node, b.node);
-    expect(result).toMatchObject({ base: null, head: null, changed: false, conflicts: [] });
-    expect(await a.node.head()).toBeNull();
-  });
-
-  it('syncs a peer with itself as a no-op', async () => {
-    const a = await peer('device-a');
-    await put(a, 'notes.md', 'v1');
-
-    const result = await sync(a.node, a.node);
-    expect(result.conflicts).toHaveLength(0);
-    expect(await get(a, 'notes.md')).toBe('v1');
-  });
-
-  it('reports blob transfers in the direction they happened', async () => {
-    const a = await peer('device-a');
-    const b = await peer('device-b');
-    await put(a, 'one.txt', 'A1');
-    await put(a, 'two.txt', 'A2');
-
-    const result = await sync(a.node, b.node);
-    expect(result.transferred).toEqual({ toA: 0, toB: 2 });
-  });
-
+describe('degenerate cases', () => {
   it('survives an adapter that reports no native id', async () => {
     const adapter: VFSAdapter = Object.assign(new MemoryAdapter('partial'), {
       fileId: async () => null,
     });
     const node = await VFSNode.open(adapter, { id: 'partial' });
     await node.write('notes.md', encoder.encode('x'));
+    await node.commit();
 
-    const tree = await node.scan();
-    expect(tree.entries[0]?.id).toMatch(/\w/);
+    const [entry] = await node.live();
+    expect(entry?.uuid).toMatch(/\w/);
+    expect(entry?.native).toBeUndefined();
+  });
+
+  it('survives a backend with no mkdir, minus the empty folders', async () => {
+    const bare = new MemoryAdapter('bare');
+    const adapter = Object.assign(Object.create(bare) as MemoryAdapter, { mkdir: undefined });
+    const node = await VFSNode.open(adapter as VFSAdapter, { id: 'bare' });
+    await node.mkdir('nowhere'); // no-op rather than a crash
+    await node.write('notes.md', encoder.encode('x'));
+    expect(await node.commit()).toBeTypeOf('string');
   });
 });

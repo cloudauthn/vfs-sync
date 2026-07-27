@@ -1,14 +1,15 @@
 {
   "name": "@cloudauthn/vfs-sync",
   "version": "0.1.21",
-  "description": "Multi-peer folder sync for OPFS, the File System Access API and Node fs — a git-style content-addressed engine with renames, tombstones and mtime conflict resolution.",
+  "description": "Multi-peer folder sync for OPFS, the File System Access API, Google Drive and Node fs \u2014 the working file is the content, .vfs is metadata, with renames, tombstones, three-way text merges and pending-conflict state.",
   "keywords": [
     "sync",
     "opfs",
     "file-system-access",
     "vfs",
-    "content-addressed",
+    "google-drive",
     "merge",
+    "three-way-merge",
     "offline-first",
     "crdt"
   ],
@@ -21,7 +22,7 @@
     "url": "git+https://github.com/cloudauthn/vfs-sync.git"
   },
   "license": "MIT",
-  "author": "Jesús Germade <jesus@germade.dev>",
+  "author": "Jes\u00fas Germade <jesus@germade.dev>",
   "type": "module",
   "main": "./dist/vfs-sync.cjs",
   "module": "./dist/vfs-sync.js",

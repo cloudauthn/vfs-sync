@@ -254,7 +254,7 @@ describe.each(backends)('$name', ({ make }) => {
 
     expect(decoder.decode(await remote.read('docs/notes.md'))).toBe('from local');
     expect(await remote.adapter.stat('todo.md')).toBeNull();
-    expect(await local.head()).toBe(await remote.head());
+    expect(await local.state()).toBe(await remote.state());
   });
 });
 
@@ -283,6 +283,6 @@ describe('cross-backend sync', () => {
       expect(decoder.decode(await node.read('b.txt'))).toBe('B');
       expect(decoder.decode(await node.read('c.txt'))).toBe('C');
     }
-    expect(await memory.head()).toBe(await handle.head());
+    expect(await memory.state()).toBe(await handle.state());
   });
 });

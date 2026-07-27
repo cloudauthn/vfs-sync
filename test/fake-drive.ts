@@ -16,6 +16,8 @@ interface Node {
   parents: string[];
   content: Uint8Array;
   modifiedTime: string;
+  /** Bumped on every mutation, which is all an ETag has to be. */
+  version: number;
 }
 
 async function bodyBytes(body: BodyInit | null | undefined): Promise<Uint8Array> {
@@ -33,6 +35,8 @@ function unescapeName(raw: string): string {
 export interface FakeDrive {
   fetch: typeof fetch;
   nodes: Map<string, Node>;
+  /** Forces the next `changes` call to answer 410, as an expired token does. */
+  expireToken(): void;
 }
 
 export function makeFakeDrive(): FakeDrive {
@@ -41,6 +45,16 @@ export function makeFakeDrive(): FakeDrive {
   let clock = Date.now();
   const nextId = () => `f${++counter}`;
   const nextTime = () => new Date((clock += 1)).toISOString();
+
+  /** The change journal: one entry per mutation, in order, like Drive's. */
+  const journal: Array<{ seq: number; fileId: string; removed?: boolean }> = [];
+  let seq = 1;
+  let expired = false;
+  const record = (fileId: string, removed?: boolean) => {
+    journal.push({ seq: seq++, fileId, ...(removed ? { removed: true } : {}) });
+  };
+
+  const etagOf = (node: Node) => `"${node.id}-${node.version}"`;
 
   const project = (node: Node) => ({
     id: node.id,
@@ -56,6 +70,7 @@ export function makeFakeDrive(): FakeDrive {
 
   const removeSubtree = (id: string) => {
     nodes.delete(id);
+    record(id, true);
     for (const node of [...nodes.values()]) {
       if (node.parents.includes(id)) removeSubtree(node.id);
     }
@@ -87,15 +102,30 @@ export function makeFakeDrive(): FakeDrive {
     if (upload && idMatch && method === 'PATCH') {
       const node = nodes.get(idMatch[1]!);
       if (!node) return error(404, 'File not found');
+      // Conditional write: If-Match is what makes an append a race somebody
+      // actually wins, rather than one that is merely narrowed.
+      const ifMatch = new Headers(init.headers).get('If-Match');
+      if (ifMatch !== null && ifMatch !== etagOf(node)) {
+        return json({ error: { message: 'Precondition Failed' } }, 412);
+      }
       node.content = await bodyBytes(init.body);
       node.modifiedTime = nextTime();
-      return json(project(node));
+      node.version++;
+      record(node.id);
+      return new Response(JSON.stringify(project(node)), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json', etag: etagOf(node) },
+      });
     }
 
     // ---- metadata read: GET /drive/v3/files/{id}?fields=...
     if (!upload && idMatch && method === 'GET') {
       const node = nodes.get(idMatch[1]!);
-      return node ? json(project(node)) : error(404, 'File not found');
+      if (!node) return error(404, 'File not found');
+      return new Response(JSON.stringify(project(node)), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json', etag: etagOf(node) },
+      });
     }
 
     // ---- rename / move: PATCH /drive/v3/files/{id}
@@ -110,6 +140,8 @@ export function makeFakeDrive(): FakeDrive {
       const remove = url.searchParams.get('removeParents');
       if (remove) node.parents = node.parents.filter((p) => p !== remove);
       if (add && !node.parents.includes(add)) node.parents.push(add);
+      node.version++;
+      record(node.id);
       return json(project(node));
     }
 
@@ -134,8 +166,10 @@ export function makeFakeDrive(): FakeDrive {
         parents: meta.parents ?? ['root'],
         content: new Uint8Array(),
         modifiedTime: nextTime(),
+        version: 1,
       };
       nodes.set(node.id, node);
+      record(node.id);
       return json({ id: node.id });
     }
 
@@ -152,8 +186,40 @@ export function makeFakeDrive(): FakeDrive {
       return json({ files });
     }
 
+    // ---- GET /drive/v3/changes/startPageToken
+    if (rest === '/drive/v3/changes/startPageToken' && method === 'GET') {
+      expired = false;
+      return json({ startPageToken: String(seq) });
+    }
+
+    // ---- GET /drive/v3/changes?pageToken=...
+    if (rest === '/drive/v3/changes' && method === 'GET') {
+      if (expired) return error(410, 'Change token expired');
+      const from = Number(url.searchParams.get('pageToken') ?? '1');
+      // Drive collapses repeated changes to one entry per file, newest state.
+      const latest = new Map<string, { fileId: string; removed?: boolean }>();
+      for (const item of journal) {
+        if (item.seq < from) continue;
+        latest.set(item.fileId, { fileId: item.fileId, ...(item.removed ? { removed: true } : {}) });
+      }
+      const changes = [...latest.values()].map((item) => {
+        const node = nodes.get(item.fileId);
+        return {
+          fileId: item.fileId,
+          ...(item.removed || !node ? { removed: true } : { file: { ...project(node), trashed: false } }),
+        };
+      });
+      return json({ changes, newStartPageToken: String(seq) });
+    }
+
     return error(400, `unhandled ${method} ${url.pathname}`);
   };
 
-  return { fetch: fetchImpl as unknown as typeof fetch, nodes };
+  return {
+    fetch: fetchImpl as unknown as typeof fetch,
+    nodes,
+    expireToken: () => {
+      expired = true;
+    },
+  };
 }

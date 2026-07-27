@@ -1,5 +1,11 @@
 import { joinPath, normalizePath } from '../path.js';
-import type { ByteRange, VFSAdapter, VFSListEntry, VFSStat } from '../types.js';
+import type {
+  ByteRange,
+  VFSAdapter,
+  VFSChangeFeed,
+  VFSListEntry,
+  VFSStat,
+} from '../types.js';
 
 /**
  * A view of another adapter rooted at one of its subfolders, so any folder of
@@ -19,6 +25,10 @@ export class ScopedAdapter implements VFSAdapter {
   readRange?: (path: string, range?: ByteRange) => Promise<Uint8Array>;
   readStream?: (path: string, range?: ByteRange) => Promise<ReadableStream<Uint8Array>>;
   writeStream?: (path: string) => Promise<WritableStream<Uint8Array>>;
+  append?: (path: string, data: Uint8Array) => Promise<void>;
+  writeIf?: (path: string, data: Uint8Array, tag: string | null) => Promise<string | null>;
+  tag?: (path: string) => Promise<string | null>;
+  changes?: (token: string | null) => Promise<VFSChangeFeed>;
 
   constructor(base: VFSAdapter, root: string, name?: string) {
     this.base = base;
@@ -35,6 +45,30 @@ export class ScopedAdapter implements VFSAdapter {
     if (readStream) this.readStream = (path, range) => readStream(this.at(path), range);
     const writeStream = base.writeStream?.bind(base);
     if (writeStream) this.writeStream = (path) => writeStream(this.at(path));
+    const append = base.append?.bind(base);
+    if (append) this.append = (path, data) => append(this.at(path), data);
+    const writeIf = base.writeIf?.bind(base);
+    if (writeIf) this.writeIf = (path, data, tag) => writeIf(this.at(path), data, tag);
+    const tag = base.tag?.bind(base);
+    if (tag) this.tag = (path) => tag(this.at(path));
+    // The change feed is account-wide on every backend that has one, so it is
+    // forwarded whole and filtered by the caller against the paths it knows.
+    const changes = base.changes?.bind(base);
+    if (changes) {
+      this.changes = async (token) => {
+        const feed = await changes(token);
+        return {
+          ...feed,
+          changes: feed.changes
+            .filter((change) => !change.path || this.inside(change.path))
+            .map((change) => (change.path ? { ...change, path: this.un(change.path) } : change)),
+        };
+      };
+    }
+  }
+
+  private inside(path: string): boolean {
+    return !this.root || path === this.root || path.startsWith(`${this.root}/`);
   }
 
   private at(path: string): string {

@@ -82,6 +82,23 @@ export class HandleAdapter implements VFSAdapter {
   }
 
   /**
+   * Native append: `keepExistingData` plus a seek to the end writes only the
+   * new bytes, instead of rewriting the file. This is what keeps extending the
+   * commit log cheap on OPFS and FSA.
+   */
+  async append(path: string, data: Uint8Array): Promise<void> {
+    const handle = await this.file(path, true);
+    if (!handle) throw new Error(`cannot write ${path}`);
+    const size = (await handle.getFile()).size;
+    const writable = await handle.createWritable({ keepExistingData: true });
+    try {
+      await writable.write({ type: 'write', position: size, data: data as unknown as BufferSource });
+    } finally {
+      await writable.close();
+    }
+  }
+
+  /**
    * `File` is a `Blob`, and slicing one is lazy: only the requested range is
    * ever pulled off disk. This is the cheap path for reading a header or a
    * trailer out of a large file.

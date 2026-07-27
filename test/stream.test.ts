@@ -160,28 +160,33 @@ describe('streaming through the engine', () => {
     await streamed.commit();
     await buffered.commit();
 
-    const [one] = (await streamed.headTree()).entries;
-    const [two] = (await buffered.headTree()).entries;
+    const [one] = await streamed.live();
+    const [two] = await buffered.live();
     expect(one?.hash).toBe(await sha256(data));
     expect(two?.hash).toBe(one?.hash);
   });
 
-  it('re-streams a blob that went missing from the object store', async () => {
-    const adapter = new MemoryAdapter('a');
-    const node = await VFSNode.open(adapter, { id: 'a', ...streaming });
-    const data = payload(20_000);
-    await node.write('f.bin', data);
-    await node.commit();
+  /**
+   * v2 has no object store to go missing from: the working file *is* the
+   * content. What replaces `putObjectStreamAt`'s address check is an explicit
+   * re-hash of everything that lands, and it has to hold on the streaming path
+   * too — that is where a truncated transfer actually happens.
+   */
+  it('rejects a streamed transfer that does not hash to what vfs.json promised', async () => {
+    const a = await VFSNode.open(new MemoryAdapter('a'), { id: 'a', ...streaming });
+    const b = await VFSNode.open(new MemoryAdapter('b'), { id: 'b', ...streaming });
+    await a.write('movie.bin', payload(30_000));
+    await a.commit();
 
-    // Same mtime and size, so the next scan takes the cached-hash branch and
-    // has to notice the object is gone and put it back.
-    const hash = (await node.headTree()).entries[0]?.hash as string;
-    await adapter.delete(`.vfs/objects/${hash.slice(0, 2)}/${hash}`);
-    expect(await node.store.hasObject(hash)).toBe(false);
+    // The source starts fine and then stops short, which is what a dropped
+    // connection looks like from the receiving end. `stat` keeps reporting the
+    // real size, so A's own mtime+size filter never notices.
+    const honest = a.adapter.readStream?.bind(a.adapter);
+    a.adapter.readStream = async (path: string) =>
+      path === 'movie.bin' ? chunked(payload(29_000)) : (honest as NonNullable<typeof honest>)(path);
 
-    await node.scan();
-    expect(await node.store.hasObject(hash)).toBe(true);
-    expect(await sha256(await collect(await node.store.getObjectStream(hash)))).toBe(hash);
+    await expect(sync(a, b)).rejects.toThrow(/arrived as/);
+    expect(await b.adapter.stat('movie.bin')).toBeNull();
   });
 
   it('falls back to buffered transfer when a peer cannot stream', async () => {
@@ -193,70 +198,12 @@ describe('streaming through the engine', () => {
     expect(await sha256(await b.read('f.bin'))).toBe(await sha256(await a.read('f.bin')));
   });
 
-  it('reads a range straight off a node, without loading the file', async () => {
-    const node = await VFSNode.open(new MemoryAdapter('a'), { id: 'a' });
-    // an ID3v2 header, filler, then an ID3v1 trailer
-    const track = concat([encoder.encode('ID3\x04\x00'), payload(4000), encoder.encode('TAGtitle')]);
-    await node.write('track.mp3', track);
-
-    expect(decoder.decode(await node.readRange('track.mp3', { end: 3 }))).toBe('ID3');
-    const size = (await node.stat('track.mp3'))?.size as number;
-    expect(decoder.decode(await node.readRange('track.mp3', { start: size - 8 }))).toBe('TAGtitle');
-
-    // and the same range as a stream
-    const head = await collect(await node.readStream('track.mp3', { end: 3 }));
-    expect(decoder.decode(head)).toBe('ID3');
-    expect(await sha256(await collect(await node.readStream('track.mp3')))).toBe(await sha256(track));
-  });
-
-  it('writes a file through a stream and commits it', async () => {
-    const node = await VFSNode.open(new MemoryAdapter('a'), { id: 'a', ...streaming });
-    const writer = (await node.writeStream('generated.bin')).getWriter();
-    for (let i = 0; i < 4; i++) await writer.write(payload(1000));
-    await writer.close();
-
-    await node.commit();
-    const entry = (await node.headTree()).entries[0];
-    expect(entry?.size).toBe(4000);
-    expect(entry?.hash).toBe(await sha256(await node.read('generated.bin')));
-  });
-});
-
-describe('object store integrity', () => {
-  it('rejects a stream that does not hash to the promised address', async () => {
-    const adapter = new MemoryAdapter('a');
-    const node = await VFSNode.open(adapter, { id: 'a' });
-    const lie = await sha256(encoder.encode('what was promised'));
-
-    await expect(
-      node.store.putObjectStreamAt(lie, chunked(encoder.encode('what actually arrived'))),
-    ).rejects.toThrow(/arrived as/);
-
-    // and it does not leave the bad bytes behind under a good name
-    expect(await node.store.hasObject(lie)).toBe(false);
-  });
-
-  it('skips a blob it already has, and drains the source', async () => {
-    const node = await VFSNode.open(new MemoryAdapter('a'), { id: 'a' });
-    const data = encoder.encode('already here');
-    const hash = await node.store.putObject(data);
-
-    await node.store.putObjectStreamAt(hash, chunked(data));
-    expect(await node.store.objectSize(hash)).toBe(data.byteLength);
-  });
-
   it('leaves nothing behind when the write fails mid-stream', async () => {
-    const node = await VFSNode.open(failingWrites(new MemoryAdapter('a')), { id: 'a' });
-    const data = payload(9000);
-    const hash = await sha256(data);
+    const a = await VFSNode.open(new MemoryAdapter('a'), { id: 'a', ...streaming });
+    const b = await VFSNode.open(failingWrites(new MemoryAdapter('b')), { id: 'b', ...streaming });
 
-    await expect(node.store.putObjectStreamAt(hash, chunked(data))).rejects.toThrow('disk full');
-    expect(await node.store.hasObject(hash)).toBe(false);
-  });
-
-  it('reports the size of a blob it does not have as zero', async () => {
-    const node = await VFSNode.open(new MemoryAdapter('a'), { id: 'a' });
-    expect(await node.store.objectSize('0'.repeat(64))).toBe(0);
-    await expect(node.store.getObjectStream('0'.repeat(64))).rejects.toThrow(/missing object/);
+    await a.write('f.bin', payload(9000));
+    await expect(sync(a, b)).rejects.toThrow('disk full');
+    expect(await b.adapter.stat('f.bin')).toBeNull();
   });
 });

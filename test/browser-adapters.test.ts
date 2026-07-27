@@ -71,7 +71,7 @@ describe('OPFSAdapter', () => {
 
     await node.write('notes.md', encoder.encode('hello'));
     expect(await node.commit()).toBeTypeOf('string');
-    expect((await node.headTree()).entries[0]?.path).toBe('notes.md');
+    expect((await node.live())[0]?.path).toBe('notes.md');
   });
 });
 

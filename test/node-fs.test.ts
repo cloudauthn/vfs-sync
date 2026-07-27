@@ -58,16 +58,17 @@ describe('NodeFsAdapter', () => {
 
     expect(decoder.decode(await b.read('notes.md'))).toBe('from A');
     expect(decoder.decode(await a.read('todo.md'))).toBe('from B');
-    expect(await a.head()).toBe(await b.head());
+    expect(await a.state()).toBe(await b.state());
   });
 
   it('survives a reopen: state lives in .vfs, not in memory', async () => {
     const a = await node('device-a');
     await a.write('notes.md', encoder.encode('v1'));
-    const head = await a.commit();
+    await a.commit();
+    const state = await a.state();
 
     const reopened = await node('device-a');
-    expect(await reopened.head()).toBe(head);
+    expect(await reopened.state()).toBe(state);
     expect(await reopened.commit()).toBeNull(); // nothing changed on disk
   });
 

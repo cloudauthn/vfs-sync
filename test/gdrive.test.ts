@@ -144,3 +144,106 @@ describe('GDriveAdapter', () => {
     expect(memory.snapshot()['doc.md']).toBe('# from drive');
   });
 });
+
+describe('conditional writes', () => {
+  it('lands when the tag still matches, and refuses when it does not', async () => {
+    const { adapter } = drive();
+    await adapter.write('log', encoder.encode('one\n'));
+
+    const tag = await adapter.tag('log');
+    expect(tag).toBeTruthy();
+    expect(await adapter.writeIf('log', encoder.encode('one\ntwo\n'), tag)).toBeTruthy();
+    expect(decoder.decode(await adapter.read('log'))).toBe('one\ntwo\n');
+
+    // Somebody else got there first: the stale tag no longer matches.
+    expect(await adapter.writeIf('log', encoder.encode('clobbered'), tag)).toBeNull();
+    expect(decoder.decode(await adapter.read('log'))).toBe('one\ntwo\n');
+  });
+
+  it('creates a missing file only when no tag was demanded', async () => {
+    const { adapter } = drive();
+    expect(await adapter.writeIf('fresh', encoder.encode('x'), '"nope"')).toBeNull();
+    expect(await adapter.stat('fresh')).toBeNull();
+
+    expect(await adapter.writeIf('fresh', encoder.encode('x'), null)).toBeTruthy();
+    expect(decoder.decode(await adapter.read('fresh'))).toBe('x');
+  });
+});
+
+describe('the changes feed', () => {
+  it('reports what moved since the token, in one request', async () => {
+    const { adapter } = drive();
+    await adapter.write('a.md', encoder.encode('one'));
+
+    const { token, changes } = await adapter.changes(null);
+    expect(changes).toEqual([]); // a baseline, not an enumeration
+
+    await adapter.write('b.md', encoder.encode('two'));
+    await adapter.write('a.md', encoder.encode('one, edited'));
+
+    const feed = await adapter.changes(token);
+    expect(feed.reset).toBeUndefined();
+    expect(feed.changes.map((change) => change.path).sort()).toEqual(['a.md', 'b.md']);
+    expect(feed.changes.every((change) => change.removed === undefined)).toBe(true);
+    expect(feed.token).not.toBe(token);
+  });
+
+  it('reports a delete as removed', async () => {
+    const { adapter } = drive();
+    await adapter.write('gone.md', encoder.encode('x'));
+    const { token } = await adapter.changes(null);
+    await adapter.delete('gone.md');
+
+    const feed = await adapter.changes(token);
+    expect(feed.changes).toHaveLength(1);
+    expect(feed.changes[0]?.removed).toBe(true);
+  });
+
+  it('asks for a full walk instead of guessing when the token expired', async () => {
+    const { adapter, fake } = drive();
+    await adapter.write('a.md', encoder.encode('one'));
+    const { token } = await adapter.changes(null);
+
+    fake.expireToken();
+    const feed = await adapter.changes(token);
+    expect(feed.reset).toBe(true);
+    expect(feed.changes).toEqual([]);
+    // A fresh token comes back, so the caller can walk once and carry on.
+    expect(feed.token).toBeTruthy();
+    expect((await adapter.changes(feed.token)).reset).toBeUndefined();
+  });
+});
+
+describe('a node over the feed', () => {
+  it('has no baseline the first time, and answers from the feed afterwards', async () => {
+    const { adapter } = drive();
+    const node = await VFSNode.open(adapter, { id: 'drive' });
+    await adapter.write('a.md', encoder.encode('one'));
+    await node.commit();
+
+    // No token yet: the caller has to walk, and that walk *is* the baseline.
+    expect(await node.externalChanges()).toBeNull();
+    // Nothing has happened since, and our own writes do not count as external.
+    expect(await node.externalChanges()).toEqual([]);
+
+    // Something writes around the engine — the Drive web UI, another client.
+    await adapter.write('a.md', encoder.encode('edited elsewhere'));
+    expect(await node.externalChanges()).toEqual(['a.md']);
+  });
+
+  it('ignores the control folder and anything the node was told to skip', async () => {
+    const { adapter } = drive();
+    const node = await VFSNode.open(adapter, {
+      id: 'drive',
+      ignore: (path) => path.startsWith('cache'),
+    });
+    await adapter.write('a.md', encoder.encode('one'));
+    await node.commit();
+    await node.externalChanges();
+
+    await adapter.write('cache/huge.bin', encoder.encode('local only'));
+    await node.commit(); // writes .vfs/vfs.json and .vfs/commits
+
+    expect(await node.externalChanges()).toEqual([]);
+  });
+});

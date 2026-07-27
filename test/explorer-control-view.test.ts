@@ -8,8 +8,11 @@ import type { Calls } from './helpers.js';
 
 /**
  * The explorer's read-only `.vfs` view, exercised through the model — no DOM.
- * The store is listed a folder at a time, as it is unfolded, so most of what
- * these check is what *is not* read.
+ *
+ * v2 shrinks this view a long way: two files on the normal path instead of an
+ * object store fanned out over a folder per hash prefix. The listing is still
+ * done a folder at a time, because `base/` can hold one copy per text version,
+ * so most of what these check is what *is not* read.
  */
 async function openMemRoot(
   backend: BrowseSource['backend'] = 'memory',
@@ -52,40 +55,43 @@ describe('explorer .vfs view', () => {
     expect(before.control).toBeNull(); // folded: nothing has been read
 
     await unfold(model, peer, CONTROL_DIR);
-    expect(names(model, peer, CONTROL_DIR)).toContain('config.json');
+    expect(names(model, peer, CONTROL_DIR)).toContain('vfs.json');
     expect(model.snapshotOf(peer.key).files.map((file) => file.path)).toEqual(['notes.md']);
+  });
+
+  it('is two entries on the normal path', async () => {
+    const { model, peer } = await openMemRoot();
+    await model.write(peer, 'notes.bin', 'not text\n');
+    await peer.node.commit();
+    await unfold(model, peer, CONTROL_DIR);
+
+    // No objects/, no commits/<hash>.json, no known-commits.log, no hash-cache.
+    expect(names(model, peer, CONTROL_DIR).sort()).toEqual(['commits', 'vfs.json']);
   });
 
   it('unfolding a folder reads that folder and nothing under it', async () => {
     const { model, peer, calls } = await openMemRoot();
-    await model.write(peer, 'notes.md', '# notes\n');
+    await model.write(peer, 'notes.xml', '<one/>\n');
     await peer.node.commit();
 
     calls.reset();
     await unfold(model, peer, CONTROL_DIR);
-    // One listing. Not `commits/`, not `objects/`, and above all not a folder per
-    // two-character hash bucket — which is what a walk of the store would cost.
+    // One listing. Not `base/`, whose copies are one per recorded text version.
     expect(calls.list).toEqual([CONTROL_DIR]);
-    expect(names(model, peer, CONTROL_DIR)).toContain('objects');
-    expect(model.snapshotOf(peer.key).control?.get(`${CONTROL_DIR}/objects`)).toBeUndefined();
+    expect(names(model, peer, CONTROL_DIR)).toContain('base');
+    expect(model.snapshotOf(peer.key).control?.get(`${CONTROL_DIR}/base`)).toBeUndefined();
 
     calls.reset();
-    await unfold(model, peer, `${CONTROL_DIR}/objects`);
-    // Re-listing the folders already open is local and cheap; the buckets that
-    // just appeared under `objects/` stay unread until they are asked for.
-    expect(calls.list).toContain(`${CONTROL_DIR}/objects`);
-    const buckets = names(model, peer, `${CONTROL_DIR}/objects`);
-    expect(buckets.length).toBeGreaterThan(0);
-    for (const bucket of buckets) {
-      expect(calls.list).not.toContain(`${CONTROL_DIR}/objects/${bucket}`);
-    }
+    await unfold(model, peer, `${CONTROL_DIR}/base`);
+    expect(calls.list).toContain(`${CONTROL_DIR}/base`);
+    expect(names(model, peer, `${CONTROL_DIR}/base`).length).toBeGreaterThan(0);
   });
 
   it('on a remote backend a repaint re-lists nothing, and unfolding costs one listing', async () => {
     // The backend label is what picks the policy, so a memory adapter wearing
     // Drive's name keeps this test about the policy and not about the transport.
     const { model, peer, calls } = await openMemRoot('GDrive');
-    await model.write(peer, 'notes.md', '# notes\n');
+    await model.write(peer, 'notes.xml', '<one/>\n');
     await peer.node.commit();
     await unfold(model, peer, CONTROL_DIR);
     const inControl = (): string[] => calls.list.filter((path) => path.startsWith(CONTROL_DIR));
@@ -95,30 +101,30 @@ describe('explorer .vfs view', () => {
     expect(inControl()).toEqual([]);
 
     calls.reset();
-    await unfold(model, peer, `${CONTROL_DIR}/objects`);
-    expect(inControl()).toEqual([`${CONTROL_DIR}/objects`]); // just the one opened
+    await unfold(model, peer, `${CONTROL_DIR}/base`);
+    expect(inControl()).toEqual([`${CONTROL_DIR}/base`]); // just the one opened
 
     calls.reset();
     await model.reload(); // and the refresh button is what re-reads them
     expect(inControl()).toContain(CONTROL_DIR);
-    expect(inControl()).toContain(`${CONTROL_DIR}/objects`);
+    expect(inControl()).toContain(`${CONTROL_DIR}/base`);
   });
 
-  it('a commit’s objects appear in the folders that are open', async () => {
+  it('a commit’s new store files appear in the folders that are open', async () => {
     const { model, peer } = await openMemRoot();
-    await model.write(peer, 'notes.md', '# notes\n');
     await unfold(model, peer, CONTROL_DIR);
-    expect(names(model, peer, CONTROL_DIR)).not.toContain('objects');
+    expect(names(model, peer, CONTROL_DIR)).not.toContain('commits');
 
+    await model.write(peer, 'notes.md', '# notes\n');
     await peer.node.commit();
     await model.render();
-    expect(names(model, peer, CONTROL_DIR)).toContain('objects');
     expect(names(model, peer, CONTROL_DIR)).toContain('commits');
+    expect(names(model, peer, CONTROL_DIR)).toContain('vfs.json');
   });
 
   it('shows a store file read-only: hashed and previewed, untracked, not compared', async () => {
     const { model, peer } = await openMemRoot();
-    await model.select(peer, { path: `${CONTROL_DIR}/config.json`, kind: 'file' });
+    await model.select(peer, { path: `${CONTROL_DIR}/vfs.json`, kind: 'file' });
 
     const details = model.details;
     expect(details?.control).toBe(true);
@@ -130,22 +136,19 @@ describe('explorer .vfs view', () => {
     expect(peer.controlExpanded.has(CONTROL_DIR)).toBe(true);
   });
 
-  it('an object’s checksum is the name it is filed under, unfolded or not', async () => {
+  it('a base copy’s checksum is the name it is filed under, unfolded or not', async () => {
     const { model, peer } = await openMemRoot();
-    await model.write(peer, 'notes.md', '# notes\n');
+    await model.write(peer, 'notes.xml', '<one/>\n');
     await peer.node.commit();
 
-    // Ask the commit which object holds the file: a store also keeps its tree
-    // under objects/, and that one's hash moves with every run.
-    const blob = (await peer.node.headTree()).entries[0]?.hash;
-    if (!blob) throw new Error('commit stored no object for the file');
+    const hash = (await peer.node.live())[0]?.hash;
+    if (!hash) throw new Error('nothing was recorded for the file');
     // Deep in a folder nobody has unfolded — the details pane still resolves it.
-    const path = `${CONTROL_DIR}/objects/${blob.slice(0, 2)}/${blob}`;
-    await model.select(peer, { path, kind: 'file' });
+    await model.select(peer, { path: `${CONTROL_DIR}/base/${hash}`, kind: 'file' });
 
-    expect(model.details?.hash).toBe(blob);
-    // an extensionless blob still previews, because the bytes read as text
-    expect(model.details?.text).toBe('# notes\n');
+    expect(model.details?.hash).toBe(hash);
+    // an extensionless copy still previews, because the bytes read as text
+    expect(model.details?.text).toBe('<one/>\n');
   });
 
   it('counts the children of a store folder, not everything beneath it', async () => {
@@ -165,7 +168,7 @@ describe('explorer .vfs view', () => {
 
   it('refuses every write into the store, whatever asks for it', async () => {
     const { model, peer } = await openMemRoot();
-    const path = `${CONTROL_DIR}/config.json`;
+    const path = `${CONTROL_DIR}/vfs.json`;
     const before = await peer.adapter.read(path);
 
     await model.write(peer, path, 'clobbered');

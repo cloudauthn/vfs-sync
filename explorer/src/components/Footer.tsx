@@ -9,7 +9,7 @@ export function Footer({ model }: { model: ExplorerModel }): JSX.Element {
   const state = model.syncing ? 'busy' : model.lastKind === 'warn' ? 'warn' : 'ok';
   const bits = [
     peer ? `${peer.label} · ${peer.backend}` : 'new tab',
-    snapshot?.head ? `@ ${snapshot.head.slice(0, 7)}` : 'no commits',
+    snapshot?.state ? `@ ${snapshot.state.slice(0, 7)}` : 'nothing recorded',
     model.lastSyncAt ? `synced ${formatAgo(model.lastSyncAt)}` : 'not synced yet',
   ];
   return (

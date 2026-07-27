@@ -34,7 +34,8 @@ export interface PeerView {
   label: string;
   backend: string;
   files: WalkedFile[];
-  head: string | null;
+  /** Digest of the live entries — two peers agree when these match. */
+  state: string | null;
 }
 
 export interface LogEntry {
@@ -138,7 +139,7 @@ export class DemoModel {
 
   // ------------------------------------------------------------------ render
 
-  /** Recompute every peer's file list and head commit, then repaint. */
+  /** Recompute every peer's file list and state digest, then repaint. */
   async render(): Promise<void> {
     const seq = ++this.renderSeq;
     const views: PeerView[] = [];
@@ -148,7 +149,7 @@ export class DemoModel {
         label: peer.label,
         backend: peer.backend,
         files: await walk(peer.adapter),
-        head: await peer.node.head(),
+        state: await peer.node.state(),
       });
     }
     if (seq !== this.renderSeq) return;
@@ -285,7 +286,7 @@ export class DemoModel {
     const winner = conflict.winner === 'a' ? conflict.a : conflict.b;
     this.log(
       `conflict on ${conflict.path} (${conflict.kind}) — ` +
-        `${winner.peer ?? conflict.winner} has the newer version` +
+        `${winner?.peer ?? conflict.winner} has the newer version` +
         (conflict.copy ? `, kept ${conflict.copy.path}` : ''),
       'conflict',
     );

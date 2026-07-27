@@ -3,47 +3,42 @@ import { MemoryAdapter } from '../src/adapters/memory.js';
 import { ScopedAdapter } from '../src/adapters/scoped.js';
 import { VFSNode } from '../src/vfs-node.js';
 import { sync, syncUntilStable } from '../src/sync.js';
-import type { NodeConfig, VFSAdapter } from '../src/types.js';
+import type { VFSAdapter } from '../src/types.js';
 import { decoder, encoder, peer, put } from './helpers.js';
 
 describe('storeId', () => {
   it('mints one at init and keeps it on reopen', async () => {
     const fs = new MemoryAdapter('a');
     const first = await VFSNode.open(fs);
-    const minted = (await first.store.readConfig()).storeId;
+    const minted = (await first.file()).storeId;
     expect(minted).toBeTruthy();
 
     const again = await VFSNode.open(fs);
-    expect((await again.store.readConfig()).storeId).toBe(minted);
+    expect((await again.file()).storeId).toBe(minted);
   });
 
-  it('upgrades a config written before storeId existed', async () => {
-    const fs = new MemoryAdapter('legacy');
-    await fs.write(
-      '.vfs/config.json',
-      encoder.encode(JSON.stringify({ id: 'legacy-peer', head: null, peers: {} })),
-    );
-    await VFSNode.open(fs);
-    const config = JSON.parse(decoder.decode(await fs.read('.vfs/config.json'))) as NodeConfig;
-    expect(config.id).toBe('legacy-peer');
-    expect(config.storeId).toBeTruthy();
+  it('lives in the header of vfs.json, alongside the peer id', async () => {
+    const fs = new MemoryAdapter('fresh');
+    const node = await VFSNode.open(fs, { id: 'device-a' });
+    const file = await node.file();
+
+    expect(file.peer).toBe('device-a');
+    expect(file.storeId).toBeTruthy();
+    // v1's config.json is gone; the header carries what it used to.
+    expect(await fs.stat('.vfs/config.json')).toBeNull();
+    expect(decoder.decode(await fs.read('.vfs/vfs.json'))).toContain('"storeId"');
   });
 
   it('both sides of a sync adopt the smaller of their two ids', async () => {
     const a = await peer('a');
     const b = await peer('b');
     await put(a, 'x.txt', 'x');
-    const smaller = [
-      (await a.node.store.readConfig()).storeId,
-      (await b.node.store.readConfig()).storeId,
-    ]
-      .sort()
-      .at(0);
+    const smaller = [(await a.node.file()).storeId, (await b.node.file()).storeId].sort().at(0);
 
     await sync(a.node, b.node);
 
-    expect((await a.node.store.readConfig()).storeId).toBe(smaller);
-    expect((await b.node.store.readConfig()).storeId).toBe(smaller);
+    expect((await a.node.file()).storeId).toBe(smaller);
+    expect((await b.node.file()).storeId).toBe(smaller);
   });
 
   it('settles on one id across a chain', async () => {
@@ -57,9 +52,7 @@ describe('storeId', () => {
       { a: b.node, b: c.node },
     ]);
 
-    const ids = await Promise.all(
-      [a, b, c].map(async (p) => (await p.node.store.readConfig()).storeId),
-    );
+    const ids = await Promise.all([a, b, c].map(async (p) => (await p.node.file()).storeId));
     expect(new Set(ids).size).toBe(1);
   });
 });
@@ -103,7 +96,7 @@ describe('ScopedAdapter', () => {
     await sync(inner, other.node);
 
     expect(other.fs.snapshot()).toEqual({ 'n.md': 'note' });
-    expect((await host.stat('projects/notes/.vfs/config.json'))?.kind).toBe('file');
+    expect((await host.stat('projects/notes/.vfs/vfs.json'))?.kind).toBe('file');
     expect(await host.stat('.vfs')).toBeNull();
   });
 });

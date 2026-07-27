@@ -1,8 +1,8 @@
 # Adapters
 
 An adapter is the only thing that knows about a storage backend. The engine talks to it through
-seven methods and never touches a backend API directly, which is why any backend can sync with
-any other.
+seven required methods — plus a handful of optional ones it emulates when they are missing — and
+never touches a backend API directly, which is why any backend can sync with any other.
 
 | Adapter | Import from | Runs in |
 | --- | --- | --- |
@@ -204,28 +204,36 @@ moves with certainty and never needs the hash heuristic. The cost is that a path
 key — resolving `a/b/c.txt` walks the folder tree by name — so the adapter keeps a path→id cache
 and invalidates it on every write, delete and rename.
 
-### Fewer writes: reconstruct mode
+### Conditional writes
 
-By default the store copies every file's bytes into `.vfs/objects/` as well, so on Drive each file
-is written twice — once as the visible file, once as its blob. Open the node with
-`reconstructBlobs: true` and the store treats the working folder *as* the blob store: a blob that is
-already a file is not duplicated, and reads reconstruct it from that file. It roughly halves the
-object writes a sync makes on Drive.
+Drive has no append, so extending the commit log re-uploads the active segment — which is exactly
+where two peers appending at once would lose rows. This adapter implements `tag()` and `writeIf()`
+on top of ETags and `If-Match`, so the engine's check-then-act becomes a race it actually wins or
+loses rather than one it merely narrows.
+
+### The changes feed
+
+`changes(token)` maps onto `/drive/v3/changes`: in **one** request it says whether anything moved,
+instead of a listing per folder. Pass `null` to get a starting token without enumerating anything.
 
 ```ts
-const drive = new GDriveAdapter({ token });
-const node = await VFSNode.open(drive, { reconstructBlobs: true });
+const { token } = await drive.changes(null);          // once
+const feed = await drive.changes(token);              // later
+if (feed.reset) await fullWalk();                     // the token expired (410 Gone)
+for (const change of feed.changes) console.log(change.native, change.removed ? 'gone' : change.path);
 ```
 
-Leave it off for local backends (OPFS, node, memory), where the extra copy is cheap and the plain
-`objects/` layout is simplest. It composes with any backend, so a Drive node can sync with a normal
-one.
+Two honest caveats. The feed is **account-wide and cannot be filtered by folder**, so the caller
+filters client-side by `fileId` against the `native` field of its entries — which is what that field
+is for — and a change inside a subfolder that has never been resolved cannot be attributed and is
+ignored until the next walk. And **the token expires**: Drive answers `410 Gone` when it has fallen
+too far behind, which comes back as `reset: true` and means taking the full-walk path that has
+always existed.
 
-Reconstruct mode also changes where a read looks first: the working folder, not `objects/`, because
-that is where the blobs are. The bytes are checked against the hash they were asked for before being
-handed back — the hash→path index can be stale in *content*, not just in existence (a conflict loser
-is pinned into `objects/` precisely because its working file is about to be overwritten), and a
-mismatch falls through to `objects/` instead of returning the wrong blob.
+Also worth knowing: **your own writes appear in the feed**. Discard them by comparing against your
+entries (same `hash`/`size`), or every write you make will look like an external change. And the
+behaviour of the feed under the `drive.file` (per-file access) scope is worth verifying for your
+own setup before relying on it; it is an optimisation, so the fallback is the walk.
 
 ### What a Drive operation costs
 
@@ -236,11 +244,14 @@ Where they go:
   every child it returns) mean this is normally paid once per path per session.
 - **A `stat`** is free of a metadata fetch when the lookup that resolved the path just returned it —
   the name query asks for `size` and `modifiedTime` along with the id.
-- **A store read** — object, commit, config — is one read, not a `stat` and then a read. The `stat`
-  only happens if the read failed, to tell an absent file from a backend that broke.
-- **Commits and trees** are content-addressed, so a store keeps the ones it has decoded. Repainting a
-  file tree or negotiating a sync walks the same handful of them repeatedly.
-- **A walk** is one `list` per folder, with no `stat` per file.
+- **A store read** is one read, not a `stat` and then a read. The `stat` only happens if the read
+  failed, to tell an absent file from a backend that broke.
+- **Painting a folder** is a read of `.vfs/vfs.json` — the mirror *is* the tree, so there is no
+  listing per folder and no object store to resolve.
+- **A quiet sync** is a range read of the other peer's header. The header comes first in the file,
+  so `entries` is never fetched when the `state` digests already match.
+- **A walk** is one `list` per folder, with no `stat` per file. It is what reconciles the mirror
+  against the disk, and it is the one obligatory cost whatever the protocol.
 
 `test/gdrive-traffic.test.ts` asserts these as upper bounds on real flows — opening a root, walking
 it, syncing it — so a change that puts a round trip back fails with the number it regressed to.
@@ -302,12 +313,13 @@ const adapter = new MemoryAdapter('scratch', {
 Two extras exist for tests:
 
 ```ts
-adapter.setMtime('notes.md', 5_000);  // script clock skew or a simultaneous edit
+adapter.setMtime('notes.md', 5_000);  // script an mtime, e.g. to defeat the fast filter
 adapter.snapshot();                   // { path: text }, control folder excluded
 ```
 
-The default clock never repeats a timestamp, which keeps conflict resolution unambiguous. Use
-`setMtime` when you want a *specific* ordering, or pass your own `clock` to control it entirely.
+The default clock never repeats a timestamp. Note that in v2 the mtime does **not** decide
+conflicts: `updated` is a hybrid logical clock stamped when a node records a change, so ordering two
+edits in a test means driving `VFSNode`'s `now`, not the adapter's.
 
 ---
 
@@ -325,8 +337,10 @@ const notes = await VFSNode.open(new ScopedAdapter(host, 'projects/notes'));
 // notes reads and writes under projects/notes/; its store is projects/notes/.vfs
 ```
 
-The wrapper only advertises the optional methods (`mkdir`, `fileId`, streaming) that its base
-implements, so capability checks like `canStream()` keep telling the truth.
+The wrapper only advertises the optional methods (`mkdir`, `fileId`, streaming, `append`,
+`writeIf`, `changes`) that its base implements, so capability checks like `canStream()` keep telling
+the truth. A forwarded change feed is filtered to the scope and its paths re-rooted, since the feed
+is account-wide on every backend that has one.
 
 ---
 
@@ -362,6 +376,9 @@ export class MyAdapter implements VFSAdapter {
   /** Optional. Only for backends with stable native identifiers. */
   async fileId?(path: string): Promise<string | null> { /* … */ }
 
+  /** Optional. Creates an empty directory; v2 records folders, so this is how one syncs. */
+  async mkdir?(path: string): Promise<void> { /* … */ }
+
   // Optional, all three. Omit them and the engine emulates them on top of
   // read/write — correct, but it holds whole files.
 
@@ -370,8 +387,32 @@ export class MyAdapter implements VFSAdapter {
   async readStream?(path: string, range?: ByteRange): Promise<ReadableStream<Uint8Array>> { /* … */ }
   /** Truncates on open, like write(). */
   async writeStream?(path: string): Promise<WritableStream<Uint8Array>> { /* … */ }
+
+  // Optional, same philosophy: implement where the backend does it better.
+
+  /** Appends, creating the file when absent. Emulated as read + concat + write. */
+  async append?(path: string, data: Uint8Array): Promise<void> { /* … */ }
+  /** Current version tag, for writeIf. */
+  async tag?(path: string): Promise<string | null> { /* … */ }
+  /** Conditional write. `null` back means the precondition failed and nothing was written. */
+  async writeIf?(path: string, data: Uint8Array, tag: string | null): Promise<string | null> { /* … */ }
+  /** Changes since `token`; pass `null` for a starting token. Without it, the engine walks. */
+  async changes?(token: string | null): Promise<VFSChangeFeed> { /* … */ }
 }
 ```
+
+### The v2 additions
+
+| Method | Native | Emulated |
+| --- | --- | --- |
+| `append?(path, data)` | node `'a'`; OPFS/FSA `keepExistingData` + seek | read, concatenate, write |
+| `changes?(token)` | Drive `changes.list` | none: without it, the engine walks |
+| `writeIf?(path, data, tag)` | Drive ETag + `If-Match` | none: compare `size`/`rows` and accept the race |
+| `mkdir?(path)` | every filesystem-shaped backend | none: the folder appears when its first file lands |
+
+`append` is what keeps extending the commit log cheap. Where it is missing the engine reads,
+concatenates and writes — which on Drive is a full re-upload of the active segment, and is the reason
+the log rotates at all.
 
 The contract the engine relies on, in full:
 

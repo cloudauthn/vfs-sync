@@ -507,6 +507,36 @@
   gap: 6px;
 }
 
+.vfs-explorer .vfs-pending {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 9px;
+  border: 1px solid var(--vfs-line);
+  border-left: 2px solid var(--vfs-conflict);
+  border-radius: 7px;
+  background: var(--vfs-panel-2);
+}
+
+.vfs-explorer .vfs-pending-head {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.vfs-explorer .vfs-pending-path {
+  font-size: 12.5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.vfs-explorer .vfs-pending-why {
+  font-size: 11.5px;
+  color: var(--vfs-muted);
+}
+
 .vfs-explorer .vfs-props {
   display: grid;
   grid-template-columns: minmax(90px, max-content) minmax(0, 1fr);
