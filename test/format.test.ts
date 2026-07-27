@@ -267,3 +267,30 @@ describe('extensionOf', () => {
     expect(extensionOf('archive.tar.gz')).toBe('gz');
   });
 });
+
+describe('log codec edges', () => {
+  it('encodes nothing for no rows, and carries the optional links when present', () => {
+    expect(encodeRows([])).toHaveLength(0);
+    const merged = row({
+      op: 'aa',
+      uuid: 'u1',
+      prev: 'p1',
+      prev2: 'p2',
+      prevPath: 'was.txt',
+      size: 12,
+    });
+    const [back] = parseRows(encodeRows([merged]));
+    expect(back).toMatchObject({ prev: 'p1', prev2: 'p2', prevPath: 'was.txt', size: 12 });
+  });
+
+  it('skips a line that is not an object at all', () => {
+    const noise = encoder.encode('not json\n[1,2,3]\n\n{"op":"aa","uuid":"u1"}\n');
+    expect(parseRows(noise).map((item) => item.uuid)).toEqual(['u1']);
+  });
+
+  it('treats a row with no usable op as zeroes rather than failing a sync', () => {
+    // A corrupt line should make the digest disagree, not throw.
+    expect(xorHex(undefined, undefined)).toBe(ZERO_DIGEST);
+    expect(xorDigest([{ ...row({ op: '', uuid: 'u1' }) }])).toBe(ZERO_DIGEST);
+  });
+});

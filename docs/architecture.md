@@ -337,7 +337,11 @@ What `sync(a, b)` does, in order:
 
 1. **Reconcile both sides.** A scan turns disk state into entries; nothing changed means nothing is
    appended, so a quiet loop does not grow the log.
-2. **Read the header** of the other peer's `vfs.json` — one range read.
+2. **Read both mirrors.** `sync(a, b)` drives both nodes, and reconciling one means comparing its
+   working folder against its own entries, so both files are read in full. (The design's
+   one-range-read-per-peer assumes a client/server split this library does not have: there is no
+   "remote peer" whose scan somebody else runs. `VFSStore.header()` is the cheap path for inspecting
+   a store *without* opening it as a node, which is what the explorer's folder probe does.)
 3. **Converge config**: `storeId` on the lexicographically smaller, the `text` list by union.
 4. **Compare `state`.** Equal digests, equal log digests → nothing to do. **Fin.**
 5. **Merge the entries** in memory. The log is opened only when the entries cannot answer alone:

@@ -247,8 +247,11 @@ console.log(`moved ${transferred.toA + transferred.toB} file(s), auto-merged ${m
 
 `sync` reconciles both sides for you; calling `commit()` first is not required.
 
-A quiet edge is **one range read per peer**: the header comes first in `vfs.json`, and if the `state`
-digests match there is nothing else to fetch.
+A quiet edge costs the reconciliation and nothing more: one `state` comparison decides there is
+nothing to transfer, nothing to merge and nothing to append. `sync(a, b)` drives *both* nodes, and
+reconciling a node means walking its working folder against its entries — so the floor here is that
+walk, not a single read. `VFSStore.header()` exists for the other case: inspecting a store you are
+not opening as a node.
 
 ---
 

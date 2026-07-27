@@ -104,15 +104,14 @@ export class VFSStore {
     return this.file;
   }
 
-  /** The decoded file if it is already in hand, without touching the backend. */
-  peek(): VFSFile | null {
-    return this.file;
-  }
-
   /**
    * Header only — `state`, `log`, `peers` — from a range read of the top of the
-   * file. This is the "one read per peer" of a quiet sync: `entries` can run to
-   * megabytes and none of it is needed to find out that nothing changed.
+   * file, growing the probe until `entries` comes into view.
+   *
+   * Not what `sync` uses: it drives both nodes and reconciling one needs its
+   * entries anyway. This is for inspecting a store you are *not* opening as a
+   * node — "does this folder hold a store, and which one?" — where `entries` can
+   * run to megabytes and none of it is needed.
    */
   async header(): Promise<VFSHeader> {
     if (this.file) return headerOf(this.file);
@@ -146,11 +145,6 @@ export class VFSStore {
         ...DEFAULT_TEXT_EXTENSIONS,
       ]),
     );
-  }
-
-  async exists(): Promise<boolean> {
-    if (this.file) return true;
-    return (await this.adapter.stat(this.filePath)) !== null;
   }
 
   // ------------------------------------------------------------ commit log

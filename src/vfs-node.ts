@@ -723,20 +723,6 @@ export class VFSNode {
     return held;
   }
 
-  /** Content this node can hand to a peer, keyed by hash. */
-  async handle(hash: Hash): Promise<ContentHandle | null> {
-    const entry = (await this.live()).find((item) => item.hash === hash && item.kind === 'file');
-    if (!entry) return null;
-    const stat = await this.adapter.stat(entry.path);
-    if (!stat) return null;
-    const path = entry.path;
-    return {
-      size: stat.size,
-      read: () => this.adapter.read(path),
-      stream: () => readStream(this.adapter, path),
-    };
-  }
-
   // ------------------------------------------------------------ conflicts
 
   /**
@@ -796,14 +782,6 @@ export class VFSNode {
     }
     await this.adapter.delete(copy.path).catch(() => undefined);
     await this.commit();
-  }
-
-  /**
-   * Keeps the previous content of a text entry, so a later three-way merge has
-   * a base. Local only — it never travels and no peer reads it.
-   */
-  async keepBase(hash: Hash, data: Uint8Array): Promise<void> {
-    await this.store.putBase(hash, data);
   }
 
   async baseOf(hash: Hash): Promise<Uint8Array | null> {

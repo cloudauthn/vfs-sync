@@ -3,7 +3,12 @@ import { History } from './history.js';
 import { MAX_TEXT_MERGE, diff3 } from './diff3.js';
 import { makeRow, missingRows } from './log.js';
 import { HELD_AT, mergeEntries } from './merge.js';
-import type { ConflictCopyPolicy, ConflictNameInfo, ConflictReport } from './merge.js';
+import type {
+  ConflictCopyPolicy,
+  ConflictNameInfo,
+  ConflictReport,
+  MergeOptions,
+} from './merge.js';
 import { extensionOf } from './vfs-file.js';
 import type { ContentHandle, ContentSource, VFSNode } from './vfs-node.js';
 import type { Hash, LogRow, VFSEntry, VFSFile } from './types.js';
@@ -27,6 +32,13 @@ export interface SyncOptions {
   /** Turn off the automatic three-way merge of text files. */
   autoMerge?: boolean;
   /**
+   * Whether to open a closed log segment when a conflict's loser is older than
+   * the active one. Defaults to `true`. Turning it off trades a cold read for
+   * the occasional conflict copy that need not have been kept — never for a
+   * different outcome.
+   */
+  archives?: boolean;
+  /**
    * Interactive resolution for a text conflict. Returning content settles it;
    * returning `null` — or leaving the hook out — takes the headless path of
    * last-writer-wins, a copy, and a pending decision.
@@ -47,8 +59,9 @@ export interface SyncResult {
 }
 
 /**
- * Syncs one edge of the mesh (§5). No ancestor negotiation: both peers read the
- * other's header, compare one digest, and only go further if it differs.
+ * Syncs one edge of the mesh (§5). No ancestor negotiation: both sides are
+ * reconciled, one `state` digest is compared, and nothing else happens unless it
+ * differs.
  *
  * Nothing is assumed about who else either peer talks to, which is what lets
  * changes travel down a chain (A <-> B <-> C) one edge at a time — and the log
@@ -119,7 +132,7 @@ export async function sync(a: VFSNode, b: VFSNode, options: SyncOptions = {}): P
   const other = { peer: b.id, entries: fileB.entries, knows: (uuid: string) => ownB.knows(uuid) };
 
   // ---- merge
-  const merge = mergeEntries(sides, other, {
+  const mergeOptions: MergeOptions = {
     history,
     heldAt: options.heldAt ?? HELD_AT,
     text: (path) => {
@@ -128,7 +141,26 @@ export async function sync(a: VFSNode, b: VFSNode, options: SyncOptions = {}): P
     },
     ...(options.conflictCopies !== undefined ? { conflictCopies: options.conflictCopies } : {}),
     ...(options.conflictName ? { conflictName: options.conflictName } : {}),
-  });
+  };
+  let merge = mergeEntries(sides, other, mergeOptions);
+
+  // A conflict whose loser predates the active segment may not be one at all:
+  // the link that would prove ancestry is in a closed archive. Reading it is the
+  // one cold read in the protocol, and it is optional by design — it can only
+  // ever *avoid* a conflict copy, never change what the state ends up being.
+  if (options.archives !== false) {
+    const oldest = coldest(merge.conflicts);
+    if (oldest !== null) {
+      const rows = [
+        ...(await readArchives(a, fileA, oldest)),
+        ...(await readArchives(b, fileB, oldest)),
+      ];
+      if (rows.length > 0) {
+        history.add(rows);
+        merge = mergeEntries(sides, other, mergeOptions);
+      }
+    }
+  }
 
   // ---- text: try to settle a content conflict rather than park a copy
   const overlay = new Map<Hash, Uint8Array>();
@@ -234,6 +266,43 @@ function needsLog(left: VFSEntry[], right: VFSEntry[]): boolean {
   }
   const mine = new Set(left.map((entry) => entry.uuid));
   return right.some((entry) => !mine.has(entry.uuid));
+}
+
+/**
+ * The `updated` of the oldest losing version among the conflicts a copy would be
+ * kept for, or `null` when there is nothing an archive could help with.
+ *
+ * Location conflicts are excluded: they never keep a copy, so nothing is saved
+ * by proving ancestry for them.
+ */
+function coldest(conflicts: ConflictReport[]): number | null {
+  let oldest: number | null = null;
+  for (const report of conflicts) {
+    if (report.kind === 'location' || report.kind === 'kind') continue;
+    const loser = report.winner === 'a' ? report.b : report.a;
+    if (!loser) continue;
+    if (oldest === null || loser.updated < oldest) oldest = loser.updated;
+  }
+  return oldest;
+}
+
+/**
+ * Rows from the closed segments that could hold links at or after `since`.
+ *
+ * Segments are named for the moment they closed, so any archive stamped before
+ * `since` is entirely older than the version in question and cannot contain the
+ * link being looked for. They are immutable, so the store caches them for good —
+ * and a segment that has been deleted (§3 says they are deletable) simply
+ * contributes nothing, which degrades to the conflict copy that would have been
+ * kept anyway.
+ */
+async function readArchives(node: VFSNode, file: VFSFile, since: number): Promise<LogRow[]> {
+  const out: LogRow[] = [];
+  for (const segment of file.log.archives ?? []) {
+    if (segment < since) continue;
+    out.push(...(await node.store.readArchive(segment)));
+  }
+  return out;
 }
 
 /** The tail of a peer's active segment, or the whole of it when the peer rotated. */

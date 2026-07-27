@@ -373,3 +373,49 @@ describe('defaultConflictName', () => {
     ).toBe('LICENSE (conflict p abcdef12)');
   });
 });
+
+describe('History', () => {
+  it('reads a log row and an entry as the same kind of link', () => {
+    const history = History.from([
+      [{ uuid: '1', at: 10, type: 'write', path: 'a.md', hash: 'mid', prev: 'old' } as unknown as LogRow],
+      [entry({ uuid: '1', path: 'a.md', hash: 'new', prev: 'mid', updated: 20 })],
+    ]);
+    expect(history.descends('1', 'new', 'old')).toBe(true);
+    expect(history.descends('1', 'old', 'new')).toBe(false);
+    // Nothing to descend from is not an ancestry claim.
+    expect(history.descends('1', 'new', null)).toBe(false);
+  });
+
+  it('keeps the latest record of a uuid, whichever source it came from', () => {
+    const history = History.from([
+      [{ uuid: '1', at: 10, type: 'write', path: 'a.md', hash: 'h' } as unknown as LogRow],
+      [{ uuid: '1', at: 30, type: 'delete', path: 'a.md' } as unknown as LogRow],
+      [{ uuid: '1', at: 20, type: 'write', path: 'a.md', hash: 'h2' } as unknown as LogRow],
+    ]);
+    expect(history.last('1')).toMatchObject({ at: 30, deleted: true });
+    expect(history.last('nobody')).toBeUndefined();
+  });
+
+  it('finds the nearest common ancestor, or says there is none', () => {
+    const history = History.from([
+      [
+        { uuid: '1', at: 1, type: 'write', path: 'a', hash: 'base', prev: null } as unknown as LogRow,
+        { uuid: '1', at: 2, type: 'write', path: 'a', hash: 'left', prev: 'base' } as unknown as LogRow,
+        { uuid: '1', at: 3, type: 'write', path: 'a', hash: 'right', prev: 'base' } as unknown as LogRow,
+      ],
+    ]);
+    expect(history.commonAncestor('1', { hash: 'left' }, { hash: 'right' })).toBe('base');
+    expect(history.commonAncestor('1', { hash: 'left' }, { hash: 'unrelated' })).toBeNull();
+  });
+
+  it('walks a path chain without looping on a cycle', () => {
+    const history = History.from([
+      [
+        { uuid: '1', at: 1, type: 'rename', path: 'b', prevPath: 'a' } as unknown as LogRow,
+        { uuid: '1', at: 2, type: 'rename', path: 'a', prevPath: 'b' } as unknown as LogRow,
+      ],
+    ]);
+    expect(history.movedFrom('1', 'b', 'b')).toBe(true);
+    expect(history.movedFrom('1', 'b', 'nowhere')).toBe(false);
+  });
+});

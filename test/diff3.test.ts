@@ -89,3 +89,41 @@ describe('diff3', () => {
     expect(merged).toContain('<name>Altered Beast (USA)</name>');
   });
 });
+
+describe('diff3 internals', () => {
+  /**
+   * The LCS anchors on what survives, so an edit in the middle of a long
+   * unchanged file produces one small hunk rather than a rewrite of everything.
+   */
+  it('anchors on the unchanged lines around an interior edit', () => {
+    const lines = Array.from({ length: 40 }, (_, i) => `line ${i}\n`);
+    const base = lines.join('');
+    const mine = lines.map((line, i) => (i === 5 ? 'line five\n' : line)).join('');
+    const theirs = lines.map((line, i) => (i === 30 ? 'line thirty\n' : line)).join('');
+
+    const merged = ok(diff3(base, mine, theirs));
+    expect(merged).toContain('line five\n');
+    expect(merged).toContain('line thirty\n');
+    expect(splitLines(merged)).toHaveLength(40);
+  });
+
+  /** Reordering is a delete plus an insert to the LCS, and both sides get theirs. */
+  it('merges a reorder on one side with an append on the other', () => {
+    const base = 'a\nb\nc\n';
+    expect(ok(diff3(base, 'b\na\nc\n', 'a\nb\nc\nd\n'))).toBe('b\na\nc\nd\n');
+  });
+
+  it('handles a side that shares nothing with the base', () => {
+    expect(diff3('a\nb\n', 'x\ny\n', 'a\nb\n').ok).toBe(true);
+    expect(ok(diff3('a\nb\n', 'x\ny\n', 'a\nb\n'))).toBe('x\ny\n');
+    // ...and when both replace it wholesale, differently, there is nothing to merge.
+    expect(diff3('a\nb\n', 'x\n', 'y\n').ok).toBe(false);
+  });
+
+  it('refuses a diff whose table would be pathological', () => {
+    // Distinct lines on both sides, past the LCS cell cap.
+    const left = Array.from({ length: 2100 }, (_, i) => `L${i}\n`).join('');
+    const right = Array.from({ length: 2100 }, (_, i) => `R${i}\n`).join('');
+    expect(diff3(left, right, left)).toEqual({ ok: false, reason: 'size' });
+  });
+});

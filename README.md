@@ -38,8 +38,8 @@ const result = await sync(laptop, phone);
 ```
 
 Both folders now hold the same files and the same `state` digest. `sync` reconciles both sides for
-you — and a sync with nothing to do is **one range read per peer**, because that digest sits in the
-header of `vfs.json` and answers "is there anything to do?" on its own.
+you, and that digest is what makes a quiet sync quiet: one comparison decides there is nothing to
+transfer, nothing to merge and nothing to append.
 
 ### Editing and syncing back
 
