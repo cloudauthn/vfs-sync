@@ -37,6 +37,24 @@ const result = await sync(laptop, phone);
 // { changed: true, conflicts: [], transferred: { toA: 0, toB: 1 }, merged: 0, state: '4a28fc…' }
 ```
 
+Ask for confirmation inside `sync`:
+
+```ts
+import { sync } from '@cloudauthn/vfs-sync';
+
+const result = await sync(laptop, phone, {
+  async approveMerge(preview) {
+    // preview.actions.toA / preview.actions.toB
+    // preview.conflicts
+    return userConfirmed(preview);
+  },
+});
+
+if (!result.approved) {
+  console.log('sync cancelled by user');
+}
+```
+
 Both folders now hold the same files and the same `state` digest. `sync` reconciles both sides for
 you, and that digest is what makes a quiet sync quiet: one comparison decides there is nothing to
 transfer, nothing to merge and nothing to append.

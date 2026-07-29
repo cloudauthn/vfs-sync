@@ -6,6 +6,7 @@ Everything is exported from `@cloudauthn/vfs-sync`, except `NodeFsAdapter`, whic
 - [VFSNode](#vfsnode)
 - [Conflicts](#conflicts)
 - [sync](#sync)
+- [syncDryRun](#syncdryrun)
 - [syncMesh / syncUntilStable](#syncmesh--syncuntilstable)
 - [mergeEntries](#mergeentries)
 - [History](#history)
@@ -226,6 +227,7 @@ Syncs one edge. Both peers end up with identical content and the same `state` di
 | `heldAt` | 64 MB | Size from which a conflict copy stays on the peer that made it. |
 | `autoMerge` | `true` | Set `false` to skip the three-way merge of text. |
 | `resolveText` | none | Hook for interactive text resolution; return `null` for the headless path. |
+| `approveMerge` | none | Hook called with a preview before writes; return `false` to abort. |
 | `now` | `Date.now` | Clock for the sync's own bookkeeping. |
 
 Returns:
@@ -233,6 +235,7 @@ Returns:
 | Field | Type | Meaning |
 | --- | --- | --- |
 | `changed` | `boolean` | `false` when the two were already identical. |
+| `approved` | `boolean \| undefined` | `false` when approval vetoed the merge; `true` when approved. |
 | `conflicts` | `ConflictReport[]` | See [conflicts.md](./conflicts.md#reading-the-report). |
 | `transferred` | `{ toA: number; toB: number }` | Files copied in each direction. |
 | `merged` | `number` | Text conflicts settled by a three-way merge instead of a copy. |
@@ -245,6 +248,21 @@ if (!changed) console.log('nothing to do');
 console.log(`moved ${transferred.toA + transferred.toB} file(s), auto-merged ${merged}`);
 ```
 
+With confirmation:
+
+```ts
+const result = await sync(local, remote, {
+  async approveMerge(preview) {
+    showPreviewToUser(preview.actions, preview.conflicts);
+    return userAccepted();
+  },
+});
+
+if (result.approved === false) {
+  console.log('sync cancelled');
+}
+```
+
 `sync` reconciles both sides for you; calling `commit()` first is not required.
 
 A quiet edge costs the reconciliation and nothing more: one `state` comparison decides there is
@@ -252,6 +270,57 @@ nothing to transfer, nothing to merge and nothing to append. `sync(a, b)` drives
 reconciling a node means walking its working folder against its entries — so the floor here is that
 walk, not a single read. `VFSStore.header()` exists for the other case: inspecting a store you are
 not opening as a node.
+
+---
+
+## syncDryRun
+
+```ts
+const preview = await syncDryRun(a, b, options?);
+```
+
+Computes what `sync(a, b)` would do **without writing either side**. It still scans both peers, so
+pending local edits are included in the preview.
+
+Use this when the preview must be decoupled from `sync` (for example, preview now and apply later).
+
+Returns:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `changed` | `boolean` | `true` when a final `sync()` call would do work. |
+| `configChanged` | `boolean` | `true` when `storeId` or `text` convergence would happen. |
+| `conflicts` | `ConflictReport[]` | Conflicts the sync would produce. |
+| `transferred` | `{ toA: number; toB: number }` | Predicted file copies per direction. |
+| `merged` | `number` | Text conflicts that would auto-merge. |
+| `actions` | `{ toA: SyncDryRunAction[]; toB: SyncDryRunAction[] }` | Planned filesystem actions per peer. |
+| `state` | `Hash \| null` | Predicted converged state digest. |
+
+`SyncDryRunAction`:
+
+```ts
+type SyncDryRunActionType = 'write' | 'delete' | 'rename' | 'mkdir';
+
+interface SyncDryRunAction {
+  type: SyncDryRunActionType;
+  uuid: string;
+  kind: 'file' | 'directory';
+  path: string;
+  from?: string; // for rename
+  to?: string;   // for rename
+}
+```
+
+Typical confirm flow:
+
+```ts
+const preview = await syncDryRun(local, remote);
+showPreviewToUser(preview.actions, preview.conflicts);
+
+if (userAccepted()) {
+  await sync(local, remote);
+}
+```
 
 ---
 

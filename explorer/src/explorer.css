@@ -20,6 +20,7 @@
   --vfs-mono: ui-monospace, SFMono-Regular, Menlo, monospace;
 
   display: flex;
+  position: relative;
   flex-direction: column;
   height: var(--vfs-height, 660px);
   min-height: 420px;
@@ -921,12 +922,175 @@
   padding: 3px 10px;
 }
 
+.vfs-explorer .vfs-split {
+  display: inline-flex;
+  align-items: stretch;
+  position: relative;
+}
+
+.vfs-explorer .vfs-split-main {
+  border-top-right-radius: 0;
+  border-bottom-right-radius: 0;
+  margin-right: 0;
+}
+
+.vfs-explorer .vfs-split-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  line-height: 1;
+  min-width: 28px;
+  padding: 0 7px;
+  background: var(--vfs-accent);
+  border: 1px solid var(--vfs-accent);
+  border-left: 1px solid color-mix(in srgb, #000 25%, var(--vfs-accent));
+  border-top-left-radius: 0;
+  border-bottom-left-radius: 0;
+  border-top-right-radius: 7px;
+  border-bottom-right-radius: 7px;
+  color: #fff;
+}
+
+.vfs-explorer .vfs-split-toggle:hover {
+  filter: brightness(1.06);
+}
+
+.vfs-explorer .vfs-split-toggle[aria-expanded='true'] {
+  filter: brightness(1.06);
+}
+
+.vfs-explorer .vfs-split-pop {
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + 4px);
+  min-width: 170px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 4px;
+  border: 1px solid var(--vfs-line);
+  border-radius: 7px;
+  background: var(--vfs-panel);
+  box-shadow: 0 7px 20px rgb(0 0 0 / 25%);
+  z-index: 20;
+}
+
+.vfs-explorer .vfs-split-item {
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: 1px solid transparent;
+  padding: 5px 8px;
+}
+
+.vfs-explorer .vfs-split-item:hover:not(:disabled) {
+  background: var(--vfs-panel-2);
+  border-color: var(--vfs-line);
+}
+
+.vfs-explorer .vfs-split-item:disabled {
+  opacity: 0.45;
+}
+
 .vfs-explorer .vfs-switch {
   display: flex;
   align-items: center;
   gap: 5px;
   white-space: nowrap;
   cursor: pointer;
+}
+
+/* ------------------------------------------------------------------- modal */
+
+.vfs-explorer .vfs-modal-backdrop {
+  position: absolute;
+  inset: 0;
+  z-index: 60;
+  display: grid;
+  place-items: center;
+  padding: 18px;
+  background: rgb(0 0 0 / 45%);
+}
+
+.vfs-explorer .vfs-modal {
+  width: min(520px, 100%);
+  max-height: min(78vh, 760px);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  background: var(--vfs-panel);
+  border: 1px solid var(--vfs-line);
+  border-radius: 10px;
+  padding: 14px;
+  box-shadow: 0 14px 36px rgb(0 0 0 / 36%);
+}
+
+.vfs-explorer .vfs-modal-title {
+  margin: 0;
+  color: var(--vfs-text);
+  font-size: 13px;
+  letter-spacing: 0.01em;
+  text-transform: none;
+}
+
+.vfs-explorer .vfs-modal-message {
+  margin: 0;
+  white-space: pre-wrap;
+  color: var(--vfs-text);
+  font-size: 12.5px;
+}
+
+.vfs-explorer .vfs-modal-sections {
+  overflow: auto;
+  max-height: min(46vh, 440px);
+  padding-right: 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.vfs-explorer .vfs-modal-section {
+  border: 1px solid var(--vfs-line);
+  border-radius: 7px;
+  background: var(--vfs-panel-2);
+  padding: 7px 8px;
+}
+
+.vfs-explorer .vfs-modal-section h4 {
+  margin: 0 0 5px;
+  font-size: 11.5px;
+  letter-spacing: 0.01em;
+  color: var(--vfs-text);
+}
+
+.vfs-explorer .vfs-modal-section ul {
+  margin: 0;
+  padding-left: 16px;
+  display: grid;
+  gap: 3px;
+  font-size: 11.5px;
+  color: var(--vfs-text);
+}
+
+.vfs-explorer .vfs-modal-section li {
+  font-family: var(--vfs-mono);
+}
+
+.vfs-explorer .vfs-modal-input {
+  width: 100%;
+  font: inherit;
+  color: var(--vfs-text);
+  background: var(--vfs-panel-2);
+  border: 1px solid var(--vfs-line);
+  border-radius: 7px;
+  padding: 6px 8px;
+}
+
+.vfs-explorer .vfs-modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
 }
 
 /* --------------------------------------------------------------- narrow */

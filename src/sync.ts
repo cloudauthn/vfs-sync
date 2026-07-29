@@ -11,7 +11,8 @@ import type {
 } from './merge.js';
 import { extensionOf } from './vfs-file.js';
 import type { ContentHandle, ContentSource, VFSNode } from './vfs-node.js';
-import type { Hash, LogRow, VFSEntry, VFSFile } from './types.js';
+import { stateDigest } from './vfs-file.js';
+import type { EntryKind, Hash, LogRow, VFSEntry, VFSFile } from './types.js';
 
 export interface TextConflictInfo {
   path: string;
@@ -44,17 +45,55 @@ export interface SyncOptions {
    * last-writer-wins, a copy, and a pending decision.
    */
   resolveText?: (info: TextConflictInfo) => Promise<string | null>;
+  /**
+   * Called after planning and before any cross-peer writes. Return `false` to
+   * abort this sync pass.
+   */
+  approveMerge?: (preview: SyncDryRunResult) => Promise<boolean> | boolean;
 }
 
 export interface SyncResult {
   /** False when both folders were already identical. */
   changed: boolean;
+  /** False when an approval hook vetoed the merge before writes. */
+  approved?: boolean;
   conflicts: ConflictReport[];
   /** Content copies performed in each direction. */
   transferred: { toA: number; toB: number };
   /** Text conflicts settled by a three-way merge instead of a copy. */
   merged: number;
   /** The digest both peers end on, or `null` when the pair is empty. */
+  state: Hash | null;
+}
+
+export type SyncDryRunActionType = 'write' | 'delete' | 'rename' | 'mkdir';
+
+export interface SyncDryRunAction {
+  type: SyncDryRunActionType;
+  uuid: string;
+  kind: EntryKind;
+  path: string;
+  /** Present on `write` actions that create a new file on that side. */
+  created?: boolean;
+  from?: string;
+  to?: string;
+}
+
+export interface SyncDryRunResult {
+  /** False when the final `sync()` call would be a no-op. */
+  changed: boolean;
+  /** Whether `sync()` would first converge `storeId`/`text` config. */
+  configChanged: boolean;
+  conflicts: ConflictReport[];
+  /** Predicted content copies performed in each direction. */
+  transferred: { toA: number; toB: number };
+  /** Text conflicts that would settle via three-way merge. */
+  merged: number;
+  /** Paths that would be settled by text auto-merge. */
+  mergedPaths: string[];
+  /** Predicted file-system actions `sync()` would perform. */
+  actions: { toA: SyncDryRunAction[]; toB: SyncDryRunAction[] };
+  /** The digest both peers would end on after `sync()`. */
   state: Hash | null;
 }
 
@@ -174,8 +213,50 @@ export async function sync(a: VFSNode, b: VFSNode, options: SyncOptions = {}): P
     enabled: options.autoMerge !== false,
     ...(options.resolveText ? { resolveText: options.resolveText } : {}),
   });
+  const mergedCount = merged.count;
+  const mergedPaths = merged.paths;
 
   const target = merge.entries;
+
+  const planA = planChanges(fileA.entries, target, a.id);
+  const planB = planChanges(fileB.entries, target, b.id);
+  const overlayHashes = new Set(overlay.keys());
+  const remoteFromB = new Set(fileHashes(fileB.entries));
+  const remoteForB = new Set([...fileHashes(target), ...fileHashes(fileA.entries)]);
+  const previewTransferred = {
+    toA: countTransfers(planA.writes, planA.localHashes, overlayHashes, remoteFromB),
+    toB: countTransfers(planB.writes, planB.localHashes, overlayHashes, remoteForB),
+  };
+  const previewState = await stateDigest(target);
+
+  const approve = options.approveMerge;
+  if (approve) {
+    const approved = await approve({
+      changed:
+        configChanged ||
+        merge.conflicts.length > 0 ||
+        mergedCount > 0 ||
+        planA.actions.length > 0 ||
+        planB.actions.length > 0,
+      configChanged,
+      conflicts: merge.conflicts,
+      transferred: previewTransferred,
+      merged: mergedCount,
+      mergedPaths,
+      actions: { toA: planA.actions, toB: planB.actions },
+      state: previewState,
+    });
+    if (!approved) {
+      return {
+        changed: false,
+        approved: false,
+        conflicts: merge.conflicts,
+        transferred: { toA: 0, toB: 0 },
+        merged: mergedCount,
+        state: null,
+      };
+    }
+  }
 
   // ---- 6. content moves, verified on arrival
   const transferred = { toA: 0, toB: 0 };
@@ -207,11 +288,266 @@ export async function sync(a: VFSNode, b: VFSNode, options: SyncOptions = {}): P
 
   return {
     changed: true,
+    approved: true,
     conflicts: merge.conflicts,
     transferred,
-    merged,
-    state: (await a.file()).state,
+    merged: mergedCount,
+    state: previewState,
   };
+}
+
+/**
+ * Computes what `sync(a, b)` would do, without writing either folder.
+ *
+ * It still scans both sides (like `sync` does through `commit`) so the preview
+ * includes pending local edits, but it appends no log rows and performs no
+ * content writes.
+ */
+export async function syncDryRun(
+  a: VFSNode,
+  b: VFSNode,
+  options: SyncOptions = {},
+): Promise<SyncDryRunResult> {
+  if (a === b) {
+    return {
+      changed: false,
+      configChanged: false,
+      conflicts: [],
+      transferred: { toA: 0, toB: 0 },
+      merged: 0,
+      mergedPaths: [],
+      actions: { toA: [], toB: [] },
+      state: await a.state(),
+    };
+  }
+
+  const now = options.now ?? (() => Date.now());
+  const at = now();
+  const [scanA, scanB] = await Promise.all([a.scan(), b.scan()]);
+  const fileA = await a.file();
+  const fileB = await b.file();
+
+  const entriesA = scanA.entries;
+  const entriesB = scanB.entries;
+
+  const storeId = [fileA.storeId, fileB.storeId].sort()[0] as string;
+  const text = [...new Set([...fileA.text, ...fileB.text])].sort();
+  const configChanged =
+    fileA.storeId !== storeId ||
+    fileB.storeId !== storeId ||
+    fileA.text.join() !== text.join() ||
+    fileB.text.join() !== text.join();
+
+  const sources: Array<Iterable<LogRow> | Iterable<VFSEntry>> = [entriesA, entriesB, scanA.rows, scanB.rows];
+  let rowsA: LogRow[] = [];
+  let rowsB: LogRow[] = [];
+  const ownA = History.from([entriesA, scanA.rows]);
+  const ownB = History.from([entriesB, scanB.rows]);
+
+  if (needsLog(entriesA, entriesB)) {
+    rowsA = await a.store.logRows();
+    rowsB = await readPeerLog(b, fileA.peers[b.id]);
+    const snapA = await a.store.readSnapshot(fileA);
+    const snapB = await b.store.readSnapshot(fileB);
+    ownA.add(rowsA).add(snapA);
+    ownB.add(rowsB).add(snapB);
+    sources.push(rowsA, rowsB, snapA, snapB);
+  }
+  const history = History.from(sources);
+
+  const sides = { peer: a.id, entries: entriesA, knows: (uuid: string) => ownA.knows(uuid) };
+  const other = { peer: b.id, entries: entriesB, knows: (uuid: string) => ownB.knows(uuid) };
+
+  const mergeOptions: MergeOptions = {
+    history,
+    heldAt: options.heldAt ?? HELD_AT,
+    text: (path) => {
+      const extension = extensionOf(path);
+      return extension !== '' && text.includes(extension);
+    },
+    ...(options.conflictCopies !== undefined ? { conflictCopies: options.conflictCopies } : {}),
+    ...(options.conflictName ? { conflictName: options.conflictName } : {}),
+  };
+  let merge = mergeEntries(sides, other, mergeOptions);
+
+  if (options.archives !== false) {
+    const oldest = coldest(merge.conflicts);
+    if (oldest !== null) {
+      const rows = [
+        ...(await readArchives(a, fileA, oldest)),
+        ...(await readArchives(b, fileB, oldest)),
+      ];
+      if (rows.length > 0) {
+        history.add(rows);
+        merge = mergeEntries(sides, other, mergeOptions);
+      }
+    }
+  }
+
+  const overlay = new Map<Hash, Uint8Array>();
+  const merged = await autoMergeText(a, b, merge, history, {
+    overlay,
+    rows: [],
+    batch: randomId(),
+    at,
+    enabled: options.autoMerge !== false,
+    ...(options.resolveText ? { resolveText: options.resolveText } : {}),
+  });
+  const mergedCount = merged.count;
+  const mergedPaths = merged.paths;
+
+  const target = merge.entries;
+  const planA = planChanges(entriesA, target, a.id);
+  const planB = planChanges(entriesB, target, b.id);
+
+  const overlayHashes = new Set(overlay.keys());
+  const remoteFromB = new Set(fileHashes(entriesB));
+  const remoteForB = new Set([...fileHashes(target), ...fileHashes(entriesA)]);
+
+  const transferred = {
+    toA: countTransfers(planA.writes, planA.localHashes, overlayHashes, remoteFromB),
+    toB: countTransfers(planB.writes, planB.localHashes, overlayHashes, remoteForB),
+  };
+
+  const changed =
+    configChanged ||
+    merge.conflicts.length > 0 ||
+    mergedCount > 0 ||
+    planA.actions.length > 0 ||
+    planB.actions.length > 0;
+
+  return {
+    changed,
+    configChanged,
+    conflicts: merge.conflicts,
+    transferred,
+    merged: mergedCount,
+    mergedPaths,
+    actions: { toA: planA.actions, toB: planB.actions },
+    state: await stateDigest(target),
+  };
+}
+
+interface PlannedChanges {
+  actions: SyncDryRunAction[];
+  writes: VFSEntry[];
+  localHashes: Set<Hash>;
+}
+
+function planChanges(currentEntries: VFSEntry[], target: VFSEntry[], nodeId: string): PlannedChanges {
+  const current = new Map(currentEntries.map((entry) => [entry.uuid, entry]));
+  const currentLive = currentEntries.filter((entry) => !entry.deleted);
+  const targetByUuid = new Set(target.map((entry) => entry.uuid));
+
+  const actions: SyncDryRunAction[] = [];
+  const writes: VFSEntry[] = [];
+
+  for (const entry of target) {
+    const before = current.get(entry.uuid);
+    const wasLive = !!before && !before.deleted;
+    if (entry.deleted) {
+      if (wasLive && before) {
+        actions.push({
+          type: 'delete',
+          uuid: before.uuid,
+          kind: before.kind,
+          path: before.path,
+        });
+      }
+      continue;
+    }
+    if (entry.held && entry.held !== nodeId) continue;
+
+    if (wasLive && before && before.path !== entry.path) {
+      actions.push({
+        type: 'rename',
+        uuid: entry.uuid,
+        kind: entry.kind,
+        path: entry.path,
+        from: before.path,
+        to: entry.path,
+      });
+    }
+
+    if (entry.kind === 'directory') {
+      if (!wasLive) {
+        actions.push({
+          type: 'mkdir',
+          uuid: entry.uuid,
+          kind: 'directory',
+          path: entry.path,
+        });
+      }
+      continue;
+    }
+
+    if (!wasLive || before?.hash !== entry.hash) {
+      writes.push(entry);
+      actions.push({
+        type: 'write',
+        uuid: entry.uuid,
+        kind: 'file',
+        path: entry.path,
+        ...(wasLive ? {} : { created: true }),
+      });
+    }
+  }
+
+  for (const entry of currentLive) {
+    if (targetByUuid.has(entry.uuid)) continue;
+    actions.push({
+      type: 'delete',
+      uuid: entry.uuid,
+      kind: entry.kind,
+      path: entry.path,
+    });
+  }
+
+  const localHashes = new Set<Hash>();
+  for (const entry of currentLive) {
+    if (entry.kind !== 'file' || !entry.hash || entry.held) continue;
+    localHashes.add(entry.hash);
+  }
+
+  return {
+    actions: sortActions(actions),
+    writes,
+    localHashes,
+  };
+}
+
+function fileHashes(entries: VFSEntry[]): Hash[] {
+  const hashes: Hash[] = [];
+  for (const entry of entries) {
+    if (entry.deleted || entry.kind !== 'file' || !entry.hash || entry.held) continue;
+    hashes.push(entry.hash);
+  }
+  return hashes;
+}
+
+function countTransfers(
+  writes: VFSEntry[],
+  localHashes: Set<Hash>,
+  overlayHashes: Set<Hash>,
+  remoteHashes: Set<Hash>,
+): number {
+  let count = 0;
+  for (const entry of writes) {
+    if (!entry.hash) continue;
+    if (localHashes.has(entry.hash)) continue;
+    if (overlayHashes.has(entry.hash)) continue;
+    if (remoteHashes.has(entry.hash)) count++;
+  }
+  return count;
+}
+
+function sortActions(actions: SyncDryRunAction[]): SyncDryRunAction[] {
+  return [...actions].sort(
+    (x, y) =>
+      (x.path < y.path ? -1 : x.path > y.path ? 1 : 0) ||
+      (x.type < y.type ? -1 : x.type > y.type ? 1 : 0) ||
+      (x.uuid < y.uuid ? -1 : x.uuid > y.uuid ? 1 : 0),
+  );
 }
 
 /**
@@ -337,8 +673,9 @@ async function autoMergeText(
   merge: { entries: VFSEntry[]; conflicts: ConflictReport[] },
   history: History,
   context: AutoMergeContext,
-): Promise<number> {
+): Promise<{ count: number; paths: string[] }> {
   let count = 0;
+  const paths: string[] = [];
   for (const report of merge.conflicts) {
     if (!report.text || !report.a || !report.b) continue;
     if (!context.enabled && !context.resolveText) continue;
@@ -408,8 +745,9 @@ async function autoMergeText(
       ...(loser.hash ? { prev2: loser.hash } : {}),
     });
     count++;
+    paths.push(report.path);
   }
-  return count;
+  return { count, paths };
 }
 
 async function readAt(node: VFSNode, path: string): Promise<Uint8Array | null> {

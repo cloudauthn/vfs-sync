@@ -32,6 +32,7 @@ import type {
   MeshEdge,
   PeerMark,
   PendingConflict,
+  SyncDryRunResult,
   VFSEntry,
   VFSAdapter,
   VFSListEntry,
@@ -263,6 +264,18 @@ export interface LogEntry {
   kind: LogKind;
 }
 
+export interface ExplorerDialog {
+  kind: 'confirm' | 'prompt';
+  title: string;
+  message: string;
+  sections?: Array<{ title: string; items: string[] }>;
+  value?: string;
+  placeholder?: string;
+  okText?: string;
+  cancelText?: string;
+  danger?: boolean;
+}
+
 /** One folder's cached children, plus the `.vfs` probe that rides along. */
 interface BrowseListing {
   entries: VFSListEntry[];
@@ -275,6 +288,10 @@ interface BrowseListing {
 interface Peek {
   hash: Hash | null;
   text: string | null;
+}
+
+function uniqueSorted(items: string[]): string[] {
+  return [...new Set(items)].sort((a, b) => a.localeCompare(b));
 }
 
 /**
@@ -320,6 +337,7 @@ export class ExplorerModel {
   lastKind: LogKind = 'info';
   logs: LogEntry[] = [];
   snapshots = new Map<string, Snapshot>();
+  dialog: ExplorerDialog | null = null;
 
   sources: BrowseSource[] = [];
   /** Key of the filesystem the new-tab view is browsing. */
@@ -376,6 +394,7 @@ export class ExplorerModel {
   private gdriveSeq = 0;
   /** The one Drive source's token provider, reused so a refresh reaches its adapter. */
   private gdriveToken: (() => Promise<string>) | null = null;
+  private dialogResolve: ((answer: boolean | string | null) => void) | null = null;
 
   constructor(options: ExplorerOptions = {}) {
     this.options = options;
@@ -1012,7 +1031,13 @@ export class ExplorerModel {
     const sel = this.browseSel?.source === source.key ? this.browseSel : null;
     const base = sel ? (sel.kind === 'directory' ? sel.path : dirname(sel.path)) : '';
     const where = base ? `${source.label} / ${base}` : source.label;
-    const name = prompt(`New folder in ${where} (a / nests)`, 'new-folder');
+    const name = await this.askPrompt({
+      title: 'New folder',
+      message: `New folder in ${where} (a / nests)`,
+      value: 'new-folder',
+      placeholder: 'new-folder',
+      okText: 'Create',
+    });
     if (!name) return;
     try {
       const relative = normalizePath(name);
@@ -1043,7 +1068,13 @@ export class ExplorerModel {
 
   async deleteBrowseEntry(source: BrowseSource, path: string): Promise<void> {
     if (!source.adapter) return;
-    if (!confirm(`Delete ${path} and everything inside it?`)) return;
+    const ok = await this.askConfirm({
+      title: 'Delete folder',
+      message: `Delete ${path} and everything inside it?`,
+      okText: 'Delete',
+      danger: true,
+    });
+    if (!ok) return;
     try {
       // a tab open on this folder (or inside it) would be left dangling
       for (const peer of this.peers.filter(
@@ -1243,7 +1274,14 @@ export class ExplorerModel {
       }
       const label = adapter.name || 'local';
       const hasStore = await this.adapterHasStore(adapter);
-      if (!hasStore && !confirm(`${label} holds no .vfs store yet. Initialise it as a vFS root?`)) {
+      if (
+        !hasStore &&
+        !(await this.askConfirm({
+          title: 'Initialise vFS root',
+          message: `${label} holds no .vfs store yet. Initialise it as a vFS root?`,
+          okText: 'Initialise',
+        }))
+      ) {
         return;
       }
       // A disk folder is never MemFS, so seeding never applies and the emptiness
@@ -1568,7 +1606,13 @@ export class ExplorerModel {
   }
 
   async newFile(peer: Peer): Promise<void> {
-    const name = prompt('File name (a / creates a folder)', 'untitled.md');
+    const name = await this.askPrompt({
+      title: 'New file',
+      message: 'File name (a / creates a folder)',
+      value: 'untitled.md',
+      placeholder: 'untitled.md',
+      okText: 'Create',
+    });
     if (!name || this.refuseControl(normalizePath(name))) return;
     await peer.node.write(name, this.encoder.encode(''));
     this.log(`created ${name} on ${peer.label}`);
@@ -1578,7 +1622,12 @@ export class ExplorerModel {
 
   async renameFile(peer: Peer, path: string): Promise<void> {
     if (this.refuseControl(path)) return;
-    const name = prompt('Rename to', path);
+    const name = await this.askPrompt({
+      title: 'Rename',
+      message: 'Rename to',
+      value: path,
+      okText: 'Rename',
+    });
     if (!name || name === path || this.refuseControl(normalizePath(name))) return;
     // Goes through the node, not the adapter, so the rename is recorded as
     // intent and travels as a rename rather than as delete + create.
@@ -1590,7 +1639,13 @@ export class ExplorerModel {
 
   async deleteFile(peer: Peer, path: string): Promise<void> {
     if (this.refuseControl(path)) return;
-    if (!confirm(`Delete ${path} from ${peer.label}?`)) return;
+    const ok = await this.askConfirm({
+      title: 'Delete file',
+      message: `Delete ${path} from ${peer.label}?`,
+      okText: 'Delete',
+      danger: true,
+    });
+    if (!ok) return;
     await peer.node.delete(path);
     this.log(`deleted ${path} on ${peer.label}`);
     await this.render();
@@ -1629,14 +1684,124 @@ export class ExplorerModel {
 
   /** Syncs the open root against the footer's target — or the whole chain. */
   async syncTarget(): Promise<void> {
-    if (this.syncTargetKey === ALL_ROOTS || this.syncTargetKey === this.active) return this.syncAll();
+    return this.syncTargetCommon(false);
+  }
+
+  /** Same target flow, but asks for approval before applying a pair merge. */
+  async syncTargetWithConfirm(): Promise<void> {
+    return this.syncTargetCommon(true);
+  }
+
+  private async syncTargetCommon(confirmMerge: boolean): Promise<void> {
+    if (this.syncTargetKey === ALL_ROOTS || this.syncTargetKey === this.active) {
+      if (confirmMerge) {
+        const ok = await this.askConfirm({
+          title: 'Sync all roots',
+          message:
+            `Sync all roots now?\n\n` +
+            `${this.edges.length} edge(s) will be processed until the chain settles.`,
+          okText: 'Sync',
+        });
+        if (!ok) {
+          this.log('sync cancelled');
+          return;
+        }
+      }
+      return this.syncAll();
+    }
     const a = this.activePeer();
     const b = this.peerOf(this.syncTargetKey);
     if (!a || !b || this.syncing) return;
+
+    const approveMerge = confirmMerge
+      ? async (preview: SyncDryRunResult) => {
+          if (!preview.changed) return true;
+
+          const changes = uniqueSorted([
+            ...preview.actions.toA
+              .filter((action) => action.type === 'write' && !action.created)
+              .map((action) => `→ ${a.label}: ${action.path}`),
+            ...preview.actions.toB
+              .filter((action) => action.type === 'write' && !action.created)
+              .map((action) => `→ ${b.label}: ${action.path}`),
+            ...preview.actions.toA
+              .filter((action) => action.type === 'rename')
+              .map((action) => `→ ${a.label}: ${action.from ?? action.path} -> ${action.to ?? action.path}`),
+            ...preview.actions.toB
+              .filter((action) => action.type === 'rename')
+              .map((action) => `→ ${b.label}: ${action.from ?? action.path} -> ${action.to ?? action.path}`),
+          ]);
+
+          const creates = uniqueSorted([
+            ...preview.actions.toA
+              .filter((action) => action.type === 'write' && action.created)
+              .map((action) => `→ ${a.label}: ${action.path}`),
+            ...preview.actions.toB
+              .filter((action) => action.type === 'write' && action.created)
+              .map((action) => `→ ${b.label}: ${action.path}`),
+            ...preview.actions.toA
+              .filter((action) => action.type === 'mkdir')
+              .map((action) => `→ ${a.label}: ${action.path}/`),
+            ...preview.actions.toB
+              .filter((action) => action.type === 'mkdir')
+              .map((action) => `→ ${b.label}: ${action.path}/`),
+          ]);
+
+          const mergedText = uniqueSorted(preview.mergedPaths);
+
+          const deletes = uniqueSorted([
+            ...preview.actions.toA
+              .filter((action) => action.type === 'delete')
+              .map((action) => `→ ${a.label}: ${action.path}`),
+            ...preview.actions.toB
+              .filter((action) => action.type === 'delete')
+              .map((action) => `→ ${b.label}: ${action.path}`),
+          ]);
+
+          const conflicts = uniqueSorted(
+            preview.conflicts.map((conflict) =>
+              conflict.copy
+                ? `${conflict.path} (${conflict.kind}) -> copy: ${conflict.copy.path}`
+                : `${conflict.path} (${conflict.kind})`,
+            ),
+          );
+
+          const lines = [
+            `${a.label} ⇄ ${b.label}`,
+            '',
+            `to ${a.label}: ${preview.actions.toA.length} action(s)`,
+            `to ${b.label}: ${preview.actions.toB.length} action(s)`,
+            `estimated transfers: ${preview.transferred.toA + preview.transferred.toB}`,
+            `text merges: ${preview.merged}`,
+            `conflicts: ${preview.conflicts.length}`,
+            '',
+            'Apply this sync?',
+          ];
+          return this.askConfirm({
+            title: 'Confirm sync',
+            message: lines.join('\n'),
+            sections: [
+              { title: 'Files that change', items: changes },
+              { title: 'Files that are created', items: creates },
+              { title: 'Files updated via text merge', items: mergedText },
+              { title: 'Files that are deleted', items: deletes },
+              { title: 'Conflicts', items: conflicts },
+            ],
+            okText: 'Apply',
+          });
+        }
+      : undefined;
+
     this.syncing = true;
     this.emit();
     try {
-      const result = await sync(a.node, b.node);
+      const result = await sync(a.node, b.node, {
+        ...(approveMerge ? { approveMerge } : {}),
+      });
+      if (result.approved === false) {
+        this.log(`${a.label} ⇄ ${b.label}: sync cancelled`);
+        return;
+      }
       const moved = result.transferred.toA + result.transferred.toB;
       if (!result.changed) this.log(`${a.label} ⇄ ${b.label}: already in sync`);
       else this.log(`${a.label} ⇄ ${b.label}: merged, ${moved} blob(s) moved`, 'ok');
@@ -1733,5 +1898,62 @@ export class ExplorerModel {
   destroy(): void {
     this.setAutoSync(false);
     this.listeners.clear();
+  }
+
+  // ------------------------------------------------------------------- modal
+
+  private async askConfirm(dialog: Omit<ExplorerDialog, 'kind'>): Promise<boolean> {
+    this.closeDialog(false);
+    this.dialog = {
+      kind: 'confirm',
+      cancelText: 'Cancel',
+      okText: 'OK',
+      ...dialog,
+    };
+    this.emit();
+    return new Promise<boolean>((resolve) => {
+      this.dialogResolve = (answer) => resolve(Boolean(answer));
+    });
+  }
+
+  private async askPrompt(dialog: Omit<ExplorerDialog, 'kind'>): Promise<string | null> {
+    this.closeDialog(null);
+    this.dialog = {
+      kind: 'prompt',
+      cancelText: 'Cancel',
+      okText: 'OK',
+      value: dialog.value ?? '',
+      ...dialog,
+    };
+    this.emit();
+    return new Promise<string | null>((resolve) => {
+      this.dialogResolve = (answer) => (typeof answer === 'string' ? resolve(answer) : resolve(null));
+    });
+  }
+
+  setDialogValue(value: string): void {
+    if (!this.dialog || this.dialog.kind !== 'prompt') return;
+    this.dialog = { ...this.dialog, value };
+    this.emit();
+  }
+
+  acceptDialog(): void {
+    if (!this.dialog) return;
+    const answer = this.dialog.kind === 'prompt' ? this.dialog.value ?? '' : true;
+    this.closeDialog(answer);
+  }
+
+  cancelDialog(): void {
+    if (!this.dialog) return;
+    this.closeDialog(this.dialog.kind === 'prompt' ? null : false);
+  }
+
+  private closeDialog(answer: boolean | string | null): void {
+    if (!this.dialog && !this.dialogResolve) return;
+    const resolve = this.dialogResolve;
+    this.dialogResolve = null;
+    this.dialog = null;
+    this.emit();
+    resolve?.(answer);
   }
 }

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { sync, syncUntilStable } from '../src/sync.js';
+import { sync, syncDryRun, syncUntilStable } from '../src/sync.js';
 import { entryAt, files, get, peer, put } from './helpers.js';
 
 describe('sync', () => {
@@ -199,6 +199,60 @@ describe('sync', () => {
     expect(mark?.segment).toBe((await b.node.file()).log.segment);
     expect(mark?.digest).toBe((await b.node.file()).log.digest);
   });
+
+  it('previews changes without writing anything', async () => {
+    const a = await peer('device-a');
+    const b = await peer('device-b');
+    await put(a, 'notes.md', 'hello from A');
+
+    const dry = await syncDryRun(a.node, b.node);
+
+    expect(dry.changed).toBe(true);
+    expect(dry.actions.toA).toEqual([]);
+    expect(dry.actions.toB).toHaveLength(1);
+    expect(dry.actions.toB[0]?.type).toBe('write');
+    expect(dry.actions.toB[0]?.kind).toBe('file');
+    expect(dry.actions.toB[0]?.path).toBe('notes.md');
+    expect(files(b)).toEqual({});
+
+    await sync(a.node, b.node);
+    expect(files(b)).toEqual({ 'notes.md': 'hello from A' });
+  });
+
+  it('matches sync transfer counts on a simple preview', async () => {
+    const a = await peer('device-a');
+    const b = await peer('device-b');
+    await put(a, 'from-a.md', 'A');
+    await put(b, 'from-b.md', 'B');
+
+    const dry = await syncDryRun(a.node, b.node);
+    const applied = await sync(a.node, b.node);
+
+    expect(dry.transferred).toEqual(applied.transferred);
+    expect(dry.conflicts).toHaveLength(applied.conflicts.length);
+    expect(dry.merged).toBe(applied.merged);
+  });
+
+  it('can veto the merge before writes with approveMerge', async () => {
+    const a = await peer('device-a');
+    const b = await peer('device-b');
+    await put(a, 'notes.md', 'hello from A');
+
+    let called = 0;
+    const result = await sync(a.node, b.node, {
+      approveMerge: async (preview) => {
+        called++;
+        expect(preview.changed).toBe(true);
+        expect(preview.actions.toB.some((action) => action.path === 'notes.md')).toBe(true);
+        return false;
+      },
+    });
+
+    expect(called).toBe(1);
+    expect(result.approved).toBe(false);
+    expect(files(b)).toEqual({});
+  });
+
 });
 
 describe('the pruned tombstone', () => {

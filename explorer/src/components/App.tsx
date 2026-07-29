@@ -7,6 +7,7 @@ import { PeerDetails } from './PeerDetails';
 import { NewTabView } from './NewTabView';
 import { Drawer } from './Drawer';
 import { Footer } from './Footer';
+import { Modal } from './Modal';
 
 export function App({ model }: { model: ExplorerModel }): JSX.Element {
   useModel(model);
@@ -29,6 +30,7 @@ export function App({ model }: { model: ExplorerModel }): JSX.Element {
       </div>
       <Drawer model={model} />
       <Footer model={model} />
+      <Modal model={model} />
     </div>
   );
 }

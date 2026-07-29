@@ -86,8 +86,17 @@ export type {
   Side,
 } from './merge.js';
 
-export { sync, syncMesh, syncUntilStable } from './sync.js';
-export type { MeshEdge, MeshResult, SyncOptions, SyncResult, TextConflictInfo } from './sync.js';
+export { sync, syncDryRun, syncMesh, syncUntilStable } from './sync.js';
+export type {
+  MeshEdge,
+  MeshResult,
+  SyncDryRunAction,
+  SyncDryRunActionType,
+  SyncDryRunResult,
+  SyncOptions,
+  SyncResult,
+  TextConflictInfo,
+} from './sync.js';
 
 export { MemoryAdapter } from './adapters/memory.js';
 export type { MemoryAdapterOptions } from './adapters/memory.js';
