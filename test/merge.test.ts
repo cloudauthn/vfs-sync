@@ -348,6 +348,28 @@ describe('directories', () => {
     expect(entries.find((item) => item.uuid === 'c')?.path).toBe(`${moved}/one.jpg`);
     expect(conflicts.some((item) => item.kind === 'kind')).toBe(true);
   });
+
+  /**
+   * Moving a loser aside can collide in turn. A conflict copy derives its name
+   * from the path, the peer and the hash of the version it parks, and so does
+   * the aside name of a colliding entry — so a version copied here and another
+   * entry carrying that same version land on the identical name.
+   *
+   * Two live entries on one path is the one thing the tree may not contain:
+   * whichever is written second wins on disk and the other is silently gone.
+   */
+  it('resolves a collision the first pass created', () => {
+    const winner = entry({ uuid: 'u1', path: 'notes.md', hash: 'hA', updated: 3000 });
+    const loser = entry({ uuid: 'u1', path: 'notes.md', hash: 'hL', peer: 'device-b', updated: 1000 });
+    // Same peer and same hash as the loser, so it derives the same aside name.
+    const twin = entry({ uuid: 'u2', path: 'notes.md', hash: 'hL', peer: 'device-b', updated: 2000 });
+
+    const { entries } = mergeEntries(A(winner, twin), B(loser), { conflictCopies: 'always' });
+
+    const live = entries.filter((item) => !item.deleted).map((item) => item.path);
+    expect(new Set(live).size).toBe(live.length);
+    expect(entries.find((item) => item.uuid === 'u1')?.path).toBe('notes.md');
+  });
 });
 
 describe('defaultConflictName', () => {

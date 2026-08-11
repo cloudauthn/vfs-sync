@@ -289,6 +289,23 @@ export class VFSNode {
   // ----------------------------------------------------------------- scan
 
   /**
+   * Whether the current rule keeps this path out of the walk.
+   *
+   * The walk prunes at the directory and never descends, so a rule covering
+   * `.cache` also excludes `.cache/x` even when the predicate says nothing
+   * about the child. Testing the leaf alone would read those children as
+   * vanished, which is the very thing this exists to prevent.
+   */
+  private excluded(path: string): boolean {
+    if (!this.ignore) return false;
+    if (this.ignore(path)) return true;
+    for (let cut = path.lastIndexOf('/'); cut > 0; cut = path.lastIndexOf('/', cut - 1)) {
+      if (this.ignore(path.slice(0, cut))) return true;
+    }
+    return false;
+  }
+
+  /**
    * Reconciles the working folder into entries, and reports what changed as log
    * rows. Files whose `mtime`+`size` still match what was recorded are not
    * re-read — with catalogues of hundred-megabyte ROMs that filter stops being
@@ -328,9 +345,26 @@ export class VFSNode {
       seen.push({ path: item.path, stat: item.stat, hash });
     }
 
-    // 2. what disappeared — the pool a move outside the VFS is matched against
+    // 2. what disappeared — the pool a move outside the VFS is matched against.
+    //
+    //    Absence from the walk is not by itself evidence of deletion. There are
+    //    three reasons a path does not come back, and only the first is a
+    //    delete: the user removed it, the current rule filters it, or this node
+    //    never materialised the bytes. `mtime` separates them — it is deleted
+    //    on every adopt and only ever re-set from a real `stat()`, so it means
+    //    "this node has seen the file on disk", and it is absent exactly on the
+    //    entries whose bytes deliberately never travelled.
+    //
+    //    Erring here is asymmetric: a missed deletion is picked up on the next
+    //    pass, an invented one destroys the file on every other peer.
     const alive = new Set(seen.map((item) => item.path));
-    const vanished = live.filter((entry) => !alive.has(entry.path));
+    const absent = live.filter((entry) => !alive.has(entry.path));
+    const preserved = absent.filter((entry) => this.excluded(entry.path) || entry.mtime === undefined);
+    const kept = new Set(preserved.map((entry) => entry.uuid));
+    const vanished = absent.filter((entry) => !kept.has(entry.uuid));
+    // Preserved entries stay out of the pool below on purpose: still in it, a
+    // new file with the same content elsewhere would read as a move of one of
+    // them and would carry the entry away from the path it is holding.
     const vanishedByHash = new Map<Hash, VFSEntry[]>();
     for (const entry of vanished) {
       if (!entry.hash) continue;
@@ -422,7 +456,20 @@ export class VFSNode {
       }
     }
 
-    // 3. tombstones for everything previously known that is neither live nor
+    // 3. entries the walk did not return and that are not deletions, carried
+    //    over verbatim. Not `updated`, not `peer`: re-stamping would let an
+    //    entry nobody touched win a tiebreak by date it has not won. Marking
+    //    them `used` is what keeps the loop below from tombstoning them, and
+    //    the claim above from handing their uuid to another file.
+    //
+    //    Preserving is not an operation, so it emits no log rows.
+    for (const entry of preserved) {
+      if (used.has(entry.uuid)) continue; // already claimed above as a rename
+      used.add(entry.uuid);
+      entries.push(entry);
+    }
+
+    // 4. tombstones for everything previously known that is neither live nor
     //    accounted for as a rename target
     for (const entry of prev) {
       if (used.has(entry.uuid)) continue;
@@ -621,15 +668,20 @@ export class VFSNode {
       parkedContent.set(entry.hash as Hash, temp);
     }
 
-    // Deepest first, so a directory is only removed once it is empty.
-    deletes.sort((x, y) => y.path.length - x.path.length);
-    for (const doomed of deletes) {
+    // Doomed files go first: a rename may be waiting for its destination to be
+    // freed. Doomed *directories* wait until the renames have run — deleting
+    // one while a file is still on its way out takes the file with it, and the
+    // loss then travels as an ordinary delete. `roms` removed before
+    // `roms/game.bin -> moved/0/game.bin` is exactly that.
+    const doomedFiles = deletes.filter((item) => item.kind !== 'directory');
+    const doomedDirs = deletes.filter((item) => item.kind === 'directory');
+    for (const doomed of doomedFiles) {
       await this.adapter.delete(doomed.path);
       livePaths.delete(doomed.path);
     }
 
-    // A rename whose destination is still occupied (a swap, or a chain) has to
-    // step through a scratch path first.
+    // A rename whose destination is still occupied (a swap, a chain, or a
+    // folder that is about to go) has to step through a scratch path first.
     const parked: Array<{ temp: string; to: string }> = [];
     for (const rename of renames) {
       if (!livePaths.has(rename.to)) continue;
@@ -644,6 +696,16 @@ export class VFSNode {
       livePaths.delete(rename.from);
       livePaths.add(rename.to);
     }
+
+    // Deepest first, so a directory is only removed once it is empty — and now
+    // that whatever was leaving it has left.
+    doomedDirs.sort((x, y) => y.path.length - x.path.length);
+    for (const doomed of doomedDirs) {
+      await this.adapter.delete(doomed.path);
+      livePaths.delete(doomed.path);
+    }
+
+    // Last, so a rename onto a path a delete had to free lands on empty ground.
     for (const item of parked) {
       await this.adapter.rename(item.temp, item.to);
       livePaths.add(item.to);
@@ -781,7 +843,51 @@ export class VFSNode {
       await this.adapter.write(disputed.path, data);
     }
     await this.adapter.delete(copy.path).catch(() => undefined);
+    // A copy whose bytes never travelled has no file here to remove, and the
+    // scan reads absence as evidence only for content this node actually held.
+    // Deleting it therefore has to be said, not shown.
+    if (copy.held && copy.held !== this.id) await this.retire(copy.uuid);
     await this.commit();
+  }
+
+  /**
+   * Tombstones an entry outright, for the deletions `scan()` cannot see: an
+   * entry with no file behind it looks the same before and after.
+   */
+  private async retire(uuid: string): Promise<void> {
+    const file = await this.store.read();
+    const doomed = file.entries.find((entry) => entry.uuid === uuid);
+    if (!doomed || doomed.deleted) return;
+    const at = this.stamp(file);
+    file.entries = file.entries.map((entry) =>
+      entry.uuid === uuid
+        ? {
+            uuid,
+            kind: doomed.kind,
+            path: doomed.path,
+            hash: null,
+            size: 0,
+            created: doomed.created,
+            updated: at,
+            peer: this.id,
+            deleted: true,
+            prev: doomed.hash,
+          }
+        : entry,
+    );
+    const row = await makeRow({
+      batch: randomId(),
+      at,
+      peer: this.id,
+      uuid,
+      type: 'delete',
+      kind: doomed.kind,
+      path: doomed.path,
+      hash: null,
+      prev: doomed.hash,
+    });
+    await this.store.append([row], file);
+    await this.settle(file);
   }
 
   async baseOf(hash: Hash): Promise<Uint8Array | null> {

@@ -196,6 +196,16 @@ await syncUntilStable(reachable);
 `ignore` keeps paths out of sync completely — they are not hashed, committed or transferred, and
 never appear as deletes on the other side.
 
+It governs what a scan *watches*, not what exists. An already-tracked file that a new rule starts
+covering keeps its entry and stays live on every peer: the scan leaves it exactly as it was rather
+than reading its absence from the walk as a deletion. That is git's model, where `.gitignore` only
+governs the untracked, and it is what makes it safe to distribute a rule to a mesh one peer at a
+time — the peers that do not have it yet are the ones that would otherwise delete.
+
+The consequence is that **there is no way to untrack without deleting**. To make a tracked file
+disappear from the mesh, delete it deliberately; the rule then keeps it from coming back. Git asks
+for the same two steps with `git rm --cached`.
+
 ```ts
 const ignore = (path: string) =>
   path === 'node_modules' ||      // directories skip the whole subtree
@@ -206,8 +216,9 @@ const ignore = (path: string) =>
 const node = await VFSNode.open(adapter, { ignore });
 ```
 
-Use the same predicate on every peer. If one peer syncs a path another ignores, the ignoring peer
-receives the file but never reports it — it will look like it silently vanished.
+Use the same predicate on every peer. Where they differ, the file still arrives on the ignoring peer
+and its entry stays live there, but that peer stops watching it: an edit made locally is never
+noticed and never travels, so the two sides drift apart without either reporting anything.
 
 To read patterns from a file instead:
 

@@ -140,6 +140,14 @@ export class MemoryAdapter implements VFSAdapter {
       this.entries.delete(key);
       this.entries.set(`${to}${key.slice(from.length)}`, moved);
     }
+    // Empty folders are tracked apart from the files, so they have to move too.
+    // Left behind, the directory would still stat at the old path and stat as
+    // missing at the new one — and v2 syncs empty directories.
+    for (const key of [...this.dirs]) {
+      if (key !== from && !key.startsWith(`${from}/`)) continue;
+      this.dirs.delete(key);
+      this.dirs.add(`${to}${key.slice(from.length)}`);
+    }
   }
 
   async stat(path: string): Promise<VFSStat | null> {

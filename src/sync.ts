@@ -780,19 +780,23 @@ function chain(
         };
       }
       for (const candidate of candidates) {
-        const entry = candidate.entries.find(
-          (item) => !item.deleted && item.kind === 'file' && item.hash === hash && !item.held,
-        );
-        if (!entry) continue;
-        const stat = await candidate.node.stat(entry.path);
-        if (!stat || stat.kind !== 'file') continue;
-        onHit();
-        const path = entry.path;
-        return {
-          size: stat.size,
-          read: () => candidate.node.read(path),
-          stream: () => candidate.node.readStream(path),
-        };
+        // Every path this candidate claims to hold the bytes at, not just the
+        // first: one of them missing from disk does not mean the peer cannot
+        // serve the content. Duplicate content is ordinary, and an entry can
+        // legitimately have no file behind it — bytes that never travelled, or
+        // that this peer has not materialised.
+        for (const entry of candidate.entries) {
+          if (entry.deleted || entry.kind !== 'file' || entry.hash !== hash || entry.held) continue;
+          const stat = await candidate.node.stat(entry.path);
+          if (!stat || stat.kind !== 'file') continue;
+          onHit();
+          const path = entry.path;
+          return {
+            size: stat.size,
+            read: () => candidate.node.read(path),
+            stream: () => candidate.node.readStream(path),
+          };
+        }
       }
       return null;
     },

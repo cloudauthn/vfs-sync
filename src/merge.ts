@@ -341,58 +341,73 @@ function conflictCopy(
  * directory moves with everything under it. The winner is picked by the same
  * deterministic rule as everywhere else, and the loser (with its subtree) is
  * renamed aside in one go, so the tree is never inconsistent halfway through.
+ *
+ * Moving a loser aside can collide in turn, and not rarely: a conflict copy
+ * derives its name from the same path, peer and hash, so a version parked here
+ * and the copy made of that same version land on the identical name. Grouping
+ * once would leave two live entries on one path — the one thing the tree may
+ * not contain, because the second one to be written wins on disk and the other
+ * is silently gone. So this runs to a fixed point, and it terminates because
+ * every aside name is strictly longer than the name it was derived from.
  */
 function resolvePathCollisions(
   entries: VFSEntry[],
   conflicts: ConflictReport[],
   nameConflict: (info: ConflictNameInfo) => string,
 ): VFSEntry[] {
-  const byPath = new Map<string, VFSEntry[]>();
-  for (const entry of entries) {
-    if (entry.deleted) continue;
-    const bucket = byPath.get(entry.path);
-    if (bucket) bucket.push(entry);
-    else byPath.set(entry.path, [entry]);
-  }
-
-  const moves: Array<{ from: string; to: string }> = [];
-  for (const [path, bucket] of byPath) {
-    if (bucket.length < 2) continue;
-    const ranked = [...bucket].sort((x, y) => (pickNewer(x, y) === x ? -1 : 1));
-    const keeper = ranked[0] as VFSEntry;
-    for (const loser of ranked.slice(1)) {
-      const aside = nameConflict({
-        path,
-        peer: loser.peer,
-        hash: loser.hash ?? loser.uuid,
-        entry: loser,
-      });
-      moves.push({ from: loser.path, to: aside });
-      loser.prevPath = loser.path;
-      loser.path = aside;
-      loser.conflictOf ??= keeper.uuid;
-      loser.reason ??= keeper.kind === loser.kind ? 'binary' : 'kind';
-      // `winner` here is an index into this report's own `a`/`b`, not into the
-      // arguments of `sync(a, b)`: a path collision is between two entries, and
-      // which peer contributed each is not the question being answered.
-      conflicts.push({
-        uuid: loser.uuid,
-        kind: keeper.kind === loser.kind ? 'content' : 'kind',
-        path,
-        winner: 'a',
-        a: keeper,
-        b: loser,
-        copy: loser,
-      });
-    }
-  }
-
-  // A directory that lost its path takes its whole subtree along.
-  for (const move of moves) {
+  for (let round = 0; round <= entries.length; round++) {
+    const byPath = new Map<string, VFSEntry[]>();
     for (const entry of entries) {
-      if (!entry.path.startsWith(`${move.from}/`)) continue;
-      entry.prevPath = entry.path;
-      entry.path = `${move.to}${entry.path.slice(move.from.length)}`;
+      if (entry.deleted) continue;
+      const bucket = byPath.get(entry.path);
+      if (bucket) bucket.push(entry);
+      else byPath.set(entry.path, [entry]);
+    }
+    // By path, so that both peers work through a round in the same order —
+    // insertion order would follow how the merge happened to build the array.
+    const collided = [...byPath]
+      .filter(([, bucket]) => bucket.length > 1)
+      .sort(([left], [right]) => (left < right ? -1 : 1));
+    if (collided.length === 0) break;
+
+    const moves: Array<{ from: string; to: string }> = [];
+    for (const [path, bucket] of collided) {
+      const ranked = [...bucket].sort((x, y) => (pickNewer(x, y) === x ? -1 : 1));
+      const keeper = ranked[0] as VFSEntry;
+      for (const loser of ranked.slice(1)) {
+        const aside = nameConflict({
+          path,
+          peer: loser.peer,
+          hash: loser.hash ?? loser.uuid,
+          entry: loser,
+        });
+        moves.push({ from: loser.path, to: aside });
+        loser.prevPath = loser.path;
+        loser.path = aside;
+        loser.conflictOf ??= keeper.uuid;
+        loser.reason ??= keeper.kind === loser.kind ? 'binary' : 'kind';
+        // `winner` here is an index into this report's own `a`/`b`, not into the
+        // arguments of `sync(a, b)`: a path collision is between two entries, and
+        // which peer contributed each is not the question being answered.
+        conflicts.push({
+          uuid: loser.uuid,
+          kind: keeper.kind === loser.kind ? 'content' : 'kind',
+          path,
+          winner: 'a',
+          a: keeper,
+          b: loser,
+          copy: loser,
+        });
+      }
+    }
+
+    // A directory that lost its path takes its whole subtree along.
+    for (const move of moves) {
+      for (const entry of entries) {
+        if (!entry.path.startsWith(`${move.from}/`)) continue;
+        entry.prevPath = entry.path;
+        entry.path = `${move.to}${entry.path.slice(move.from.length)}`;
+      }
     }
   }
   return entries;
