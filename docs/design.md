@@ -1,188 +1,177 @@
-# VFS Sync — Diseño de sincronización multi-peer (OPFS / File System Access API / Google Drive)
+# VFS Sync — Multi-peer sync design (OPFS / File System Access API / Google Drive)
 
-> Este es el diseño de lo que está implementado hoy. [`design-v2.md`](./design-v2.md) propone
-> sustituir sus secciones 3, 5, 6, 7 y 8: `.vfs` de dos ficheros, sync por metadatos y sin almacén
-> de blobs. Las secciones 1, 2 y 4 siguen vigentes en v2.
+> This is the design of what is implemented today. [`design-v2.md`](./design-v2.md) proposes
+> replacing its sections 3, 5, 6, 7 and 8: a two-file `.vfs`, sync by metadata and no blob store.
+> Sections 1, 2 and 4 still hold in v2.
 
-## Objetivo
+## Goal
 
-Mecanismo de sincronización de carpetas entre cualquier combinación de proveedores:
+A folder sync mechanism across any combination of providers:
 - OPFS
-- File System Access API (sistema de archivos local, vía navegador)
-- Google Drive (eventualmente)
+- File System Access API (local file system, through the browser)
+- Google Drive (eventually)
 
-Debe soportar **cualquier combinación** de peers, incluyendo cadenas de varios nodos
-(ej. `OPFS <-> FS local <-> FS local <-> GDrive`), no solo pares fijos.
+It has to support **any combination** of peers, including chains of several nodes
+(e.g. `OPFS <-> local FS <-> local FS <-> GDrive`), not just fixed pairs.
 
-Pensado como parte reutilizable del SDK **cloudauthn** (junto con la parte de
-WebAuthn/passkeys), para usar en `play.germade` y `MusikMatch`.
+Meant as a reusable part of the **cloudauthn** SDK (alongside the WebAuthn/passkeys half), for use in
+`play.germade` and `MusikMatch`.
 
-## Modelo general: mesh, no hub-and-spoke
+## General model: mesh, not hub-and-spoke
 
-Todos los nodos actúan como pares entre sí. Cada nodo solo conoce a los peers con los
-que tiene una relación de sync **directa** — no hay conocimiento global del grafo ni de
-"peers de mis peers". La propagación en cadenas largas ocurre porque cada arista corre
-su propio ciclo de sync de forma independiente y periódica.
+Every node acts as a peer to every other. A node only knows the peers it has a **direct** sync
+relationship with — there is no global knowledge of the graph, nor of "my peers' peers". Propagation
+along long chains happens because each edge runs its own sync cycle independently and periodically.
 
-## 1. Capa de abstracción: VFSAdapter
+## 1. Abstraction layer: VFSAdapter
 
-Interfaz común que implementa cada backend:
+The common interface each backend implements:
 
 ```
 list(path)
 read(path)
 write(path, data)
 delete(path)
-rename(oldPath, newPath)   // operación de primera clase, no solo write+delete
+rename(oldPath, newPath)   // first-class operation, not just write+delete
 stat(path)                 // mtime, size
 ```
 
-Adaptadores necesarios:
-- **OPFS**: `FileSystemDirectoryHandle` / `FileSystemFileHandle`, `createSyncAccessHandle`
-  desde worker para acceso síncrono.
-- **File System Access API**: mismo modelo de handles (`showDirectoryPicker`), con el
-  matiz de que los permisos expiran y hay que volver a solicitarlos
-  (`requestPermission`) — complica la sync automática en background.
-- **Google Drive**: API REST (`files.list`, `files.get`, `files.create/update`),
-  `changes.list` + `pageToken` para sync incremental. Drive da un `fileId` estable
-  (ver sección de identidad).
+Adapters needed:
+- **OPFS**: `FileSystemDirectoryHandle` / `FileSystemFileHandle`, `createSyncAccessHandle` from a
+  worker for synchronous access.
+- **File System Access API**: the same handle model (`showDirectoryPicker`), with the wrinkle that
+  permissions expire and have to be requested again (`requestPermission`) — which complicates
+  automatic background sync.
+- **Google Drive**: REST API (`files.list`, `files.get`, `files.create/update`), `changes.list` +
+  `pageToken` for incremental sync. Drive provides a stable `fileId` (see the identity section).
 
-Empezar por OPFS y FSA (no dependen de OAuth); Drive se añade después sin tocar el motor.
+Start with OPFS and FSA (they do not depend on OAuth); Drive comes later without touching the engine.
 
-## 2. Carpeta de control `.vfs`
+## 2. The `.vfs` control folder
 
-Vive dentro de cada carpeta sincronizada, igual que `.git`. Debe **excluirse del diff**
-de contenido (si no, cada motor la trataría como archivo normal a sincronizar).
+It lives inside each synced folder, like `.git`. It has to be **excluded from the content diff**
+(otherwise every engine would treat it as an ordinary file to sync).
 
 ```
 .vfs/
-  config.json              # id único del nodo, lista de peers conocidos
-  objects/<hash[0:2]>/<hash>   # blobs y trees, content-addressed
+  config.json              # unique node id, list of known peers
+  objects/<hash[0:2]>/<hash>   # blobs and trees, content-addressed
   commits/<commit_hash>.json   # {tree, parents[], timestamp, peer}
-  known-commits.log         # índice plano: <hash> <timestamp> <parent(s)>
-  hash-cache.json           # {path: {hash, mtime, size}} — caché local de hashes
+  known-commits.log         # flat index: <hash> <timestamp> <parent(s)>
+  hash-cache.json           # {path: {hash, mtime, size}} — local hash cache
 ```
 
-> Nota: se simplificó el diseño eliminando `refs/<peer-id>` (puntero directo al último
-> commit en común con cada peer). Se decidió usar un único mecanismo —
-> `known-commits.log` — tanto para peers ya conocidos como para el primer encuentro
-> con un peer nuevo, en vez de mantener dos rutas distintas.
+> Note: the design was simplified by dropping `refs/<peer-id>` (a direct pointer to the last commit
+> in common with each peer). The decision was to use a single mechanism — `known-commits.log` — both
+> for already-known peers and for the first encounter with a new one, rather than maintaining two
+> separate paths.
 
 ### `known-commits.log`
-Índice plano de todos los commits que el nodo conoce (los propios + los aprendidos de
-otros peers al sincronizar). Convierte la búsqueda de ancestro común en una
-intersección de conjuntos (`misCommits ∩ susCommits`) en vez de recorrer el DAG
-objeto a objeto. Es el único mecanismo de negociación de ancestro común, tanto con
-peers ya conocidos como con peers nuevos. Análogo al `commit-graph` de git moderno:
-acelera la negociación sin cambiar el modelo de datos.
+A flat index of every commit the node knows about (its own plus the ones learned from other peers
+while syncing). It turns the search for a common ancestor into a set intersection
+(`myCommits ∩ theirCommits`) instead of walking the DAG object by object. It is the only
+common-ancestor negotiation mechanism, for both known and new peers. Analogous to modern git's
+`commit-graph`: it speeds up negotiation without changing the data model.
 
-## 3. Modelo de commits (estilo git)
+## 3. Commit model (git-style)
 
-- **Blob**: contenido de archivo, direccionado por `hash(contenido)`. Dedup automático
-  entre archivos/peers con el mismo contenido.
-- **Tree**: snapshot de la carpeta — lista de entradas `{id, path, hash, deleted,
-  renamed_from}`.
-- **Commit**: `{tree_hash, parents[], timestamp, peer_id}`. Un commit con dos padres
-  representa un merge entre dos peers.
+- **Blob**: file content, addressed by `hash(content)`. Automatic dedup across files and peers with
+  the same content.
+- **Tree**: folder snapshot — a list of entries `{id, path, hash, deleted, renamed_from}`.
+- **Commit**: `{tree_hash, parents[], timestamp, peer_id}`. A commit with two parents represents a
+  merge between two peers.
 
-### Identidad de archivo (`id`)
+### File identity (`id`)
 
-El diff no se hace solo por `path` — cada archivo tiene una identidad que sobrevive a
-renames:
-- **Drive**: usa el `fileId` nativo, estable ante renames sin necesidad de heurística.
-- **OPFS / FSA**: no hay id nativo → identidad sintética generada por el propio nodo.
-  - Se asigna la primera vez que un path se "descubre" (aparece sin id asignable ni por
-    continuidad de path ni por evento de rename ni por heurística de hash).
-  - Se conserva mientras el archivo exista, incluyendo tras renames.
-  - **Caso de reconciliación**: dos peers que descubren el mismo archivo de forma
-    independiente (sin sync previo entre ellos) le asignan ids distintos. En su primer
-    encuentro, el emparejamiento no puede basarse en id — cae de vuelta a comparar por
-    `path`/hash, y uno de los dos ids "gana" y se propaga como canónico de ahí en
-    adelante.
+The diff is not done by `path` alone — each file has an identity that survives renames:
+- **Drive**: uses the native `fileId`, stable across renames with no heuristics needed.
+- **OPFS / FSA**: no native id → a synthetic identity generated by the node itself.
+  - Assigned the first time a path is "discovered" (it shows up with no id assignable by path
+    continuity, rename event, or hash heuristic).
+  - Kept for as long as the file exists, including across renames.
+  - **Reconciliation case**: two peers that discover the same file independently (with no prior sync
+    between them) assign it different ids. On their first encounter, pairing cannot be based on id —
+    it falls back to comparing by `path`/hash, and one of the two ids "wins" and propagates as
+    canonical from then on.
 
-## 4. Detección de cambios y filtro de coste
+## 4. Change detection and cost filter
 
-Para evitar hashear todo en cada sync:
+To avoid hashing everything on every sync:
 
-1. **Filtro rápido**: comparar `mtime` + `size` contra `hash-cache.json`.
-   - Si coinciden con lo cacheado → se asume que el hash guardado sigue siendo válido,
-     no se relee el archivo.
-   - Si difieren → el archivo cambió localmente → se recalcula el hash y se actualiza
-     la caché.
-2. El hash resultante es el que entra en el `tree` del commit (content-addressed).
+1. **Fast filter**: compare `mtime` + `size` against `hash-cache.json`.
+   - If they match what was cached → the stored hash is assumed still valid and the file is not
+     re-read.
+   - If they differ → the file changed locally → the hash is recomputed and the cache updated.
+2. The resulting hash is what goes into the commit's `tree` (content-addressed).
 
-`hash-cache.json` es **local a cada peer** (no se sincroniza); lo que viaja entre peers
-son los hashes ya resueltos dentro de los trees/commits.
+`hash-cache.json` is **local to each peer** (it is not synced); what travels between peers are the
+already-resolved hashes inside the trees and commits.
 
-## 5. Borrados
+## 5. Deletes
 
-Se representan como tombstone explícito en el tree, no como ausencia:
+Represented as an explicit tombstone in the tree, not as absence:
 
 ```json
-{ "id": "...", "path": "...", "hash": null, "deleted": true, "mtime": "<momento del borrado>" }
+{ "id": "...", "path": "...", "hash": null, "deleted": true, "mtime": "<moment of deletion>" }
 ```
 
-- El tombstone se conserva en el histórico (no se purga enseguida) — un peer nuevo que
-  no vio el borrado necesita verlo para no asumir "nunca existió".
-- Borrado en un lado + edición en el otro desde el ancestro común → conflicto real,
-  resuelto con la misma regla de timestamp (ver sección 7).
+- The tombstone is kept in history (not purged right away) — a new peer that did not witness the
+  delete needs to see it so it does not assume "this never existed".
+- Deleted on one side and edited on the other since the common ancestor → a real conflict, resolved
+  by the same timestamp rule (see section 7).
 
 ## 6. Renames
 
-Se registran explícitamente en el tree, no solo se infieren:
+Recorded explicitly in the tree, not merely inferred:
 
 ```json
-{ "id": "...", "path": "<nuevo>", "hash": "...", "deleted": false, "renamed_from": "<anterior>" }
+{ "id": "...", "path": "<new>", "hash": "...", "deleted": false, "renamed_from": "<previous>" }
 ```
 
-- **Por qué explícito y no solo heurística por hash**: evita ambigüedad cuando hay
-  contenido duplicado (mismo hash en dos archivos), y deja historial navegable
-  ("esto se renombró de X a Y en este commit").
-- **Drive**: el adaptador lo detecta con certeza total vía `fileId` estable.
-- **OPFS/FSA**: el propio VFS debe exponer `rename()` como operación de primera clase
-  para capturar la intención en el momento en que ocurre. La heurística por hash
-  (mismo hash, path distinto) queda como red de seguridad para cambios que llegaron
-  por fuera del VFS (ej. el usuario renombra el archivo directamente en el Finder).
+- **Why explicit rather than hash heuristics alone**: it avoids ambiguity when there is duplicate
+  content (the same hash in two files), and leaves a navigable history ("this was renamed from X to
+  Y in this commit").
+- **Drive**: the adapter detects it with total certainty via the stable `fileId`.
+- **OPFS/FSA**: the VFS itself has to expose `rename()` as a first-class operation to capture the
+  intent at the moment it happens. The hash heuristic (same hash, different path) remains as a safety
+  net for changes that arrived from outside the VFS (e.g. the user renaming the file directly in
+  Finder).
 
-## 7. Resolución de conflictos
+## 7. Conflict resolution
 
-Regla acordada: **cuando el hash confirma que el contenido difiere realmente, gana la
-versión con el timestamp (mtime) más reciente.**
+The agreed rule: **when the hash confirms the content really differs, the version with the more
+recent timestamp (mtime) wins.**
 
-Flujo completo por archivo, en cada arista de sync:
+The full per-file flow, on each sync edge:
 
-1. Filtro mtime+size → ¿cambió algo desde el ancestro común?
-2. Si cambió en ambos lados → comparar hash.
-   - Hash igual → mismo contenido, no hay conflicto real.
-   - Hash distinto → conflicto real → gana el mtime más reciente.
-3. Se genera un commit nuevo con dos padres representando el estado conciliado.
+1. mtime+size filter → did anything change since the common ancestor?
+2. If it changed on both sides → compare hashes.
+   - Same hash → same content, no real conflict.
+   - Different hash → real conflict → the more recent mtime wins.
+3. A new commit is generated with two parents representing the reconciled state.
 
-**Riesgo a vigilar**: desfase de reloj entre peers puede hacer "ganar" a una edición
-que en realidad es anterior en tiempo real. Mitigación sugerida: conservar siempre la
-versión perdedora como copia de conflicto (ej. `archivo (conflicto, peer-C,
-2026-07-24).ext`) en vez de descartarla silenciosamente — especialmente importante
-para binarios (ROMs, assets), donde no cabe merge línea a línea.
+**Risk to watch**: clock skew between peers can make an edit "win" that is actually older in real
+time. Suggested mitigation: always keep the losing version as a conflict copy (e.g. `file (conflict,
+peer-C, 2026-07-24).ext`) instead of discarding it silently — especially important for binaries
+(ROMs, assets), where a line-by-line merge is not possible.
 
-## 8. Algoritmo de sync entre dos peers (resumen)
+## 8. Sync algorithm between two peers (summary)
 
-1. Negociar ancestro común: intersección de `known-commits.log` de ambos peers
-   (`misCommits ∩ susCommits`) → commit base más reciente en común.
-2. `diff(base.tree, A.tree)` y `diff(base.tree, C.tree)` por `id` (fallback a `path`
-   si no hay match de id, ver sección 3).
-3. Clasificar cada entrada: solo-A, solo-C, ambos-igual (mismo hash), conflicto real
-   (hash distinto).
-4. Aplicar cambios no conflictivos en ambas direcciones.
-5. Resolver conflictos por timestamp (sección 7), conservando la versión perdedora
-   como copia si se quiere evitar pérdida silenciosa.
-6. Generar commit de merge con ambos padres, añadirlo a `known-commits.log` en
-   ambos nodos.
+1. Negotiate the common ancestor: intersect both peers' `known-commits.log`
+   (`myCommits ∩ theirCommits`) → the most recent commit in common.
+2. `diff(base.tree, A.tree)` and `diff(base.tree, C.tree)` by `id` (falling back to `path` when there
+   is no id match, see section 3).
+3. Classify each entry: A-only, C-only, both-equal (same hash), real conflict (different hash).
+4. Apply the non-conflicting changes in both directions.
+5. Resolve conflicts by timestamp (section 7), keeping the losing version as a copy if silent loss is
+   to be avoided.
+6. Generate a merge commit with both parents and add it to `known-commits.log` on both nodes.
 
-## Pendiente / siguientes pasos
+## Open / next steps
 
-- Definir formato JSON exacto de `tree` y `commit` (campos finales, tipos).
-- Prototipar `VFSAdapter` para OPFS y para FSA.
-- Prototipar el motor de diff/merge genérico, probable con adaptadores en memoria antes
-  de los reales.
-- Evaluar necesidad de garbage collection sobre `objects/` (blobs/trees no alcanzables
-  desde ningún ref).
-- Añadir adaptador de Google Drive cuando el resto esté validado.
+- Define the exact JSON format of `tree` and `commit` (final fields, types).
+- Prototype `VFSAdapter` for OPFS and for FSA.
+- Prototype the generic diff/merge engine, probably with in-memory adapters before the real ones.
+- Evaluate whether garbage collection over `objects/` is needed (blobs/trees unreachable from any
+  ref).
+- Add the Google Drive adapter once the rest is validated.
