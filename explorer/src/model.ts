@@ -1698,7 +1698,7 @@ export class ExplorerModel {
         const ok = await this.askConfirm({
           title: 'Sync all roots',
           message:
-            `Sync all roots now?\n\n` +
+            'Sync all roots now?\n\n' +
             `${this.edges.length} edge(s) will be processed until the chain settles.`,
           okText: 'Sync',
         });
