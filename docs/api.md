@@ -38,6 +38,7 @@ const node = await VFSNode.open(adapter, {
 | --- | --- | --- |
 | `id` | generated, then persisted | Stable peer id. Appears in log rows and conflict-copy names. |
 | `ignore` | none | Return `true` to keep a path out of sync entirely. |
+| `materialize` | keep everything | Return `false` to take the entry without the bytes. See [selective materialisation](#selective-materialisation). |
 | `now` | `Date.now` | Injectable clock, mostly for tests. |
 | `streamThreshold` | 4 MiB | Size from which content is hashed and moved as a stream. |
 | `rotateAt` | 256 KB | Active log segment size that triggers a rotation. |
@@ -107,6 +108,40 @@ None of these touches the disk — they read the mirror the engine wrote. That i
 folder is one read, not a listing per folder) and also the caveat: as soon as something writes around
 the engine the mirror drifts, and `file.local.verifiedAt` is the honest answer to "when was this last
 checked?". Reconcile with `scan()` or `commit()`.
+
+### Selective materialisation
+
+A node can hold an entry without holding its content. The tree is complete on every peer; the folder
+is not. Which bytes a node keeps is the `materialize` predicate, evaluated locally — the engine
+stores nothing about it, so nothing about it travels and no two peers have to agree.
+
+```ts
+const phone = await VFSNode.open(adapter, { materialize: (entry) => entry.size < 10_000_000 });
+
+node.wants(entry);                              // would this node keep these bytes?
+materialised(entry);                            // does it have them right now?
+await node.materialize(path, peer);             // fetch them, verified against the hash
+await node.dematerialize(path, peer);           // release them, keep the entry
+```
+
+`materialised(entry)` is exported at the top level and is the way to ask whether an entry has a file
+behind it: `mtime` is deleted on every adopt and only ever re-set from a real `stat()`, so its
+presence means exactly "this node has seen this file on disk". It is also what keeps reconciliation
+from reading a missing file as a deletion.
+
+Three rules that are easier to know than to derive:
+
+- **The policy governs what arrives, never what is already on disk.** Turning it `false` for content
+  a node holds does not free the bytes, and does not leave them stranded at an old hash either.
+- **`dematerialize` needs a peer that can serve the content**, checked before anything is removed.
+  Releasing the last copy would leave the entry live mesh-wide with the bytes nowhere, which no node
+  can detect on its own. If nobody holds it, the operation you want is `delete`.
+- **The policy is the steady state.** Both methods are manual moves against it, so widening the
+  predicate pulls content down on the next sync and a policy that still wants a file undoes a
+  `dematerialize`.
+
+Neither method writes a log row and neither changes `state`: which content a node stores is a local
+storage decision, not an operation on the mesh.
 
 ### `node.scan()`
 

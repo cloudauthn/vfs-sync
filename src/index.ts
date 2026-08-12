@@ -70,7 +70,7 @@ export type { Diff3Result } from './diff3.js';
 export { walk } from './walk.js';
 export type { WalkOptions, WalkedFile } from './walk.js';
 
-export { VFSNode } from './vfs-node.js';
+export { VFSNode, holds, materialised } from './vfs-node.js';
 export type { ContentHandle, ContentSource, ScanResult, VFSNodeOptions } from './vfs-node.js';
 
 export { HELD_AT, defaultConflictName, mergeEntries, pairEntries, pickNewer } from './merge.js';

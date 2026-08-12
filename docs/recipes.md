@@ -239,6 +239,65 @@ async function ignoreFrom(adapter: VFSAdapter): Promise<(path: string) => boolea
 
 ---
 
+## Holding the entry without the bytes
+
+`ignore` is about paths a node does not watch. `materialize` is a different question: the node
+watches the path, records the entry, agrees with every peer about its hash — and does not keep the
+content on disk. The tree is complete everywhere; the folder is not.
+
+```ts
+const phone = await VFSNode.open(adapter, {
+  materialize: (entry) => entry.size < 10_000_000,
+});
+```
+
+The predicate is evaluated by whoever knows the policy, and the engine stores nothing about it — so
+nothing about it travels, and no two peers have to agree. It can be anything: a size threshold, a
+directory prefix, a set of paths the user has pinned. Change it between two calls if you like.
+
+Entries with no bytes behind them are ordinary in every other respect. They rename, they take
+deletions, they show up in `live()`. What tells them apart is `mtime`, which is only ever set from a
+real look at the disk:
+
+```ts
+import { materialised } from '@cloudauthn/vfs-sync';
+
+const remote = (await node.live()).filter((entry) => !materialised(entry));
+```
+
+### Fetching and releasing
+
+```ts
+await phone.materialize('albums/master.wav', desktop);   // bring the bytes here
+await phone.dematerialize('albums/master.wav', desktop); // give the space back
+```
+
+Both take the peer explicitly. For `dematerialize` that peer is not decoration: it has to be able to
+serve the content before anything is removed here. Releasing the last copy would leave the entry
+live across the mesh with the bytes nowhere, and no node can detect that on its own, because nothing
+about materialisation travels. If no peer holds it, what you want is `delete` — that is a real
+deletion and it says so with a tombstone.
+
+### Two things that surprise people
+
+**The policy governs what arrives, not what is already here.** Changing it to `false` for a file you
+already hold does not free the space; it also does not strand the file at a stale version — bytes on
+disk are kept current whatever the policy says. Freeing space is `dematerialize`, always deliberate.
+
+**The policy is the steady state.** `materialize` and `dematerialize` are manual moves against it, so
+a policy that still wants a file will fetch it back on the next sync. Unpinning is therefore two
+moves, and either alone is incomplete:
+
+```ts
+const unpinned = await VFSNode.open(adapter, { materialize: (entry) => pinned.has(entry.path) });
+await unpinned.dematerialize('albums/master.wav', desktop);
+```
+
+That is also what makes pinning work in the other direction: widen the predicate and the next sync
+brings the content down, with no per-file call.
+
+---
+
 ## Reading a file header
 
 Metadata usually sits at one end of a file. `readRange` seeks to it, so the cost is the range and

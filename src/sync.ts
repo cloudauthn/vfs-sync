@@ -10,6 +10,7 @@ import type {
   MergeOptions,
 } from './merge.js';
 import { extensionOf } from './vfs-file.js';
+import { holds, materialised } from './vfs-node.js';
 import type { ContentHandle, ContentSource, VFSNode } from './vfs-node.js';
 import { stateDigest } from './vfs-file.js';
 import type { EntryKind, Hash, LogRow, VFSEntry, VFSFile } from './types.js';
@@ -136,7 +137,12 @@ export async function sync(a: VFSNode, b: VFSNode, options: SyncOptions = {}): P
 
   // ---- 3. one comparison decides whether there is anything to do at all
   const at = now();
-  if (fileA.state === fileB.state && fileA.log.digest === fileB.log.digest) {
+  if (
+    fileA.state === fileB.state &&
+    fileA.log.digest === fileB.log.digest &&
+    !refillable(a, fileA, fileB) &&
+    !refillable(b, fileB, fileA)
+  ) {
     await close(a, b, fileA, fileB, [], [], at);
     return {
       changed: configChanged,
@@ -218,11 +224,11 @@ export async function sync(a: VFSNode, b: VFSNode, options: SyncOptions = {}): P
 
   const target = merge.entries;
 
-  const planA = planChanges(fileA.entries, target, a.id);
-  const planB = planChanges(fileB.entries, target, b.id);
+  const planA = planChanges(fileA.entries, target, a);
+  const planB = planChanges(fileB.entries, target, b);
   const overlayHashes = new Set(overlay.keys());
-  const remoteFromB = new Set(fileHashes(fileB.entries));
-  const remoteForB = new Set([...fileHashes(target), ...fileHashes(fileA.entries)]);
+  const remoteFromB = new Set(fileHashes(fileB.entries, b));
+  const remoteForB = new Set([...fileHashes(target, a), ...fileHashes(fileA.entries, a)]);
   const previewTransferred = {
     toA: countTransfers(planA.writes, planA.localHashes, overlayHashes, remoteFromB),
     toB: countTransfers(planB.writes, planB.localHashes, overlayHashes, remoteForB),
@@ -397,12 +403,12 @@ export async function syncDryRun(
   const mergedPaths = merged.paths;
 
   const target = merge.entries;
-  const planA = planChanges(entriesA, target, a.id);
-  const planB = planChanges(entriesB, target, b.id);
+  const planA = planChanges(entriesA, target, a);
+  const planB = planChanges(entriesB, target, b);
 
   const overlayHashes = new Set(overlay.keys());
-  const remoteFromB = new Set(fileHashes(entriesB));
-  const remoteForB = new Set([...fileHashes(target), ...fileHashes(entriesA)]);
+  const remoteFromB = new Set(fileHashes(entriesB, b));
+  const remoteForB = new Set([...fileHashes(target, a), ...fileHashes(entriesA, a)]);
 
   const transferred = {
     toA: countTransfers(planA.writes, planA.localHashes, overlayHashes, remoteFromB),
@@ -434,7 +440,8 @@ interface PlannedChanges {
   localHashes: Set<Hash>;
 }
 
-function planChanges(currentEntries: VFSEntry[], target: VFSEntry[], nodeId: string): PlannedChanges {
+function planChanges(currentEntries: VFSEntry[], target: VFSEntry[], node: VFSNode): PlannedChanges {
+  const nodeId = node.id;
   const current = new Map(currentEntries.map((entry) => [entry.uuid, entry]));
   const currentLive = currentEntries.filter((entry) => !entry.deleted);
   const targetByUuid = new Set(target.map((entry) => entry.uuid));
@@ -457,6 +464,10 @@ function planChanges(currentEntries: VFSEntry[], target: VFSEntry[], nodeId: str
       continue;
     }
     if (entry.held && entry.held !== nodeId) continue;
+    // The same rule `apply()` applies, and it has to be the same one or the
+    // dry run describes a sync that will not happen: the policy decides what
+    // arrives, never what is already on disk.
+    if (!node.wants(entry) && !materialised(before)) continue;
 
     if (wasLive && before && before.path !== entry.path) {
       actions.push({
@@ -481,7 +492,7 @@ function planChanges(currentEntries: VFSEntry[], target: VFSEntry[], nodeId: str
       continue;
     }
 
-    if (!wasLive || before?.hash !== entry.hash) {
+    if (!wasLive || before?.hash !== entry.hash || !materialised(before)) {
       writes.push(entry);
       actions.push({
         type: 'write',
@@ -506,6 +517,7 @@ function planChanges(currentEntries: VFSEntry[], target: VFSEntry[], nodeId: str
   const localHashes = new Set<Hash>();
   for (const entry of currentLive) {
     if (entry.kind !== 'file' || !entry.hash || entry.held) continue;
+    if (!materialised(entry)) continue; // the entry is here, the bytes are not
     localHashes.add(entry.hash);
   }
 
@@ -516,10 +528,49 @@ function planChanges(currentEntries: VFSEntry[], target: VFSEntry[], nodeId: str
   };
 }
 
-function fileHashes(entries: VFSEntry[]): Hash[] {
+/**
+ * Content `node` wants, does not have, and the other side looks able to hand
+ * over.
+ *
+ * The `state` comparison cannot see this. Which bytes a node stores is local
+ * policy and is deliberately outside the digest — it has to be, or two peers
+ * with different policies would never agree on `state` and would sync forever.
+ * So two peers can hold identical trees while one is still missing files it
+ * wants, and the fast path would skip the transfer that fixes it.
+ *
+ * It is checked against what the other side actually holds, not just against
+ * the wish: a mesh where nobody has the bytes stays on the fast path instead of
+ * re-planning a transfer nobody can serve on every pass. Entry inspection only,
+ * no I/O, and the common case — nothing missing — never looks at the far side.
+ */
+function refillable(node: VFSNode, own: VFSFile, other: VFSFile): boolean {
+  const missing: Hash[] = [];
+  for (const entry of own.entries) {
+    if (entry.deleted || entry.kind !== 'file' || !entry.hash) continue;
+    if (entry.held && entry.held !== node.id) continue;
+    if (materialised(entry) || !node.wants(entry)) continue;
+    missing.push(entry.hash);
+  }
+  if (missing.length === 0) return false;
+
+  const available = new Set<Hash>();
+  for (const entry of other.entries) {
+    if (entry.deleted || entry.kind !== 'file' || !entry.hash || entry.held) continue;
+    if (materialised(entry)) available.add(entry.hash);
+  }
+  return missing.some((hash) => available.has(hash));
+}
+
+/**
+ * Hashes `node` can serve: what it holds now, plus what its policy will make it
+ * hold. Only feeds the dry run's transfer estimate, so erring here misreports a
+ * number rather than losing anything.
+ */
+function fileHashes(entries: VFSEntry[], node: VFSNode): Hash[] {
   const hashes: Hash[] = [];
   for (const entry of entries) {
     if (entry.deleted || entry.kind !== 'file' || !entry.hash || entry.held) continue;
+    if (!node.wants(entry) && !materialised(entry)) continue;
     hashes.push(entry.hash);
   }
   return hashes;
@@ -780,23 +831,10 @@ function chain(
         };
       }
       for (const candidate of candidates) {
-        // Every path this candidate claims to hold the bytes at, not just the
-        // first: one of them missing from disk does not mean the peer cannot
-        // serve the content. Duplicate content is ordinary, and an entry can
-        // legitimately have no file behind it — bytes that never travelled, or
-        // that this peer has not materialised.
-        for (const entry of candidate.entries) {
-          if (entry.deleted || entry.kind !== 'file' || entry.hash !== hash || entry.held) continue;
-          const stat = await candidate.node.stat(entry.path);
-          if (!stat || stat.kind !== 'file') continue;
-          onHit();
-          const path = entry.path;
-          return {
-            size: stat.size,
-            read: () => candidate.node.read(path),
-            stream: () => candidate.node.readStream(path),
-          };
-        }
+        const handle = await holds(candidate.node, candidate.entries, hash);
+        if (!handle) continue;
+        onHit();
+        return handle;
       }
       return null;
     },

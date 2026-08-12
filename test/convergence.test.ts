@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { MemoryAdapter } from '../src/adapters/memory.js';
 import { syncUntilStable } from '../src/sync.js';
-import { VFSNode } from '../src/vfs-node.js';
+import { VFSNode, materialised } from '../src/vfs-node.js';
 import type { MeshEdge } from '../src/sync.js';
 
 /**
@@ -65,6 +65,31 @@ async function world(
   return { peers: out, edges };
 }
 
+/**
+ * The mirror actually mirrors: what `vfs.json` claims this node holds is what
+ * is on disk, on every peer.
+ *
+ * This is the assertion convergence cannot make on its own, and the one that
+ * exposed every bug phase 1 uncovered. The engine would fail to put a file on
+ * disk, the next scan read the absence as a deletion, the tombstone travelled,
+ * and all peers converged — on having lost the file. Convergence held. The
+ * folder was wrong.
+ *
+ * It is phrased against `mtime` rather than against liveness because a live
+ * entry no longer implies bytes: `mtime` is the engine's own record of "I have
+ * this one", and the check is that the record does not lie in either direction.
+ */
+async function mirrors(peers: Peer[]): Promise<void> {
+  for (const peer of peers) {
+    const live = await peer.node.live();
+    const claimed = live
+      .filter((entry) => entry.kind === 'file' && materialised(entry))
+      .map((entry) => entry.path)
+      .sort();
+    expect(claimed, `on ${peer.node.name}`).toEqual(Object.keys(peer.fs.snapshot()).sort());
+  }
+}
+
 /** One random operation on one random peer. */
 async function step(peers: Peer[], next: () => number, round: number): Promise<void> {
   const peer = peers[Math.floor(next() * peers.length)] as Peer;
@@ -109,14 +134,7 @@ describe('convergence', () => {
       const snapshots = peers.map((peer) => peer.fs.snapshot());
       for (const snapshot of snapshots) expect(snapshot).toEqual(snapshots[0]);
 
-      // And the mirror actually mirrors: what `vfs.json` claims is on disk.
-      for (const peer of peers) {
-        const tracked = (await peer.node.live())
-          .filter((entry) => entry.kind === 'file')
-          .map((entry) => entry.path)
-          .sort();
-        expect(tracked).toEqual(Object.keys(peer.fs.snapshot()).sort());
-      }
+      await mirrors(peers);
     });
   }
 
@@ -141,6 +159,7 @@ describe('convergence', () => {
       expect(new Set(states).size, `states: ${states.join(' ')}`).toBe(1);
       const snapshots = peers.map((peer) => peer.fs.snapshot());
       for (const snapshot of snapshots) expect(snapshot).toEqual(snapshots[0]);
+      await mirrors(peers);
       // The rotation actually happened, or the test proves nothing.
       expect((await peers[0]?.node.file())?.log.snapshot).toBeTypeOf('string');
     });
@@ -160,5 +179,6 @@ describe('convergence', () => {
 
     expect(peers[1]?.fs.snapshot()).toEqual(peers[0]?.fs.snapshot());
     expect(await peers[1]?.node.state()).toBe(await peers[0]?.node.state());
+    await mirrors(peers);
   });
 });

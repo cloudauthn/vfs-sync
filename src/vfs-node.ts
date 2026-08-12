@@ -24,6 +24,28 @@ export interface VFSNodeOptions {
   id?: string;
   /** Return true to keep a path out of sync entirely. */
   ignore?: (path: string) => boolean;
+  /**
+   * Bytes this node keeps on disk. Everything else: the entry travels, the
+   * content does not — the tree is complete, the folder is not. Absent means
+   * materialise everything, which is what a node without a policy has always
+   * done.
+   *
+   * ```ts
+   * VFSNode.open(fs, { materialize: (entry) => entry.size < 10_000_000 });
+   * ```
+   *
+   * The engine stores nothing about this and nothing about it travels, so the
+   * policy can be anything the app knows and can change between two calls. Two
+   * consequences worth knowing before relying on it:
+   *
+   * - It governs what **arrives**, never what is already here. Turning it
+   *   `false` for content this node holds does not free the bytes; that is
+   *   {@link VFSNode.dematerialize}, which is deliberate and verified.
+   * - It is the steady state. {@link VFSNode.materialize} fetches against the
+   *   policy, and a policy that still wants the entry will fetch it back on the
+   *   next sync.
+   */
+  materialize?: (entry: VFSEntry) => boolean;
   /** Injectable clock, mostly for tests. */
   now?: () => number;
   /**
@@ -50,6 +72,50 @@ export interface ContentSource {
   open(hash: Hash, entry: VFSEntry): Promise<ContentHandle | null>;
 }
 
+/**
+ * Whether this node has the file on disk. `mtime` is deleted on every adopt and
+ * only ever re-set from a real `stat()`, so its presence means exactly that —
+ * the invariant reconciliation leans on to tell a deletion from content that
+ * was never here.
+ *
+ * One name for it because three places have to agree: `scan()` decides whether
+ * absence is evidence, `apply()` and `planChanges()` decide whether a policy
+ * that declines an entry is allowed to leave its bytes behind at a stale hash.
+ */
+export function materialised(entry: VFSEntry | undefined): boolean {
+  return !!entry && !entry.deleted && entry.mtime !== undefined;
+}
+
+/**
+ * Bytes for `hash` from whatever path `node` still holds them at.
+ *
+ * Every candidate path, not just the first: one of them missing from disk does
+ * not mean the peer cannot serve the content. Duplicate content is ordinary,
+ * and an entry can legitimately have no file behind it — bytes that never
+ * travelled, or that this peer has not materialised.
+ *
+ * Disk is the ground truth here, not policy. A peer serves whatever it happens
+ * to hold, whether or not its own predicate would have chosen to keep it.
+ */
+export async function holds(
+  node: VFSNode,
+  entries: VFSEntry[],
+  hash: Hash,
+): Promise<ContentHandle | null> {
+  for (const entry of entries) {
+    if (entry.deleted || entry.kind !== 'file' || entry.hash !== hash || entry.held) continue;
+    const stat = await node.stat(entry.path);
+    if (!stat || stat.kind !== 'file') continue;
+    const path = entry.path;
+    return {
+      size: stat.size,
+      read: () => node.read(path),
+      stream: () => node.readStream(path),
+    };
+  }
+  return null;
+}
+
 export interface ScanResult {
   entries: VFSEntry[];
   /** One row per operation the scan discovered. Empty when nothing changed. */
@@ -73,6 +139,7 @@ export class VFSNode {
   readonly streamThreshold: number;
 
   private readonly ignore: ((path: string) => boolean) | undefined;
+  private readonly policy: ((entry: VFSEntry) => boolean) | undefined;
   private readonly now: () => number;
 
   private constructor(adapter: VFSAdapter, id: string, options: VFSNodeOptions, store: VFSStore) {
@@ -80,6 +147,7 @@ export class VFSNode {
     this.store = store;
     this.id = id;
     this.ignore = options.ignore;
+    this.policy = options.materialize;
     this.now = options.now ?? (() => Date.now());
     this.streamThreshold = options.streamThreshold ?? STREAM_THRESHOLD;
   }
@@ -138,6 +206,17 @@ export class VFSNode {
       await this.store.logRows(),
       await this.store.readSnapshot(file),
     ]);
+  }
+
+  /**
+   * True when this node's policy keeps this entry's bytes on disk. No policy
+   * means everything, which is the behaviour a node has always had.
+   *
+   * Public because `planChanges()` has to ask the destination node the same
+   * question `apply()` asks itself, and the two must not answer differently.
+   */
+  wants(entry: VFSEntry): boolean {
+    return this.policy ? this.policy(entry) : true;
   }
 
   /** True when this path's extension is on the store's text list (§4). */
@@ -633,6 +712,14 @@ export class VFSNode {
       // Content the far peer chose to keep to itself (§4): the entry travels,
       // the bytes do not, and the explorer paints it as remote.
       if (entry.held && entry.held !== this.id) continue;
+      // Content this node's policy declines. The `materialised` half is not
+      // optional: a policy that turns false for something already on disk must
+      // not skip the write, or the file would sit at the old hash while the
+      // tree records the new one — and `scan()`'s mtime filter, seeing an
+      // untouched file, would never look at it again. Nothing would ever
+      // disagree with itself about it. The predicate governs what arrives;
+      // releasing what is already here is `dematerialize()`.
+      if (!this.wants(entry) && !materialised(before)) continue;
       if (wasLive && before.path !== entry.path) {
         renames.push({ from: before.path, to: entry.path, uuid: entry.uuid });
       }
@@ -640,7 +727,12 @@ export class VFSNode {
         if (!wasLive) mkdirs.push(entry);
         continue;
       }
-      if (!wasLive || before.hash !== entry.hash) writes.push(entry);
+      // `!materialised` is the refill: an entry this node wants but has no
+      // bytes for is a write, even though nothing about it changed. Without it
+      // the policy is only ever a filter — pinning a folder that nobody has
+      // edited since would download nothing, and there would be two unrelated
+      // ways to ask for the same content.
+      if (!wasLive || before.hash !== entry.hash || !materialised(before)) writes.push(entry);
     }
 
     // Content this node already holds, from *before* anything moved. A conflict
@@ -649,6 +741,10 @@ export class VFSNode {
     const local = new Map<Hash, { path: string; size: number }>();
     for (const entry of current.values()) {
       if (entry.deleted || entry.kind !== 'file' || !entry.hash || local.has(entry.hash)) continue;
+      // An entry is not a file. One with no bytes behind it would send the copy
+      // below reading a path that holds nothing — the same confusion `chain()`
+      // had on the serving side, here on the receiving one.
+      if (!materialised(entry)) continue;
       local.set(entry.hash, { path: entry.path, size: entry.size });
     }
 
@@ -720,26 +816,39 @@ export class VFSNode {
         await this.copy(staged, entry.path, entry.size);
         continue;
       }
-      const handle = await source.open(hash, entry);
-      if (!handle) continue;
-      if (this.streams(handle.size)) {
-        const hasher = new Sha256();
-        await pump(await handle.stream(), await writeStream(this.adapter, entry.path), (chunk) =>
-          hasher.update(chunk),
-        );
-        if (hasher.digest() !== hash) {
-          await this.adapter.delete(entry.path);
-          throw new Error(`${entry.path} arrived as ${hasher.digest()} in ${this.adapter.name}`);
-        }
-      } else {
-        const data = await handle.read();
-        const actual = await sha256(data);
-        if (actual !== hash) throw new Error(`${entry.path} arrived as ${actual} in ${this.adapter.name}`);
-        await this.adapter.write(entry.path, data);
-      }
+      await this.fetchContent(entry, source);
     }
 
     for (const temp of parkedContent.values()) await this.adapter.delete(temp).catch(() => undefined);
+  }
+
+  /**
+   * Writes `entry`'s content from `source`, verified against the hash the tree
+   * declares. False when no holder could serve it.
+   *
+   * One implementation, because `materialize()` needs exactly this and a second
+   * copy is a second place for the two to drift on the check that matters.
+   */
+  private async fetchContent(entry: VFSEntry, source: ContentSource): Promise<boolean> {
+    const hash = entry.hash as Hash;
+    const handle = await source.open(hash, entry);
+    if (!handle) return false;
+    if (this.streams(handle.size)) {
+      const hasher = new Sha256();
+      await pump(await handle.stream(), await writeStream(this.adapter, entry.path), (chunk) =>
+        hasher.update(chunk),
+      );
+      if (hasher.digest() !== hash) {
+        await this.adapter.delete(entry.path);
+        throw new Error(`${entry.path} arrived as ${hasher.digest()} in ${this.adapter.name}`);
+      }
+    } else {
+      const data = await handle.read();
+      const actual = await sha256(data);
+      if (actual !== hash) throw new Error(`${entry.path} arrived as ${actual} in ${this.adapter.name}`);
+      await this.adapter.write(entry.path, data);
+    }
+    return true;
   }
 
   private async copy(from: string, to: string, size: number): Promise<void> {
@@ -763,13 +872,25 @@ export class VFSNode {
       delete next.native;
       delete next.mtime;
       const before = current.get(entry.uuid);
+      // Whether this node has the file on disk once the apply is done, which is
+      // the same question `apply()` asked: the policy decides what arrives, and
+      // bytes already here are kept current whatever it says.
+      const onDisk =
+        !(entry.held && entry.held !== this.id) && (this.wants(entry) || materialised(before));
       // Nothing this apply touched: the two node-local fields still describe
       // the file on disk, so carry them over. On Drive re-statting an untouched
-      // entry is a round trip per file, which for a catalogue is the whole cost.
-      if (before && !entry.deleted && before.path === entry.path && before.hash === entry.hash) {
+      // entry is a round trip per file, which for a catalogue is the whole cost
+      // — and an entry with no bytes here is exactly the one not to pay it for.
+      if (
+        before &&
+        !entry.deleted &&
+        before.path === entry.path &&
+        before.hash === entry.hash &&
+        materialised(before)
+      ) {
         if (before.mtime !== undefined) next.mtime = before.mtime;
         if (before.native) next.native = before.native;
-      } else if (!entry.deleted && !(entry.held && entry.held !== this.id)) {
+      } else if (!entry.deleted && onDisk) {
         const stat = await this.adapter.stat(entry.path);
         if (stat) next.mtime = stat.mtime;
         if (this.adapter.fileId) {
@@ -783,6 +904,85 @@ export class VFSNode {
     held.entries = entries;
     held.local.verifiedAt = this.now();
     return held;
+  }
+
+  // ------------------------------------------------------ materialisation
+
+  /** The live file entry at `path`, or an error naming what is wrong with it. */
+  private async fileEntry(path: string): Promise<{ file: VFSFile; entry: VFSEntry }> {
+    const file = await this.store.read();
+    const entry = file.entries.find((item) => !item.deleted && item.path === path);
+    if (!entry) throw new Error(`no live entry at ${path}`);
+    if (entry.kind !== 'file' || !entry.hash) throw new Error(`${path} is not a file`);
+    return { file, entry };
+  }
+
+  /**
+   * Fetches the bytes for a path this node has the entry for but not the
+   * content — declined by its own policy, or kept by the peer that made it (§4).
+   *
+   * Verified against the declared hash, exactly as a sync would be. Once the
+   * bytes are on disk the entry is ordinary again, and the `mtime` stamped here
+   * is what makes it so: reconciliation stops treating it as content that was
+   * never here.
+   *
+   * It fetches *against* the policy, not through it — the caller is overriding
+   * a standing decision. A policy that still declines the entry leaves it alone
+   * from here on; one that wants it would have fetched it on the next sync.
+   */
+  async materialize(path: string, from: VFSNode): Promise<void> {
+    const { file, entry } = await this.fileEntry(path);
+    const available = await from.live();
+    const source: ContentSource = { open: (hash) => holds(from, available, hash) };
+    if (!(await this.fetchContent(entry, source))) {
+      throw new Error(`${from.name} cannot serve ${path}`);
+    }
+    // Stamped here rather than through `commit()`: the bytes match the hash the
+    // entry already declares, so a walk would emit no row and would cost the
+    // full listing the mtime filter exists to avoid.
+    const stat = await this.adapter.stat(path);
+    if (stat) entry.mtime = stat.mtime;
+    if (this.adapter.fileId) {
+      const native = await this.adapter.fileId(path);
+      if (native) entry.native = native;
+    }
+    await this.store.write(file);
+  }
+
+  /**
+   * Releases the bytes for a path and keeps the entry. Nothing about it travels
+   * and no log row is written: which content a node stores is a local storage
+   * decision, not an operation on the mesh. `state` does not change either —
+   * `mtime` is outside the digest.
+   *
+   * `from` has to be able to serve the content first. Dematerialising the last
+   * copy would leave the entry live across the mesh with the bytes nowhere, and
+   * the library cannot see that on its own, because nothing about
+   * materialisation travels. It is a sanity check and not a guarantee — the
+   * peer could lose the bytes a moment later — but the case it catches is the
+   * realistic one. If no peer holds it, what is wanted is a deletion, and a
+   * deletion says so with a tombstone.
+   *
+   * **The order of the two writes is not a preference.** The record that this
+   * node no longer holds the bytes lands *before* the bytes go. Interrupted the
+   * other way round, the next `scan()` would find the file gone with an `mtime`
+   * still saying it had been seen here, and would tombstone it on every peer —
+   * the deletion-by-inference this engine exists to not do. Interrupted this
+   * way it heals: the scan finds the file, the hash is unchanged, and it
+   * re-stamps the `mtime` with no row and no re-dating.
+   */
+  async dematerialize(path: string, from: VFSNode): Promise<void> {
+    const { file, entry } = await this.fileEntry(path);
+    const available = await from.live();
+    if (!(await holds(from, available, entry.hash as Hash))) {
+      throw new Error(`${from.name} cannot serve ${path}: releasing it here would leave no copy`);
+    }
+    if (materialised(entry)) {
+      delete entry.mtime;
+      delete entry.native;
+      await this.store.write(file);
+    }
+    await this.adapter.delete(path).catch(() => undefined);
   }
 
   // ------------------------------------------------------------ conflicts
@@ -832,21 +1032,26 @@ export class VFSNode {
     if (!copy) throw new Error(`no pending conflict ${uuid}`);
     const disputed = file.entries.find((entry) => entry.uuid === copy.conflictOf);
 
-    if (choice === 'theirs' && copy.held && copy.held !== this.id) {
-      // The copy was too big to travel (§4), so its bytes are still on the peer
-      // that made it. Say so, rather than failing on a read of a file that was
-      // never going to be here.
-      throw new Error(`the losing version of ${copy.path} is held on ${copy.held}`);
+    // Whether the bytes of the losing version are actually here. Two ways they
+    // are not: the copy was too big to travel (§4) and stayed on the peer that
+    // made it, or this node's policy declined to materialise it.
+    const here = materialised(copy);
+    if (choice === 'theirs' && !here) {
+      // Say so, rather than failing on a read of a file that was never going to
+      // be here.
+      const why = copy.held && copy.held !== this.id ? `held on ${copy.held}` : 'not materialised here';
+      throw new Error(`the losing version of ${copy.path} is ${why}`);
     }
     if (choice !== 'mine' && disputed) {
       const data = choice instanceof Uint8Array ? choice : await this.adapter.read(copy.path);
       await this.adapter.write(disputed.path, data);
     }
     await this.adapter.delete(copy.path).catch(() => undefined);
-    // A copy whose bytes never travelled has no file here to remove, and the
-    // scan reads absence as evidence only for content this node actually held.
-    // Deleting it therefore has to be said, not shown.
-    if (copy.held && copy.held !== this.id) await this.retire(copy.uuid);
+    // A copy whose bytes are not here has no file to remove, and the scan reads
+    // absence as evidence only for content this node actually held. Deleting it
+    // therefore has to be said, not shown — otherwise the copy is immortal:
+    // nothing on disk to remove, and nothing for reconciliation to notice.
+    if (!here) await this.retire(copy.uuid);
     await this.commit();
   }
 
@@ -920,7 +1125,12 @@ function sameEntries(left: VFSEntry[], right: VFSEntry[]): boolean {
       held.path === entry.path &&
       held.hash === entry.hash &&
       held.size === entry.size &&
-      !!held.deleted === !!entry.deleted
+      !!held.deleted === !!entry.deleted &&
+      // Not the `mtime` value — a touched file with the same content is not a
+      // change worth a write. Whether there is an `mtime` at all is: it is the
+      // record of whether this node holds the bytes, and losing that record
+      // makes reconciliation read the file as content that was never here.
+      materialised(held) === materialised(entry)
     );
   });
 }
