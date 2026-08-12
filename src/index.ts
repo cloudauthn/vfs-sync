@@ -70,7 +70,7 @@ export {
 } from './log.js';
 export { History } from './history.js';
 export { MAX_TEXT_MERGE, diff3, splitLines } from './diff3.js';
-export type { Diff3Result } from './diff3.js';
+export type { Diff3Reason, Diff3Result } from './diff3.js';
 
 export { IGNORE_FILE, excludesRulesFile, matchIgnore, parseIgnore } from './ignore.js';
 export type { IgnoreRule } from './ignore.js';
@@ -92,6 +92,7 @@ export type {
   MergeResult,
   MergeSide,
   Side,
+  TextMergeReason,
 } from './merge.js';
 
 export { PairingError, sync, syncDryRun, syncMesh, syncUntilStable } from './sync.js';

@@ -85,12 +85,21 @@ export function at(): number {
   return clock;
 }
 
-export async function peer(name: string, options: { rotateAt?: number } = {}): Promise<Peer> {
+export async function peer(
+  name: string,
+  options: {
+    rotateAt?: number;
+    text?: (path: string) => boolean;
+    materialize?: (entry: VFSEntry) => boolean;
+  } = {},
+): Promise<Peer> {
   const fs = new MemoryAdapter(name, { clock: () => tick() });
   const node = await VFSNode.open(fs, {
     id: name,
     now: () => tick(),
     ...(options.rotateAt !== undefined ? { rotateAt: options.rotateAt } : {}),
+    ...(options.text ? { text: options.text } : {}),
+    ...(options.materialize ? { materialize: options.materialize } : {}),
   });
   return { node, fs };
 }

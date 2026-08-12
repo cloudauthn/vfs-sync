@@ -107,6 +107,33 @@ The list converges by union when two peers sync, and starts as:
 cue  json  log  m3u  md  nfo  srt  txt  xml
 ```
 
+**Union in one direction only.** Nothing removes an extension once it is on the list, and a peer
+arriving with an older list adopts the wider one. One peer adding `json` therefore means every
+`.json` in the mesh attempts a merge from then on, on every peer, permanently. That is why there is
+no one-line call to widen it.
+
+### Selecting by path
+
+The list can only speak in extensions. To claim paths it cannot name, a node takes a predicate:
+
+```ts
+const node = await VFSNode.open(adapter, { text: (path) => path.startsWith('catalog/') });
+```
+
+Local, like `materialize`: nothing about it travels and nothing is stored about it. Two properties
+it has to have to be worth anything:
+
+- **It is consulted at commit, not only at merge.** A merge needs a base, and the base only exists
+  because the version was recorded as text when it was written. This is why the predicate is a node
+  option and not a `sync()` one — a predicate that arrived at merge time would classify conflicts it
+  could never settle, on exactly the paths it was added for.
+- **It adds; it cannot subtract.** `sync()` unions both nodes' answers, so a refusal here is
+  overruled by the other side's list. To turn the merge off, that is `autoMerge: false` on the sync
+  call: total, and per call.
+
+Because it is a union, only one of the two peers needs to have claimed a path: whichever kept the
+base carries the merge for both.
+
 ### The base is local and does not travel
 
 A three-way merge needs base + A + B. A and B are free — the working file *is* the content — and the
@@ -120,10 +147,42 @@ to LWW plus a copy, at zero protocol cost.
 - **1 MB maximum** to even attempt a merge. Above it, LWW, whatever the extension says.
 - **Mixed CRLF and LF** between sides degrades to LWW: normalising would change the content, and
   with it the hash.
+- **Line-based.** A one-line document merges nothing — two edits to a minified `.json` are two edits
+  to the same line, which is a collision by construction. `json` shipping in the default list does
+  not change that. Whoever wants a field-level merge serialises one field per line; that is a
+  condition of the technique, not a limitation to be lifted later.
 - **Never merge markers.** There is no mode that writes `<<<<<<<` into a working file — an emulator
   frontend reads `gamelist.xml` without asking questions, and a marker propagated through the mesh
   is a broken catalogue on every peer. Either the merge comes out clean and is written whole, or it
   is not written.
+
+### Why one did not merge
+
+`text: true` says a merge was worth attempting, not that it happened. When it did not, `textReason`
+says why:
+
+```ts
+const { merged, conflicts } = await sync(a, b);
+for (const report of conflicts) {
+  if (report.text && report.textReason) console.log(report.path, report.textReason);
+}
+```
+
+| `textReason` | Meaning | Does it change on its own? |
+| --- | --- | --- |
+| `block` | the two sides edited the same lines | yes — it is about these two versions |
+| `size` | over 1 MB | no, while the file stays that size |
+| `eol` | one side CRLF, the other LF | **no** — it will not merge tomorrow either |
+| `no-base` | no ancestor copy was retained here or on the peer | yes, once a version is recorded as text |
+| `unreadable` | this peer holds the entry and not the bytes | yes, once the content is fetched |
+
+`eol` is the one worth acting on: a folder written from Windows and from macOS collects a conflict
+copy on every single edit and merges nothing, forever. The library will not normalise terminators —
+that would change the content, and with it the hash and the identity of the version. Settling on one
+terminator is the consumer's to do.
+
+`textReason` is absent when the merge succeeded, when a `resolveText` hook settled it, and when no
+attempt was made at all (`autoMerge: false` with no hook).
 
 The merge is computed by **one side only**, the LWW winner. If both ran diff3 independently they
 would have to produce the same byte — same algorithm, same line endings, same treatment of a missing
@@ -309,6 +368,7 @@ for (const conflict of conflicts) {
 | `copy` | `VFSEntry \| undefined` | The preserved loser, when one was kept. |
 | `base` | `Hash \| undefined` | The ancestor, when the chain turned one up. |
 | `text` | `true \| undefined` | Both sides were text, so a three-way merge was worth trying. |
+| `textReason` | `TextMergeReason \| undefined` | Why the attempt did not settle it. See [why one did not merge](#why-one-did-not-merge). |
 
 Surface conflicts in the UI. Silent resolution is how users lose trust in a sync tool — even when
 the resolution was right.

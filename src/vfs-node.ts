@@ -49,6 +49,28 @@ export interface VFSNodeOptions {
    *   next sync.
    */
   materialize?: (entry: VFSEntry) => boolean;
+  /**
+   * Paths this node treats as text, on top of the mesh-wide extension list
+   * (§4). Selection by path is what the list cannot express:
+   *
+   * ```ts
+   * VFSNode.open(fs, { text: (path) => path.startsWith('catalog/') });
+   * ```
+   *
+   * Local like {@link VFSNodeOptions.materialize}: nothing about it travels and
+   * the engine stores nothing about it. Two properties it must have to be worth
+   * anything:
+   *
+   * - It is consulted at **commit** as well as at merge. A three-way merge needs
+   *   a base, and the base is only there because the version was recorded as
+   *   text when it was written — a predicate that arrived at merge time would
+   *   classify conflicts it could never settle.
+   * - It **adds**; it cannot subtract. `sync()` unions both nodes' answers, so a
+   *   subtraction here would be overruled by the other side's list — a switch
+   *   that works only when the peer agrees. To turn the merge off, that is
+   *   `autoMerge: false` on the sync call: total, and per call.
+   */
+  text?: (path: string) => boolean;
   /** Injectable clock, mostly for tests. */
   now?: () => number;
   /**
@@ -149,6 +171,7 @@ export class VFSNode {
   /** Compiled rules from `local.ignore` in the header. */
   private local: IgnoreRule[] = [];
   private readonly policy: ((entry: VFSEntry) => boolean) | undefined;
+  private readonly textPolicy: ((path: string) => boolean) | undefined;
   private readonly now: () => number;
 
   private constructor(adapter: VFSAdapter, id: string, options: VFSNodeOptions, store: VFSStore) {
@@ -157,6 +180,7 @@ export class VFSNode {
     this.id = id;
     this.ignore = options.ignore;
     this.policy = options.materialize;
+    this.textPolicy = options.text;
     this.now = options.now ?? (() => Date.now());
     this.streamThreshold = options.streamThreshold ?? STREAM_THRESHOLD;
   }
@@ -266,10 +290,26 @@ export class VFSNode {
     return this.policy ? this.policy(entry) : true;
   }
 
-  /** True when this path's extension is on the store's text list (§4). */
+  /**
+   * True when this path gets a three-way merge (§4): its extension is on the
+   * store's list, or this node's own policy claims it.
+   */
   async isText(path: string): Promise<boolean> {
+    if (this.marksText(path)) return true;
     const extension = extensionOf(path);
     return extension !== '' && (await this.store.read()).text.includes(extension);
+  }
+
+  /**
+   * True when this node's own `text` policy claims this path, whatever the
+   * mesh-wide list says.
+   *
+   * Public and synchronous because `sync()` has to fold both nodes' answers into
+   * the single predicate the merge takes, and the merge is pure — it cannot stop
+   * and ask a node anything.
+   */
+  marksText(path: string): boolean {
+    return this.textPolicy ? this.textPolicy(path) : false;
   }
 
   // ------------------------------------------------------ external changes
@@ -747,17 +787,21 @@ export class VFSNode {
    *
    * Local by construction: it never travels and no peer reads it. Missing a
    * base degrades the merge to LWW plus a copy, which costs nothing but a file.
+   *
+   * This is also why {@link VFSNodeOptions.text} is a node option rather than a
+   * sync one: retention has to have happened here, versions ago, for a merge to
+   * be possible at all later.
    */
   private async keepText(entries: VFSEntry[], file: VFSFile): Promise<void> {
     const text = file.text;
-    if (text.length === 0) return;
+    if (text.length === 0 && !this.textPolicy) return;
     const before = new Map(file.entries.map((entry) => [entry.uuid, entry.hash]));
     const keep = new Set<Hash>();
     let wrote = 0;
     for (const entry of entries) {
       if (entry.deleted || entry.kind !== 'file' || !entry.hash) continue;
       const extension = extensionOf(entry.path);
-      if (extension === '' || !text.includes(extension)) continue;
+      if (!(extension !== '' && text.includes(extension)) && !this.marksText(entry.path)) continue;
       keep.add(entry.hash);
       if (entry.prev) keep.add(entry.prev);
       if (entry.prev2) keep.add(entry.prev2);

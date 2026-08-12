@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import { sync, syncUntilStable } from '../src/sync.js';
-import { files, get, peer, put } from './helpers.js';
+import { VFSNode } from '../src/vfs-node.js';
+import { files, get, peer, put, tick } from './helpers.js';
+import type { Peer } from './helpers.js';
 
 /**
  * §4's closing move: the bytes always converge, the *decision* is what stays
@@ -214,6 +216,196 @@ describe('text conflicts', () => {
     // binary, which is precisely the invariant §4 refuses to break.
     expect(result.merged).toBe(0);
     expect(result.conflicts[0]?.text).toBeUndefined();
+  });
+});
+
+/**
+ * The extension list cannot say "everything under `catalog/`", and the predicate
+ * that can has to be a *node* option: what makes a three-way merge possible is
+ * the base kept at commit, versions before anybody has a conflict.
+ */
+describe('text selection by path', () => {
+  const catalog = (path: string) => path.startsWith('catalog/');
+
+  /** Non-overlapping edits to an extensionless file under `catalog/`. */
+  async function divergedCatalog(options: Parameters<typeof peer>[1] = {}) {
+    const a = await peer('device-a', options);
+    const b = await peer('device-b', options);
+    await put(a, 'catalog/index', 'one\ntwo\nthree\n');
+    await sync(a.node, b.node);
+
+    await put(a, 'catalog/index', 'ONE\ntwo\nthree\n');
+    await a.node.commit();
+    await put(b, 'catalog/index', 'one\ntwo\nTHREE\n');
+    return { a, b };
+  }
+
+  it('merges a path the extension list could never have named', async () => {
+    const { a, b } = await divergedCatalog({ text: catalog });
+    const result = await sync(a.node, b.node);
+
+    expect(result.merged).toBe(1);
+    expect(await get(a, 'catalog/index')).toBe('ONE\ntwo\nTHREE\n');
+    expect(await a.node.conflicts()).toHaveLength(0);
+  });
+
+  it('leaves the same divergence binary when no policy claimed the path', async () => {
+    const { a, b } = await divergedCatalog();
+    const result = await sync(a.node, b.node);
+
+    expect(result.merged).toBe(0);
+    expect(result.conflicts[0]?.text).toBeUndefined();
+    expect(await a.node.conflicts()).toHaveLength(1);
+  });
+
+  /**
+   * The policy arriving after the versions were written is exactly the state a
+   * predicate handed to `sync()` would produce for *every* path it named: the
+   * conflict is classified as text and there is nothing to merge it against,
+   * because retention happens at commit and those commits are past.
+   */
+  it('cannot merge versions recorded before the policy existed', async () => {
+    const { a, b } = await divergedCatalog();
+    const late = async (p: Peer) =>
+      VFSNode.open(p.fs, { id: p.node.peerId, now: () => tick(), text: catalog });
+    const result = await sync(await late(a), await late(b));
+
+    expect(result.merged).toBe(0);
+    expect(result.conflicts[0]?.text).toBe(true);
+    expect(result.conflicts[0]?.textReason).toBe('no-base');
+  });
+
+  /** Union: the peer that kept the base carries the merge for both. */
+  it('needs only one of the two peers to have claimed it', async () => {
+    const a = await peer('device-a', { text: catalog });
+    const b = await peer('device-b');
+    await put(a, 'catalog/index', 'one\ntwo\nthree\n');
+    await sync(a.node, b.node);
+
+    await put(a, 'catalog/index', 'ONE\ntwo\nthree\n');
+    await a.node.commit();
+    await put(b, 'catalog/index', 'one\ntwo\nTHREE\n');
+    const result = await sync(a.node, b.node);
+
+    expect(result.merged).toBe(1);
+    expect(await get(b, 'catalog/index')).toBe('ONE\ntwo\nTHREE\n');
+  });
+
+  /**
+   * The policy adds and cannot take away. Under union a refusal here would be
+   * overruled by the other peer's list anyway, so offering it would be offering
+   * a switch that works only when the peer agrees. `autoMerge: false` is the one
+   * that works.
+   */
+  it('does not let a node subtract from the mesh-wide list', async () => {
+    const never = () => false;
+    const a = await peer('device-a', { text: never });
+    const b = await peer('device-b', { text: never });
+    await put(a, 'gamelist.xml', '<one/>\n<two/>\n<three/>\n');
+    await sync(a.node, b.node);
+
+    await put(a, 'gamelist.xml', '<ONE/>\n<two/>\n<three/>\n');
+    await a.node.commit();
+    await put(b, 'gamelist.xml', '<one/>\n<two/>\n<THREE/>\n');
+
+    expect((await sync(a.node, b.node)).merged).toBe(1);
+    expect((await sync(a.node, b.node, { autoMerge: false })).merged).toBe(0);
+  });
+
+  it('answers `isText()` the same way the merge does', async () => {
+    const a = await peer('device-a', { text: catalog });
+    expect(await a.node.isText('catalog/index')).toBe(true);
+    expect(await a.node.isText('gamelist.xml')).toBe(true);
+    expect(await a.node.isText('roms/sonic.bin')).toBe(false);
+    expect(a.node.marksText('catalog/index')).toBe(true);
+    expect(a.node.marksText('gamelist.xml')).toBe(false);
+  });
+});
+
+/**
+ * `text: true` used to mean both "merged" and "was eligible and refused", and
+ * the caller had no way to tell them apart. `eol` in particular is a standing
+ * property of the folder — it will not merge tomorrow either.
+ */
+describe('why a text merge did not happen', () => {
+  it('reports mismatched line terminators instead of silently copying', async () => {
+    const a = await peer('device-a');
+    const b = await peer('device-b');
+    await put(a, 'gamelist.xml', '<one/>\n<two/>\n<three/>\n');
+    await sync(a.node, b.node);
+
+    await put(a, 'gamelist.xml', '<ONE/>\r\n<two/>\r\n<three/>\r\n');
+    await a.node.commit();
+    await put(b, 'gamelist.xml', '<one/>\n<two/>\n<THREE/>\n');
+    const result = await sync(a.node, b.node);
+
+    expect(result.merged).toBe(0);
+    expect(result.conflicts[0]?.text).toBe(true);
+    expect(result.conflicts[0]?.textReason).toBe('eol');
+  });
+
+  it('reports overlapping edits', async () => {
+    const a = await peer('device-a');
+    const b = await peer('device-b');
+    await put(a, 'gamelist.xml', '<one/>\n<two/>\n<three/>\n');
+    await sync(a.node, b.node);
+
+    await put(a, 'gamelist.xml', '<one/>\n<LEFT/>\n<three/>\n');
+    await a.node.commit();
+    await put(b, 'gamelist.xml', '<one/>\n<RIGHT/>\n<three/>\n');
+    const result = await sync(a.node, b.node);
+
+    expect(result.conflicts[0]?.textReason).toBe('block');
+  });
+
+  /** A peer holding the entry and not the bytes has nothing to merge from. */
+  it('reports content this peer does not hold', async () => {
+    const a = await peer('device-a');
+    const relay = await peer('device-b', { materialize: () => false });
+    const c = await peer('device-c');
+
+    await put(a, 'gamelist.xml', '<one/>\n<two/>\n<three/>\n');
+    await sync(a.node, relay.node);
+    await sync(relay.node, c.node);
+
+    await put(a, 'gamelist.xml', '<ONE/>\n<two/>\n<three/>\n');
+    await sync(a.node, relay.node);
+    await put(c, 'gamelist.xml', '<one/>\n<two/>\n<THREE/>\n');
+    const result = await sync(relay.node, c.node);
+
+    expect(result.merged).toBe(0);
+    expect(result.conflicts[0]?.textReason).toBe('unreadable');
+  });
+
+  /** Nothing was attempted, so there is nothing to explain. */
+  it('says nothing when the merge was turned off', async () => {
+    const a = await peer('device-a');
+    const b = await peer('device-b');
+    await put(a, 'gamelist.xml', '<one/>\n<two/>\n');
+    await sync(a.node, b.node);
+
+    await put(a, 'gamelist.xml', '<LEFT/>\n<two/>\n');
+    await a.node.commit();
+    await put(b, 'gamelist.xml', '<RIGHT/>\n<two/>\n');
+    const result = await sync(a.node, b.node, { autoMerge: false });
+
+    expect(result.conflicts[0]?.text).toBe(true);
+    expect(result.conflicts[0]?.textReason).toBeUndefined();
+  });
+
+  it('says nothing when a hook settled what the merge declined', async () => {
+    const a = await peer('device-a');
+    const b = await peer('device-b');
+    await put(a, 'gamelist.xml', '<one/>\n<two/>\n');
+    await sync(a.node, b.node);
+
+    await put(a, 'gamelist.xml', '<LEFT/>\n<two/>\n');
+    await a.node.commit();
+    await put(b, 'gamelist.xml', '<RIGHT/>\n<two/>\n');
+    const result = await sync(a.node, b.node, { resolveText: async () => '<BOTH/>\n<two/>\n' });
+
+    expect(result.merged).toBe(1);
+    expect(result.conflicts[0]?.textReason).toBeUndefined();
   });
 });
 

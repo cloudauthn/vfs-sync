@@ -40,6 +40,7 @@ const node = await VFSNode.open(adapter, {
 | `id` | generated, then persisted | Stable peer id. Appears in log rows and conflict-copy names. |
 | `ignore` | none | Return `true` to keep a path out of sync entirely. Composes by union with `.vfsignore` and `local.ignore` — see [Excluding files](./recipes.md#excluding-files). |
 | `materialize` | keep everything | Return `false` to take the entry without the bytes. See [selective materialisation](#selective-materialisation). |
+| `text` | the header's extension list | Return `true` to claim a path for the three-way merge. Adds to the list, never subtracts — see [selecting by path](./conflicts.md#selecting-by-path). |
 | `now` | `Date.now` | Injectable clock, mostly for tests. |
 | `streamThreshold` | 4 MiB | Size from which content is hashed and moved as a stream. |
 | `rotateAt` | 256 KB | Active log segment size that triggers a rotation. |
@@ -156,6 +157,24 @@ Three rules that are easier to know than to derive:
 
 Neither method writes a log row and neither changes `state`: which content a node stores is a local
 storage decision, not an operation on the mesh.
+
+### Which paths merge as text
+
+```ts
+const node = await VFSNode.open(adapter, { text: (path) => path.startsWith('catalog/') });
+
+await node.isText('catalog/index');   // the full answer: mesh list OR this node's policy
+node.marksText('catalog/index');      // this node's policy alone, synchronously
+```
+
+The `text` list in the header selects by extension and converges by union across the mesh; the
+predicate selects by path and stays local. It is consulted when a version is **recorded**, not only
+when a conflict is merged — that is where the base copy a three-way merge needs comes from, so a
+policy added today does nothing for versions written yesterday. It adds to the list and cannot
+subtract from it. [Selecting by path](./conflicts.md#selecting-by-path) has the reasoning.
+
+Nothing adds to the travelling list at runtime. It converges by union and never shrinks, so widening
+it is permanent for every peer — a decision the library does not offer as a one-liner.
 
 ### Exclusion rules
 
@@ -543,7 +562,7 @@ const { entries, conflicts } = mergeEntries(
 | `history` | Ancestry. An empty one is legal and merely pessimistic — every divergence reads as a conflict. |
 | `conflictCopies` | `'edits'` (default), `'always'` or `false`. |
 | `conflictName` | Names the conflict copies. |
-| `text` | `true` for paths that should get a three-way merge; drives `ConflictReport.text`. |
+| `text` | `true` for paths that should get a three-way merge; drives `ConflictReport.text`. `sync()` builds this one by folding the header's extension list together with both nodes' `text` policies. |
 | `heldAt` | Size from which a conflict copy does not travel. |
 
 Each `MergeSide` may also carry `knows(uuid)` — *that peer's own* knowledge, which is what the
@@ -592,6 +611,9 @@ else console.log('declined:', result.reason);  // 'block' | 'size' | 'eol'
 
 There is no mode that emits `<<<<<<<`. `splitLines(text)` is exported too; it keeps terminators, so
 joining is exactly the original.
+
+Inside `sync()` the same three reasons reach the caller as `ConflictReport.textReason`, widened with
+`'no-base'` and `'unreadable'` for the two ways a merge is skipped before `diff3` is ever called.
 
 ---
 

@@ -1,4 +1,5 @@
 import { History } from './history.js';
+import type { Diff3Reason } from './diff3.js';
 import { basename, dirname, splitExtension } from './path.js';
 import { sortEntries } from './vfs-file.js';
 import type { ConflictReason, Hash, VFSEntry } from './types.js';
@@ -25,7 +26,23 @@ export interface ConflictReport {
    * trying. `sync()` is what actually tries it — the merge itself stays pure.
    */
   text?: boolean;
+  /**
+   * Why the attempt did not settle it. Absent when the merge succeeded, and
+   * when none was attempted (`autoMerge: false` with no hook).
+   *
+   * Without this, `text: true` means both "merged" and "was eligible and
+   * refused", and the caller cannot tell which — `'eol'` in particular is a
+   * standing condition of the folder, not an accident of one pass.
+   */
+  textReason?: TextMergeReason;
 }
+
+/**
+ * Why an eligible text conflict was not merged: the three `diff3` declines,
+ * plus the two that happen before it is ever called — no base retained, and
+ * content this peer does not hold.
+ */
+export type TextMergeReason = Diff3Reason | 'no-base' | 'unreadable';
 
 /**
  * `'edits'` (default) keeps a copy only when both sides had real content — the

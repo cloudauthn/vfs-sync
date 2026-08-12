@@ -8,6 +8,7 @@ import type {
   ConflictNameInfo,
   ConflictReport,
   MergeOptions,
+  TextMergeReason,
 } from './merge.js';
 import { CURRENT_VERSION, extensionOf, readable } from './vfs-file.js';
 import { holds, materialised } from './vfs-node.js';
@@ -188,10 +189,7 @@ export async function sync(a: VFSNode, b: VFSNode, options: SyncOptions = {}): P
   const mergeOptions: MergeOptions = {
     history,
     heldAt: options.heldAt ?? HELD_AT,
-    text: (path) => {
-      const extension = extensionOf(path);
-      return extension !== '' && config.text.includes(extension);
-    },
+    text: textPredicate(a, b, config.text),
     ...(options.conflictCopies !== undefined ? { conflictCopies: options.conflictCopies } : {}),
     ...(options.conflictName ? { conflictName: options.conflictName } : {}),
   };
@@ -375,10 +373,7 @@ export async function syncDryRun(
   const mergeOptions: MergeOptions = {
     history,
     heldAt: options.heldAt ?? HELD_AT,
-    text: (path) => {
-      const extension = extensionOf(path);
-      return extension !== '' && text.includes(extension);
-    },
+    text: textPredicate(a, b, text),
     ...(options.conflictCopies !== undefined ? { conflictCopies: options.conflictCopies } : {}),
     ...(options.conflictName ? { conflictName: options.conflictName } : {}),
   };
@@ -680,6 +675,23 @@ function convergeConfig(fileA: VFSFile, fileB: VFSFile): ConvergedConfig {
   };
 }
 
+/**
+ * The single predicate the merge takes, folded out of three sources: the
+ * converged extension list, and each node's own `text` policy.
+ *
+ * Union, and it has to be. The base comes from whichever peer kept one —
+ * `autoMergeText` asks `a` and then `b` — so one side having classified the path
+ * as text is enough for both to get the merge. It also means a node's policy can
+ * only ever add: what it declines, the other side's list may still claim.
+ */
+function textPredicate(a: VFSNode, b: VFSNode, list: string[]): (path: string) => boolean {
+  return (path) => {
+    const extension = extensionOf(path);
+    if (extension !== '' && list.includes(extension)) return true;
+    return a.marksText(path) || b.marksText(path);
+  };
+}
+
 /** Writes a converged config onto both files. `sync()` only — never the dry run. */
 function applyConfig(fileA: VFSFile, fileB: VFSFile, config: ConvergedConfig): void {
   fileA.text = [...config.text];
@@ -897,7 +909,10 @@ async function autoMergeText(
     if (!context.enabled && !context.resolveText) continue;
     const left = report.a;
     const right = report.b;
-    if (left.size > MAX_TEXT_MERGE || right.size > MAX_TEXT_MERGE) continue;
+    if (left.size > MAX_TEXT_MERGE || right.size > MAX_TEXT_MERGE) {
+      report.textReason = 'size';
+      continue;
+    }
 
     const ancestor = report.base ?? history.commonAncestor(report.uuid, left, right);
     const baseBytes = ancestor
@@ -905,13 +920,26 @@ async function autoMergeText(
       : null;
     const mine = await readAt(a, left.path);
     const theirs = await readAt(b, right.path);
-    if (!mine || !theirs) continue;
+    // One of the two peers does not hold the bytes — dematerialised, or held on
+    // the peer that made the copy. Nothing to merge from, and it is not a
+    // refusal: the same conflict merges once the content is fetched.
+    if (!mine || !theirs) {
+      report.textReason = 'unreadable';
+      continue;
+    }
 
     const baseText = baseBytes ? decodeText(baseBytes) : null;
     let text: string | null = null;
-    if (context.enabled && baseText !== null) {
-      const attempt = diff3(baseText, decodeText(mine), decodeText(theirs));
-      if (attempt.ok) text = attempt.text;
+    // Why it did not merge, kept until the hook has had its turn: a hook that
+    // settles it makes the reason moot.
+    let refused: TextMergeReason | undefined;
+    if (context.enabled) {
+      if (baseText === null) refused = 'no-base';
+      else {
+        const attempt = diff3(baseText, decodeText(mine), decodeText(theirs));
+        if (attempt.ok) text = attempt.text;
+        else refused = attempt.reason;
+      }
     }
     if (text === null && context.resolveText) {
       text = await context.resolveText({
@@ -923,7 +951,10 @@ async function autoMergeText(
         peerB: b.peerId,
       });
     }
-    if (text === null) continue;
+    if (text === null) {
+      if (refused) report.textReason = refused;
+      continue;
+    }
 
     const data = encodeText(text);
     const hash = await sha256(data);

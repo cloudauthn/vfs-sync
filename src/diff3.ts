@@ -19,7 +19,10 @@ export const MAX_TEXT_MERGE = 1024 * 1024;
  */
 const MAX_LCS_CELLS = 4_000_000;
 
-export type Diff3Result = { ok: true; text: string } | { ok: false; reason: 'block' | 'size' | 'eol' };
+/** Why a merge was declined: overlapping edits, too big, or mismatched terminators. */
+export type Diff3Reason = 'block' | 'size' | 'eol';
+
+export type Diff3Result = { ok: true; text: string } | { ok: false; reason: Diff3Reason };
 
 /** Splits keeping each terminator, so joining is exactly the original text. */
 export function splitLines(text: string): string[] {
