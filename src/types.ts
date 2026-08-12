@@ -243,6 +243,16 @@ export interface LogMark {
 /** Node-local markers. Travels in the file but is ignored by whoever reads it. */
 export interface LocalState {
   driveChangeToken?: string;
+  /**
+   * Exclusion patterns that apply to this node only.
+   *
+   * They live in `local` because that object is written into the file and
+   * ignored by whoever reads it, which is exactly the contract these need: the
+   * shared rules travel in `.vfsignore`, these do not. Set them through
+   * {@link VFSNode.setLocalIgnore} — the header is rewritten by the engine, so
+   * hand-editing it does not survive.
+   */
+  ignore?: string[];
   /** When the mirror was last checked against the disk. */
   verifiedAt?: number;
   pendingRenames?: Array<{ from: string; to: string }>;

@@ -1,9 +1,11 @@
 import { MAX_TEXT_MERGE } from './diff3.js';
-import { randomId, sha256, sha256Stream } from './hash.js';
+import { decodeText, randomId, sha256, sha256Stream } from './hash.js';
 import { History } from './history.js';
+import { IGNORE_FILE, excludesRulesFile, matchIgnore, parseIgnore } from './ignore.js';
 import { makeRow } from './log.js';
 import { Sha256 } from './sha256.js';
 import { CONTROL_DIR, VFSStore } from './store.js';
+import type { IgnoreRule } from './ignore.js';
 import type { VFSStoreOptions } from './store.js';
 import { STREAM_THRESHOLD, canStream, pump, readRange, readStream, writeStream } from './stream.js';
 import { extensionOf } from './vfs-file.js';
@@ -18,6 +20,7 @@ import type {
   VFSStat,
 } from './types.js';
 import { walk } from './walk.js';
+import type { WalkedFile } from './walk.js';
 
 export interface VFSNodeOptions {
   /** Stable peer id. Generated and persisted in `.vfs/vfs.json` if omitted. */
@@ -139,6 +142,12 @@ export class VFSNode {
   readonly streamThreshold: number;
 
   private readonly ignore: ((path: string) => boolean) | undefined;
+  /** Compiled rules from `.vfsignore`, cached against its mtime+size. */
+  private shared: IgnoreRule[] = [];
+  private sharedStamp: string | null = null;
+  private sharedText = '';
+  /** Compiled rules from `local.ignore` in the header. */
+  private local: IgnoreRule[] = [];
   private readonly policy: ((entry: VFSEntry) => boolean) | undefined;
   private readonly now: () => number;
 
@@ -274,7 +283,7 @@ export class VFSNode {
       const known = byNative.get(change.native) ?? (change.path ? byPath.get(change.path) : undefined);
       const path = known?.path ?? change.path;
       if (!path) continue;
-      if (this.ignore?.(path)) continue;
+      if (this.excluded(path)) continue;
       if (path === CONTROL_DIR || path.startsWith(`${CONTROL_DIR}/`)) continue;
       // A change we cannot attribute is a file in a folder we have never
       // resolved: honestly out of reach until the next walk.
@@ -368,7 +377,20 @@ export class VFSNode {
   // ----------------------------------------------------------------- scan
 
   /**
-   * Whether the current rule keeps this path out of the walk.
+   * The union of the three sources: the shared `.vfsignore`, this node's
+   * `local.ignore`, and the constructor predicate. Ignored by any one of them,
+   * ignored — no precedence to define, because without negation no two rules
+   * can disagree.
+   */
+  private ignores(path: string): boolean {
+    if (path === IGNORE_FILE) return false; // never excluded; see walk()
+    if (matchIgnore(this.shared, path)) return true;
+    if (matchIgnore(this.local, path)) return true;
+    return this.ignore?.(path) ?? false;
+  }
+
+  /**
+   * Whether the current rules keep this path out of the walk.
    *
    * The walk prunes at the directory and never descends, so a rule covering
    * `.cache` also excludes `.cache/x` even when the predicate says nothing
@@ -376,12 +398,72 @@ export class VFSNode {
    * vanished, which is the very thing this exists to prevent.
    */
   private excluded(path: string): boolean {
-    if (!this.ignore) return false;
-    if (this.ignore(path)) return true;
+    if (this.ignores(path)) return true;
     for (let cut = path.lastIndexOf('/'); cut > 0; cut = path.lastIndexOf('/', cut - 1)) {
-      if (this.ignore(path.slice(0, cut))) return true;
+      if (this.ignores(path.slice(0, cut))) return true;
     }
     return false;
+  }
+
+  /**
+   * Refreshes the shared rules from what the walk just saw, and reports whether
+   * they changed.
+   *
+   * `.vfsignore` is ordinary content, so reading it is an adapter call — on
+   * Drive a round trip, on the one path built to avoid them. It is not read on
+   * every scan: the walk already carries its `mtime` and `size`, which is the
+   * same evidence the scan trusts to skip re-reading every other file, so it is
+   * the cache key here too.
+   *
+   * **Not the recorded hash**, which was the obvious choice and is circular:
+   * the hash lives in the entry, the entry does not exist until a scan has
+   * produced it, so a hand-written `.vfsignore` could not take effect in the
+   * pass it appeared in — and the file it was meant to exclude got tracked in
+   * that pass instead. Phase 1 then preserves the tracked entry for good, so
+   * the rule never excludes what it was written for.
+   */
+  private async refreshShared(walked: WalkedFile[]): Promise<boolean> {
+    const seen = walked.find((item) => item.path === IGNORE_FILE);
+    if (!seen) {
+      const had = this.shared.length > 0;
+      this.shared = [];
+      this.sharedStamp = null;
+      return had;
+    }
+    const stamp = `${seen.stat.mtime}:${seen.stat.size}`;
+    if (stamp === this.sharedStamp) return false;
+    this.sharedStamp = stamp;
+    let text = '';
+    try {
+      text = decodeText(await this.adapter.read(IGNORE_FILE));
+    } catch {
+      // Recorded but not on disk: an entry this node never materialised, or a
+      // file that went missing. Missing rules are no rules, not a failed scan.
+      this.sharedStamp = null;
+    }
+    if (text === this.sharedText) return false; // touched, same content
+    this.sharedText = text;
+    this.shared = parseIgnore(text);
+    return true;
+  }
+
+
+  /**
+   * Replaces this node's local exclusion rules. They do not travel.
+   *
+   * Throws when the patterns would exclude `.vfsignore`. The engine never
+   * excludes it in any case (see `walk()`), but here the caller is present and
+   * can be told — which is the difference between this door and the one rules
+   * arrive through from a peer.
+   */
+  async setLocalIgnore(patterns: string[]): Promise<void> {
+    if (excludesRulesFile(patterns)) {
+      throw new Error(`a rule may not exclude ${IGNORE_FILE}: the mesh needs it to converge`);
+    }
+    const file = await this.store.read();
+    file.local.ignore = [...patterns];
+    this.local = parseIgnore(patterns.join('\n'));
+    await this.store.write(file);
   }
 
   /**
@@ -402,10 +484,15 @@ export class VFSNode {
       live.filter((entry) => entry.native).map((entry) => [entry.native as string, entry]),
     );
 
-    const walked = await walk(this.adapter, {
-      directories: true,
-      ...(this.ignore ? { ignore: this.ignore } : {}),
-    });
+    this.local = parseIgnore((file.local.ignore ?? []).join('\n'));
+    const listing = { directories: true, ignore: (path: string) => this.ignores(path) };
+    // The walk prunes with the rules in hand, so an excluded subtree is never
+    // listed. `.vfsignore` is exempt from exclusion, so it always comes back —
+    // and if it has changed, the pass is redone under the new rules. That costs
+    // a second walk only when the rules actually moved, and it is what lets a
+    // rule take effect in the same pass it appears in.
+    let walked = await walk(this.adapter, listing);
+    if (await this.refreshShared(walked)) walked = await walk(this.adapter, listing);
 
     // 1. content hashes, through the mtime+size filter
     const seen: Array<{ path: string; stat: VFSStat; hash: Hash | null; prior?: VFSEntry }> = [];

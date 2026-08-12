@@ -252,22 +252,64 @@ log as history, and ancestry starts over. Content comes back, provenance does no
 If no peer still has the bytes on disk — the file was deleted on the ignoring peer too, after the
 tombstone — it is gone, and the answer is a backup. There is no object store to recover it from.
 
-To read patterns from a file instead:
+### Rules in a file
+
+The predicate is the escape hatch for logic no pattern language expresses. For the ordinary cases
+there are two built-in sources, and all three compose by **union** — ignored by any one of them,
+ignored:
+
+| Source | Travels? | Set by |
+| --- | --- | --- |
+| `.vfsignore` in the working folder | **yes**, it is ordinary content | writing the file |
+| `local.ignore` in the `vfs.json` header | no | `node.setLocalIgnore()` |
+| `VFSNodeOptions.ignore` | no | the caller |
+
+```
+# .vfsignore — shared with every peer
+*.tmp
+.DS_Store
+._*
+@eaDir
+.cache/
+/build/
+```
 
 ```ts
-async function ignoreFrom(adapter: VFSAdapter): Promise<(path: string) => boolean> {
-  const stat = await adapter.stat('.vfsignore');
-  if (!stat) return () => false;
-
-  const patterns = new TextDecoder()
-    .decode(await adapter.read('.vfsignore'))
-    .split('\n')
-    .map((line) => line.trim())
-    .filter((line) => line && !line.startsWith('#'));
-
-  return (path) => patterns.some((p) => path === p || path.startsWith(`${p}/`));
-}
+// local to this node, and it does not travel
+await node.setLocalIgnore(['scratch/', '*.local.json']);
 ```
+
+Three forms, all matched at any depth, because OS junk turns up in every folder:
+
+| Pattern | Matches |
+| --- | --- |
+| `*.tmp`, `._*` | that name, in any folder |
+| `.cache/` | any `.cache` anywhere, and everything under it |
+| `/build/` | only the top-level `build` |
+| `docs/notes.md` | that pair of segments at any depth |
+| `/docs/notes.md` | only that one file |
+
+> **The leading `/` is the only anchor.** This is where the syntax differs from gitignore, where an
+> interior slash anchors implicitly: there, `docs/notes.md` means the one at the top. Here it means
+> *every* `docs/notes.md` in the tree, and `/docs/notes.md` is the one at the top. The difference is
+> silent — you get more excluded than you meant, not an error — so it is worth reading twice.
+
+`*` never crosses a `/`. Blank lines and `#` comments are ignored. There is no `!pattern` negation:
+without it no two rules can disagree, so there is no precedence to define between the three sources.
+
+A trailing `/` is accepted and reads as intent, but it does not change anything — a matched directory
+already covers its subtree, because the walk stops there and never descends.
+
+**`.vfsignore` can never be excluded**, whatever any rule says. It is synced content and the mesh
+needs it to converge: a peer that dropped it from its tree would make every other one read a
+deletion. `setLocalIgnore()` refuses such a rule outright, since there you are present to fix it; a
+rule arriving from a peer is simply not honoured, because a bad line in a file that travels should
+not take down everyone who receives it.
+
+**Distributing rules is safe, and only became so with the fix above.** The sync that carries a new
+`.vfsignore` still runs under the old rules, and converges on the next pass — which is what
+`syncUntilStable` already does. The peers that do not have the rule yet used to be the ones that
+deleted.
 
 ---
 

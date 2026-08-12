@@ -38,7 +38,7 @@ const node = await VFSNode.open(adapter, {
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `id` | generated, then persisted | Stable peer id. Appears in log rows and conflict-copy names. |
-| `ignore` | none | Return `true` to keep a path out of sync entirely. |
+| `ignore` | none | Return `true` to keep a path out of sync entirely. Composes by union with `.vfsignore` and `local.ignore` — see [Excluding files](./recipes.md#excluding-files). |
 | `materialize` | keep everything | Return `false` to take the entry without the bytes. See [selective materialisation](#selective-materialisation). |
 | `now` | `Date.now` | Injectable clock, mostly for tests. |
 | `streamThreshold` | 4 MiB | Size from which content is hashed and moved as a stream. |
@@ -156,6 +156,29 @@ Three rules that are easier to know than to derive:
 
 Neither method writes a log row and neither changes `state`: which content a node stores is a local
 storage decision, not an operation on the mesh.
+
+### Exclusion rules
+
+Three sources, composed by union: `.vfsignore` in the working folder (travels, plain text),
+`local.ignore` in the header (does not travel), and the `ignore` predicate.
+
+```ts
+await node.setLocalIgnore(['scratch/', '*.local.json']);   // throws on a rule excluding .vfsignore
+
+parseIgnore(text);              // string -> IgnoreRule[]
+matchIgnore(rules, path);       // does any rule cover this path?
+excludesRulesFile(patterns);    // would these exclude .vfsignore?
+IGNORE_FILE;                    // '.vfsignore'
+```
+
+`parseIgnore` and `matchIgnore` are pure and exported so the language can be tested — and matched —
+on its own. The syntax, the one place it differs from gitignore, and why `.vfsignore` can never be
+excluded are all in [Excluding files](./recipes.md#excluding-files).
+
+`.vfsignore` is not re-read on every scan: the walk already carries its `mtime` and `size`, which is
+the same evidence the scan trusts to skip re-reading any other file. When it *has* changed, the pass
+is redone under the new rules, so a rule takes effect in the pass it appears in rather than the one
+after.
 
 ### `node.scan()`
 

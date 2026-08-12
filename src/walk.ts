@@ -1,3 +1,4 @@
+import { IGNORE_FILE } from './ignore.js';
 import { CONTROL_DIR } from './store.js';
 import type { VFSAdapter, VFSStat } from './types.js';
 
@@ -30,7 +31,12 @@ export async function walk(adapter: VFSAdapter, options: WalkOptions = {}): Prom
   const visit = async (dir: string): Promise<void> => {
     for (const entry of await adapter.list(dir)) {
       if (entry.path === controlDir || entry.path.startsWith(`${controlDir}/`)) continue;
-      if (ignore?.(entry.path)) continue;
+      // The rules file is never excluded, whatever the rules say. It is synced
+      // content and the mesh needs it to converge: a peer that drops it from
+      // the tree makes every other one read a deletion. Enforced here, by
+      // construction, rather than by rejecting the rule — a bad line in a file
+      // that travels would otherwise take down every peer that received it.
+      if (entry.path !== IGNORE_FILE && ignore?.(entry.path)) continue;
       if (entry.kind === 'directory') {
         if (options.directories) {
           files.push({ path: entry.path, stat: entry.stat ?? { kind: 'directory', size: 0, mtime: 0 } });
