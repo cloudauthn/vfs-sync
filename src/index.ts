@@ -38,7 +38,9 @@ export { basename, dirname, joinPath, normalizePath, splitExtension } from './pa
 export { CONTROL_DIR, ROTATE_AT, VFSStore } from './store.js';
 export type { VFSStoreOptions } from './store.js';
 export {
+  CURRENT_VERSION,
   DEFAULT_TEXT_EXTENSIONS,
+  FORMAT_CHANGES,
   HEADER_PROBE,
   ZERO_DIGEST,
   canonicalEntry,
@@ -46,11 +48,14 @@ export {
   emptyFile,
   encodeVFSFile,
   extensionOf,
+  migrateFile,
   normalizeFile,
   parseHeader,
+  readable,
   sortEntries,
   stateDigest,
 } from './vfs-file.js';
+export type { FormatChange } from './vfs-file.js';
 export {
   canonicalRow,
   encodeRows,
@@ -86,10 +91,12 @@ export type {
   Side,
 } from './merge.js';
 
-export { sync, syncDryRun, syncMesh, syncUntilStable } from './sync.js';
+export { PairingError, sync, syncDryRun, syncMesh, syncUntilStable } from './sync.js';
 export type {
   MeshEdge,
   MeshResult,
+  PairingCode,
+  PairingSide,
   SyncDryRunAction,
   SyncDryRunActionType,
   SyncDryRunResult,

@@ -8,6 +8,7 @@ Everything is exported from `@cloudauthn/vfs-sync`, except `NodeFsAdapter`, whic
 - [sync](#sync)
 - [syncDryRun](#syncdryrun)
 - [syncMesh / syncUntilStable](#syncmesh--syncuntilstable)
+- [Pairing](#pairing)
 - [mergeEntries](#mergeentries)
 - [History](#history)
 - [diff3](#diff3)
@@ -46,10 +47,23 @@ const node = await VFSNode.open(adapter, {
 Creates `.vfs/` if it is not there. Opening the same folder twice returns nodes with the same `id`
 — it is read back from `vfs.json`.
 
-The header also carries a `storeId`: the shared identity of the dataset, as opposed to `peer`, which
-names this one replica. It is generated at init, and every sync makes both peers adopt the
-lexicographically smaller of their two — deterministic and transitive, so a whole mesh settles on
-one value. Two folders showing the same `storeId` are replicas of the same data.
+The header carries two identities, and they answer different questions.
+
+| | Identifies | Born | Converges |
+| --- | --- | --- | --- |
+| `peerId` | **the node** | at init, a UUIDv4 | never |
+| `syncId` | **the group** | on the first sync | yes, on the smaller — after the guard |
+
+`syncId` is an explicit `null` until the folder has synced with someone. That `null` carries
+information: it is what tells a folder that has never paired apart from one written by an engine
+that had no notion of a group. Two folders showing the same `syncId` belong to the same mesh; two
+showing different non-null ones are separate meshes, and [pairing them is refused](#pairing).
+
+`options.id` overrides the generated `peerId`. **In production, omit it** — the default is already a
+UUIDv4 per folder, and the option only exists because tests want fixed ids. If you do pass it, it
+has to be globally unique: two folders that derive it the same way are the collision the guard
+below is built to catch, and the guard is the only thing standing between that and a corrupted log
+offset.
 
 ### Working-folder operations
 
@@ -65,7 +79,7 @@ await node.mkdir('roms/megadrive');       // empty folders sync in v2
 the file's identity and transferring no content. Renaming through the adapter directly still works —
 the hash heuristic catches it — but going through the node is exact.
 
-`node.name` is the adapter's label; `node.id` is the peer id.
+`node.name` is the adapter's label; `node.peerId` is this node's identity.
 
 ### Partial reads and streams
 
@@ -324,7 +338,7 @@ Returns:
 | Field | Type | Meaning |
 | --- | --- | --- |
 | `changed` | `boolean` | `true` when a final `sync()` call would do work. |
-| `configChanged` | `boolean` | `true` when `storeId` or `text` convergence would happen. |
+| `configChanged` | `boolean` | `true` when `text` convergence would happen. |
 | `conflicts` | `ConflictReport[]` | Conflicts the sync would produce. |
 | `transferred` | `{ toA: number; toB: number }` | Predicted file copies per direction. |
 | `merged` | `number` | Text conflicts that would auto-merge. |
@@ -382,6 +396,94 @@ const conflicts = rounds.flat().flatMap((r) => r.result.conflicts);
 ```
 
 A change moves one hop per pass, so a chain of *n* peers needs up to *n − 1* rounds.
+
+One bad edge does not paralyse the mesh: an edge that throws is reported in place and every other
+edge in the pass still runs, so `MeshResult` carries `result` **or** `error`.
+
+```ts
+for (const { edge, result, error } of await syncMesh(edges)) {
+  if (error) console.warn(`${edge.a.name} <-> ${edge.b.name}: ${error.message}`);
+  else if (result.changed) console.log('updated', edge.a.name);
+}
+```
+
+`syncUntilStable` does not count a failing edge as progress — a throw that repeats identically every
+pass is not a reason to keep going.
+
+---
+
+## Pairing
+
+Before anything is merged, `sync()` decides whether these two folders *may* merge. Nothing has been
+written at that point, which is what makes stopping safe.
+
+Two checks, in this order — reading `peerId` and `syncId` means nothing until you know which version
+wrote them:
+
+| Code | Means |
+| --- | --- |
+| `version-unreconcilable` | this engine cannot interpret the other folder's format |
+| `peer-collision` | both folders claim the same `peerId`: one is a copy, or the id was imposed |
+| `foreign-mesh` | two established groups with different `syncId`s |
+
+Everything else is ordinary. Equal `syncId`s is every sync after the first; two `null`s mint one; a
+`syncId` against a `null` is a folder joining a group, and needs no tiebreak because the one without
+an affiliation has none to lose.
+
+```ts
+try {
+  await sync(a, b);
+} catch (error) {
+  if (!(error instanceof PairingError)) throw error;
+  console.log(error.code, error.a.entries, 'files against', error.b.entries);
+}
+```
+
+`PairingError` carries both sides — `peerId`, `syncId`, `version`, live entry count and log digest —
+so a caller can present *"1,240 files against 890"* instead of two uuids. The library detects,
+describes and stops: it does not ask, and it does not decide. Note what is **not** being decided
+here — there is no "this folder wins" mode. Resolution stays per file and per version, with ancestry
+above the clock; the only question settled is whether to merge at all.
+
+To authorise a merge, name one of the two reported `syncId`s:
+
+```ts
+await sync(a, b, { adopt: { syncId: error.a.syncId } });
+```
+
+Specific on purpose. A blanket `true` would disarm the guard at that call site for ever, including a
+different collision months later — it is the same "prove you knew the prior state" idiom as
+`writeIf(path, data, tag)`. Once authorised the merge is the ordinary merge, and the smaller
+`syncId` survives.
+
+**`peer-collision` is not authorisable.** Merging two nodes with one identity is not a decision
+anyone can make well: `peers` is keyed by `peerId`, so the two share a slot, each sync overwrites
+the other's mark, and the log offset that mark carries is then applied to a log it does not describe.
+The remedy lies outside sync.
+
+### Format versions
+
+`vfs.json` migrates **eagerly** on read; the commit log migrates **in the reader**, because closed
+segments are immutable and cached for ever. The rule generalises: what is mutable migrates eagerly,
+what is immutable migrates in the reader.
+
+```ts
+CURRENT_VERSION;              // the version this engine writes
+readable(2);                  // can it interpret a version 2 folder?
+FORMAT_CHANGES;               // the registry, one entry per step
+```
+
+Each step declares whether it is `additive`, `migratable` or `breaking`. The distinction is not
+cosmetic — it answers whether the change can ship in one go:
+
+| `kind` | new engine reads old | **old engine reads new** |
+| --- | --- | --- |
+| `additive` | yes, nothing to do | **yes** — new fields it ignores |
+| `migratable` | yes, via `migrate` | **no** |
+| `breaking` | no | no |
+
+The second column is the one that matters, because on shared storage the old engine *is* going to
+read what the new one writes.
 
 ---
 

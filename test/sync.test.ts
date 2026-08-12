@@ -184,7 +184,7 @@ describe('sync', () => {
 
     await sync(a.node, b.node);
 
-    expect((await a.node.file()).storeId).toBe((await b.node.file()).storeId);
+    expect((await a.node.file()).syncId).toBe((await b.node.file()).syncId);
     expect((await a.node.file()).text).toContain('gamelist');
   });
 
@@ -398,7 +398,7 @@ describe('chains', () => {
     await syncUntilStable(edges);
 
     const again = await syncUntilStable(edges, { maxRounds: 3 });
-    expect(again.flat().flatMap((item) => item.result.conflicts)).toHaveLength(0);
+    expect(again.flat().flatMap((item) => item.result?.conflicts ?? [])).toHaveLength(0);
   });
 
   it('follows a rename chain a lagging peer never saw', async () => {

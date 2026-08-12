@@ -243,7 +243,7 @@ anyway:
 const pending = await node.conflicts();   // reads vfs.json; no network, no sync
 
 for (const item of pending) {
-  console.log(`${item.path} — ${item.reason}, ${item.peer}'s version is at ${item.copyPath}`);
+  console.log(`${item.path} — ${item.reason}, ${item.peerId}'s version is at ${item.copyPath}`);
 }
 ```
 
@@ -293,8 +293,8 @@ for (const conflict of conflicts) {
   const loser = conflict.winner === 'a' ? conflict.b : conflict.a;
 
   console.log(`${conflict.path} (${conflict.kind})`);
-  console.log(`  kept:  ${winner?.peer} — ${new Date(winner!.updated).toISOString()}`);
-  console.log(`  lost:  ${loser?.peer} — ${new Date(loser!.updated).toISOString()}`);
+  console.log(`  kept:  ${winner?.peerId} — ${new Date(winner!.updated).toISOString()}`);
+  console.log(`  lost:  ${loser?.peerId} — ${new Date(loser!.updated).toISOString()}`);
   if (conflict.copy) console.log(`  saved: ${conflict.copy.path}`);
 }
 ```

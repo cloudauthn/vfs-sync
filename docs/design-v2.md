@@ -104,7 +104,7 @@ It is the mirror of the tree and the only thing a sync needs to read in order to
 ```jsonc
 {
   "version": 2,
-  "storeId": "9f3c…",          // identity of the dataset; converges on the lexicographically smaller
+  "syncId": "9f3c…",           // identity of the group; null until the first sync
   "peer": "device-a",          // identity of this node
   "state": "4a28fc…",          // digest of the live entries, fixed fields (see below)
   "text": ["xml", "nfo", "m3u", "cue", "txt", "md"],   // extensions that get a text merge (§4)
@@ -186,7 +186,7 @@ remains the logical identity.
 
 **What travels and what does not.** The whole file is read as it stands, but `peers` and `local` are
 markers of this node: whoever reads it from outside ignores them. The `text` list converges by union
-on sync, just as `storeId` converges on the smaller: two stores end up classifying the same way,
+on sync, the same way `syncId` settles on the smaller: two stores end up classifying the same way,
 which is what §4 requires. `hash-cache.json` disappears because `entries` already carries
 `hash`+`size`+`updated` per path, which is exactly the filter of v1 section 4.
 
@@ -519,7 +519,8 @@ where it does not, two columns — which is plenty for deciding between two vers
 Replaces section 8 of v1. There is no ancestor negotiation.
 
 1. **Read the header** of the other peer's `vfs.json` (`readRange`, §2) — 1 read.
-2. **Config**: `storeId` converges on the lexicographically smaller (same as today); the `text` list,
+2. **Config**: the `text` list converges by union; group identity (`syncId`) is decided by the
+   pairing guard rather than here, and the `text` list,
    by union.
 3. **`state`**: if their digest matches mine, there is nothing to do. Done.
 4. **Read the whole file** and do the **entry merge** in memory (§4) → per file: nothing / fetch /

@@ -10,7 +10,7 @@ async function row(uuid: string, at: number, hash: string | null = 'h'): Promise
   return makeRow({
     batch: 'b1',
     at,
-    peer: 'device-a',
+    peerId: 'device-a',
     uuid,
     type: hash ? 'write' : 'delete',
     kind: 'file',
@@ -22,12 +22,12 @@ async function row(uuid: string, at: number, hash: string | null = 'h'): Promise
 describe('the control folder', () => {
   it('opens an empty store and keeps its identity on reopen', async () => {
     const adapter = new MemoryAdapter('device-a');
-    const created = await new VFSStore(adapter).init({ peer: 'device-a' });
-    const reopened = await new VFSStore(adapter).init({ peer: 'someone-else' });
+    const created = await new VFSStore(adapter).init({ peerId: 'device-a' });
+    const reopened = await new VFSStore(adapter).init({ peerId: 'someone-else' });
 
-    expect(reopened.peer).toBe('device-a');
-    expect(reopened.storeId).toBe(created.storeId);
-    expect(reopened.version).toBe(2);
+    expect(reopened.peerId).toBe('device-a');
+    expect(reopened.syncId).toBe(created.syncId);
+    expect(reopened.version).toBe(3);
   });
 
   it('says which backend has no store rather than inventing one', async () => {
@@ -43,7 +43,7 @@ describe('the control folder', () => {
    */
   it('tells a backend that broke apart from a file that is not there', async () => {
     const base = new MemoryAdapter('flaky');
-    await new VFSStore(base).init({ peer: 'device-a' });
+    await new VFSStore(base).init({ peerId: 'device-a' });
     const broken = Object.create(base) as MemoryAdapter;
     broken.read = () => Promise.reject(new Error('502 from the backend'));
 
@@ -57,8 +57,8 @@ describe('the control folder', () => {
     const writer = new VFSStore(adapter);
     const reader = new VFSStore(adapter);
 
-    const file = await writer.init({ peer: 'device-a' });
-    expect((await reader.read()).peer).toBe('device-a');
+    const file = await writer.init({ peerId: 'device-a' });
+    expect((await reader.read()).peerId).toBe('device-a');
 
     file.text = ['xml'];
     await writer.write(file);
@@ -73,7 +73,7 @@ describe('appending to the log', () => {
   it('adds only what the segment does not already hold', async () => {
     const adapter = new MemoryAdapter('s');
     const store = new VFSStore(adapter);
-    const file = await store.init({ peer: 'device-a' });
+    const file = await store.init({ peerId: 'device-a' });
 
     const one = await row('u1', 100);
     const two = await row('u2', 200);
@@ -86,7 +86,7 @@ describe('appending to the log', () => {
 
   it('keeps the digest in step with the set', async () => {
     const store = new VFSStore(new MemoryAdapter('s'));
-    const file = await store.init({ peer: 'device-a' });
+    const file = await store.init({ peerId: 'device-a' });
     expect(file.log.digest).toBe(ZERO_DIGEST);
 
     await store.append([await row('u1', 100)], file);
@@ -103,7 +103,7 @@ describe('appending to the log', () => {
   it('folds in rows another writer appended underneath it', async () => {
     const adapter = new MemoryAdapter('s');
     const mine = new VFSStore(adapter);
-    const file = await mine.init({ peer: 'device-a' });
+    const file = await mine.init({ peerId: 'device-a' });
     await mine.append([await row('u1', 100)], file);
 
     // Somebody else appends through a store of their own.
@@ -118,7 +118,7 @@ describe('appending to the log', () => {
   it('reads the tail from an offset instead of the whole segment', async () => {
     const adapter = new MemoryAdapter('s');
     const store = new VFSStore(adapter);
-    const file = await store.init({ peer: 'device-a' });
+    const file = await store.init({ peerId: 'device-a' });
     await store.append([await row('u1', 100)], file);
     const offset = file.log.size;
     await store.append([await row('u2', 200)], file);
@@ -131,7 +131,7 @@ describe('appending to the log', () => {
 describe('base/', () => {
   it('holds text versions and prunes what nothing refers to', async () => {
     const store = new VFSStore(new MemoryAdapter('s'));
-    await store.init({ peer: 'device-a' });
+    await store.init({ peerId: 'device-a' });
     await store.putBase('keepme', encoder.encode('kept'));
     await store.putBase('dropme', encoder.encode('dropped'));
 

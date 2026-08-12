@@ -44,7 +44,7 @@ function rollup(dir: TreeDir): { count: number; bytes: number } {
 }
 
 function selectedOn(model: ExplorerModel, path: string): boolean {
-  return model.selection?.peer === model.active && model.selection.path === path;
+  return model.selection?.peerId === model.active && model.selection.path === path;
 }
 
 function treeRows(model: ExplorerModel, peer: Peer, dir: TreeDir, depth: number): JSX.Element[] {

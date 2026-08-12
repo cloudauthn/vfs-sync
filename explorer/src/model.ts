@@ -166,7 +166,7 @@ export interface Snapshot {
 }
 
 export interface Selection {
-  peer: string;
+  peerId: string;
   path: string;
   kind: 'file' | 'directory';
 }
@@ -182,7 +182,7 @@ export interface Across {
 
 /** Everything the right-hand column shows about the current selection. */
 export interface Details {
-  peer: string;
+  peerId: string;
   path: string;
   kind: 'file' | 'directory';
   stat: VFSStat | null;
@@ -231,7 +231,7 @@ export interface BrowseRow {
   /** Directory rows only. */
   childCount: number;
   /** Directory rows only: the `.vfs` store inside, if any. */
-  info: { storeId: string } | null;
+  info: { syncId: string | null } | null;
   expanded: boolean;
 }
 
@@ -245,7 +245,7 @@ export type BrowseDetailsData =
       name: string;
       /** Immediate children only — a recursive walk is too costly on Drive. */
       count: number;
-      info: { storeId: string } | null;
+      info: { syncId: string | null } | null;
     };
 
 /** Everything the new-tab view draws, computed off the browsing thread. */
@@ -280,7 +280,7 @@ export interface ExplorerDialog {
 interface BrowseListing {
   entries: VFSListEntry[];
   /** `undefined` until this folder has been probed for a store. */
-  info?: { storeId: string } | null;
+  info?: { syncId: string | null } | null;
   expiresAt: number;
 }
 
@@ -711,7 +711,7 @@ export class ExplorerModel {
       this.snapshots = merged;
       this.treeLoading = false;
       this.emit();
-      if (this.selection?.peer === peer.key) {
+      if (this.selection?.peerId === peer.key) {
         await this.select(peer, { path: this.selection.path, kind: this.selection.kind });
       }
       return;
@@ -728,7 +728,7 @@ export class ExplorerModel {
     if (index === -1) return;
     this.peers.splice(index, 1);
     this.rebuildEdges();
-    if (this.selection?.peer === peer.key) {
+    if (this.selection?.peerId === peer.key) {
       this.selection = null;
       this.details = null;
       this.dirty = false;
@@ -783,16 +783,16 @@ export class ExplorerModel {
   private async readVfsInfo(
     adapter: VFSAdapter,
     children: VFSListEntry[],
-  ): Promise<{ storeId: string } | null> {
+  ): Promise<{ syncId: string | null } | null> {
     const control = children.find((c) => c.name === CONTROL_DIR && c.kind === 'directory');
     if (!control) return null;
     try {
       // Only the header is needed, and it comes first in the file — so this
       // stays a few hundred bytes even when `entries` runs to megabytes.
       const prefix = await readRange(adapter, `${control.path}/vfs.json`, { end: HEADER_PROBE });
-      return { storeId: parseHeader(prefix)?.storeId ?? 'unknown' };
+      return { syncId: parseHeader(prefix)?.syncId ?? null };
     } catch {
-      return { storeId: 'unknown' };
+      return { syncId: null };
     }
   }
 
@@ -807,7 +807,7 @@ export class ExplorerModel {
     source: BrowseSource,
     path: string,
     children: VFSListEntry[],
-  ): Promise<{ storeId: string } | null> {
+  ): Promise<{ syncId: string | null } | null> {
     if (!source.adapter) return null;
     const held = this.browseCache.get(`${source.key}:${normalizePath(path)}`);
     if (held?.info !== undefined && Date.now() < held.expiresAt) return held.info;
@@ -1371,7 +1371,7 @@ export class ExplorerModel {
     const unsaved =
       this.dirty &&
       this.details &&
-      this.details.peer === peer.key &&
+      this.details.peerId === peer.key &&
       this.details.path === entry?.path
         ? this.details.text
         : null;
@@ -1385,7 +1385,7 @@ export class ExplorerModel {
       this.emit();
       return;
     }
-    this.selection = { peer: peer.key, path: entry.path, kind: entry.kind };
+    this.selection = { peerId: peer.key, path: entry.path, kind: entry.kind };
     const token = ++this.detailToken;
     // Paint the row highlight straight away; the checksum arrives after.
     this.detailsLoading = !this.dirty;
@@ -1415,7 +1415,7 @@ export class ExplorerModel {
     const mime = mimeOf(current.path);
     const control = this.isControlPath(current.path);
     const detail: Details = {
-      peer: peer.key,
+      peerId: peer.key,
       path: current.path,
       kind: current.kind,
       stat: null,
@@ -1662,7 +1662,7 @@ export class ExplorerModel {
   async resolveConflict(peer: Peer, uuid: string, choice: 'mine' | 'theirs'): Promise<void> {
     const pending = (await peer.node.conflicts()).find((item) => item.uuid === uuid);
     if (!pending) return;
-    if (pending.held && pending.held !== peer.node.id && choice === 'theirs') {
+    if (pending.held && pending.held !== peer.node.peerId && choice === 'theirs') {
       this.log(`that version stayed on ${pending.held} — sync with it first`, 'warn');
       return;
     }
@@ -1821,8 +1821,10 @@ export class ExplorerModel {
     this.emit();
     try {
       const rounds = await syncUntilStable(this.edges);
-      const changed = rounds.flat().filter((r) => r.result.changed);
-      const conflicts = rounds.flat().flatMap((r) => r.result.conflicts);
+      const changed = rounds.flat().filter((r) => r.result?.changed);
+      const conflicts = rounds.flat().flatMap((r) => r.result?.conflicts ?? []);
+      const failed = rounds.flat().filter((r) => r.error);
+      for (const edge of failed) this.log(`${edge.edge.a.name} <-> ${edge.edge.b.name}: ${edge.error?.message}`, 'warn');
       if (changed.length === 0) this.log('every root already in sync');
       else this.log(`converged in ${rounds.length} round(s), ${changed.length} edge update(s)`, 'ok');
       for (const conflict of conflicts) this.logConflict(conflict);
@@ -1839,7 +1841,7 @@ export class ExplorerModel {
     const winner = conflict.winner === 'a' ? conflict.a : conflict.b;
     this.log(
       `conflict on ${conflict.path} (${conflict.kind}) — ` +
-        `${winner?.peer ?? conflict.winner} has the newer version` +
+        `${winner?.peerId ?? conflict.winner} has the newer version` +
         (conflict.copy ? `, kept ${conflict.copy.path}` : ''),
       'conflict',
     );
@@ -1848,7 +1850,7 @@ export class ExplorerModel {
   /** A sync may have rewritten or removed whatever was selected. */
   private async reselect(): Promise<void> {
     await this.render();
-    const peer = this.peerOf(this.selection?.peer);
+    const peer = this.peerOf(this.selection?.peerId);
     if (!this.selection || !peer) return;
     const stat = await peer.adapter.stat(this.selection.path);
     if (!stat) await this.select(peer, null);

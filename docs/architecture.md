@@ -76,7 +76,7 @@ The mirror of the working tree, and the only file a sync has to read to decide a
 ```jsonc
 {
   "version": 2,
-  "storeId": "9f3c…",          // identity of the dataset; converges on the smaller
+  "syncId": "9f3c…",           // identity of the group; null until the first sync
   "peer": "device-a",          // identity of this node
   "state": "4a28fc…",          // digest of the live entries, over the converging fields
   "text": ["xml", "nfo", "m3u", "cue", "txt", "md"],
@@ -342,7 +342,8 @@ What `sync(a, b)` does, in order:
    one-range-read-per-peer assumes a client/server split this library does not have: there is no
    "remote peer" whose scan somebody else runs. `VFSStore.header()` is the cheap path for inspecting
    a store *without* opening it as a node, which is what the explorer's folder probe does.)
-3. **Converge config**: `storeId` on the lexicographically smaller, the `text` list by union.
+3. **Converge config**: the `text` list by union. Group identity is not here — `syncId` is
+   settled by the pairing guard and written when the sync closes.
 4. **Compare `state`.** Equal digests, equal log digests → nothing to do. **Fin.**
 5. **Merge the entries** in memory. The log is opened only when the entries cannot answer alone:
    when an entry exists on one side and not the other (it may be a delete whose tombstone was

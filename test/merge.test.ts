@@ -11,13 +11,13 @@ function entry(partial: Partial<VFSEntry> & { uuid: string; path: string }): VFS
     size: 1,
     created: 1000,
     updated: 1000,
-    peer: 'device-a',
+    peerId: 'device-a',
     ...partial,
   };
 }
 
-const A = (...entries: VFSEntry[]): MergeSide => ({ peer: 'device-a', entries });
-const B = (...entries: VFSEntry[]): MergeSide => ({ peer: 'device-b', entries });
+const A = (...entries: VFSEntry[]): MergeSide => ({ peerId: 'device-a', entries });
+const B = (...entries: VFSEntry[]): MergeSide => ({ peerId: 'device-b', entries });
 
 /** The one-step chains `prev`/`prevPath` describe, with nothing else loaded. */
 function inline(...entries: VFSEntry[]): History {
@@ -108,7 +108,7 @@ describe('mergeEntries', () => {
 
   it('resolves a real conflict in favour of the newer updated', () => {
     const a = entry({ uuid: '1', path: 'a.md', hash: 'x', updated: 1000, prev: 'old' });
-    const b = entry({ uuid: '1', path: 'a.md', hash: 'y', updated: 2000, prev: 'old', peer: 'device-b' });
+    const b = entry({ uuid: '1', path: 'a.md', hash: 'y', updated: 2000, prev: 'old', peerId: 'device-b' });
 
     const { entries, conflicts } = mergeEntries(A(a), B(b), { history: inline(a, b) });
     expect(conflicts[0]?.kind).toBe('content');
@@ -123,7 +123,7 @@ describe('mergeEntries', () => {
    */
   it('calls divergence from a shared parent a conflict, not a propagation', () => {
     const a = entry({ uuid: '1', path: 'a.md', hash: 'x', updated: 1000, prev: 'old' });
-    const b = entry({ uuid: '1', path: 'a.md', hash: 'y', updated: 2000, prev: 'old', peer: 'device-b' });
+    const b = entry({ uuid: '1', path: 'a.md', hash: 'y', updated: 2000, prev: 'old', peerId: 'device-b' });
     const history = History.from([
       [
         { uuid: '1', at: 500, type: 'write', path: 'a.md', hash: 'old', prev: null } as unknown as LogRow,
@@ -155,7 +155,7 @@ describe('mergeEntries', () => {
       hash: 'bbbbbbbb22',
       updated: 2000,
       prev: 'old',
-      peer: 'device-b',
+      peerId: 'device-b',
     });
 
     const { entries, conflicts } = mergeEntries(A(a), B(b), { history: inline(a, b) });
@@ -170,7 +170,7 @@ describe('mergeEntries', () => {
 
   it('produces the same conflict copy when re-merged', () => {
     const a = entry({ uuid: '1', path: 'notes.md', hash: 'x1', updated: 1000, prev: 'old' });
-    const b = entry({ uuid: '1', path: 'notes.md', hash: 'y2', updated: 2000, prev: 'old', peer: 'device-b' });
+    const b = entry({ uuid: '1', path: 'notes.md', hash: 'y2', updated: 2000, prev: 'old', peerId: 'device-b' });
 
     const first = mergeEntries(A(a), B(b), { history: inline(a, b) }).entries;
     const second = mergeEntries(A(...first), B(b), { history: inline(a, b) }).entries;
@@ -186,7 +186,7 @@ describe('mergeEntries', () => {
       updated: 2000,
       size: 700,
       prev: 'old',
-      peer: 'device-b',
+      peerId: 'device-b',
     });
 
     const { entries } = mergeEntries(A(a), B(b), { history: inline(a, b), heldAt: 100 });
@@ -195,7 +195,7 @@ describe('mergeEntries', () => {
 
   it('merges a rename on one side with an edit on the other', () => {
     const a = entry({ uuid: '1', path: 'renamed.md', hash: 'old', updated: 2000, prevPath: 'a.md' });
-    const b = entry({ uuid: '1', path: 'a.md', hash: 'edited', updated: 3000, prev: 'old', peer: 'device-b' });
+    const b = entry({ uuid: '1', path: 'a.md', hash: 'edited', updated: 3000, prev: 'old', peerId: 'device-b' });
 
     const { entries, conflicts } = mergeEntries(A(a), B(b), { history: inline(a, b) });
     expect(conflicts).toHaveLength(0);
@@ -228,7 +228,7 @@ describe('mergeEntries', () => {
 
   it('resolves two different renames as a location conflict', () => {
     const a = entry({ uuid: '1', path: 'left.md', hash: 'same', updated: 1000, prevPath: 'a.md' });
-    const b = entry({ uuid: '1', path: 'right.md', hash: 'same', updated: 2000, prevPath: 'a.md', peer: 'device-b' });
+    const b = entry({ uuid: '1', path: 'right.md', hash: 'same', updated: 2000, prevPath: 'a.md', peerId: 'device-b' });
 
     const { entries, conflicts } = mergeEntries(A(a), B(b), { history: inline(a, b) });
     expect(conflicts).toHaveLength(1);
@@ -248,7 +248,7 @@ describe('mergeEntries', () => {
       updated: 2000,
       prev: 'old',
       prevPath: 'a.md',
-      peer: 'device-b',
+      peerId: 'device-b',
     });
     const { conflicts } = mergeEntries(A(a), B(b), { history: inline(a, b) });
     expect(conflicts).toHaveLength(1);
@@ -257,7 +257,7 @@ describe('mergeEntries', () => {
 
   it('breaks an updated tie deterministically instead of by argument order', () => {
     const a = entry({ uuid: '1', path: 'a.md', hash: 'aaa', updated: 5000, prev: 'old' });
-    const b = entry({ uuid: '1', path: 'a.md', hash: 'bbb', updated: 5000, prev: 'old', peer: 'device-b' });
+    const b = entry({ uuid: '1', path: 'a.md', hash: 'bbb', updated: 5000, prev: 'old', peerId: 'device-b' });
 
     const left = mergeEntries(A(a), B(b), { history: inline(a, b) }).entries.find(
       (item) => item.path === 'a.md',
@@ -272,7 +272,7 @@ describe('mergeEntries', () => {
 
   it('reports delete-versus-edit and lets the newer side win', () => {
     const a = entry({ uuid: '1', path: 'a.md', hash: null, deleted: true, updated: 3000, prev: 'old' });
-    const b = entry({ uuid: '1', path: 'a.md', hash: 'edited', updated: 2000, prev: 'old', peer: 'device-b' });
+    const b = entry({ uuid: '1', path: 'a.md', hash: 'edited', updated: 2000, prev: 'old', peerId: 'device-b' });
 
     const { entries, conflicts } = mergeEntries(A(a), B(b), { history: inline(a, b) });
     expect(conflicts[0]?.kind).toBe('delete-edit');
@@ -283,7 +283,7 @@ describe('mergeEntries', () => {
 
   it("keeps the edited version under conflictCopies: 'always'", () => {
     const a = entry({ uuid: '1', path: 'a.md', hash: null, deleted: true, updated: 3000, prev: 'old' });
-    const b = entry({ uuid: '1', path: 'a.md', hash: 'edited', updated: 2000, prev: 'old', peer: 'device-b' });
+    const b = entry({ uuid: '1', path: 'a.md', hash: 'edited', updated: 2000, prev: 'old', peerId: 'device-b' });
 
     const { conflicts } = mergeEntries(A(a), B(b), {
       history: inline(a, b),
@@ -295,7 +295,7 @@ describe('mergeEntries', () => {
 
   it('is symmetric: swapping the peers yields the same content', () => {
     const a = entry({ uuid: '1', path: 'a.md', hash: 'x', updated: 1000, prev: 'old' });
-    const b = entry({ uuid: '1', path: 'a.md', hash: 'y', updated: 2000, prev: 'old', peer: 'device-b' });
+    const b = entry({ uuid: '1', path: 'a.md', hash: 'y', updated: 2000, prev: 'old', peerId: 'device-b' });
 
     const left = mergeEntries(A(a), B(b), { history: inline(a, b) }).entries;
     const right = mergeEntries(A(b), B(a), { history: inline(a, b) }).entries;
@@ -304,7 +304,7 @@ describe('mergeEntries', () => {
 
   it('flags a text conflict for the three-way path without resolving it itself', () => {
     const a = entry({ uuid: '1', path: 'list.xml', hash: 'x', updated: 1000, prev: 'old' });
-    const b = entry({ uuid: '1', path: 'list.xml', hash: 'y', updated: 2000, prev: 'old', peer: 'device-b' });
+    const b = entry({ uuid: '1', path: 'list.xml', hash: 'y', updated: 2000, prev: 'old', peerId: 'device-b' });
 
     const { conflicts } = mergeEntries(A(a), B(b), {
       history: inline(a, b),
@@ -336,7 +336,7 @@ describe('directories', () => {
       updated: 1000,
     });
     const child = entry({ uuid: 'c', path: 'photos/one.jpg', hash: 'c1', updated: 1000 });
-    const file = entry({ uuid: 'f', path: 'photos', hash: 'f1', updated: 5000, peer: 'device-b' });
+    const file = entry({ uuid: 'f', path: 'photos', hash: 'f1', updated: 5000, peerId: 'device-b' });
 
     const { entries, conflicts } = mergeEntries(A(dir, child), B(file));
     const paths = entries.map((item) => item.path).sort();
@@ -360,9 +360,9 @@ describe('directories', () => {
    */
   it('resolves a collision the first pass created', () => {
     const winner = entry({ uuid: 'u1', path: 'notes.md', hash: 'hA', updated: 3000 });
-    const loser = entry({ uuid: 'u1', path: 'notes.md', hash: 'hL', peer: 'device-b', updated: 1000 });
+    const loser = entry({ uuid: 'u1', path: 'notes.md', hash: 'hL', peerId: 'device-b', updated: 1000 });
     // Same peer and same hash as the loser, so it derives the same aside name.
-    const twin = entry({ uuid: 'u2', path: 'notes.md', hash: 'hL', peer: 'device-b', updated: 2000 });
+    const twin = entry({ uuid: 'u2', path: 'notes.md', hash: 'hL', peerId: 'device-b', updated: 2000 });
 
     const { entries } = mergeEntries(A(winner, twin), B(loser), { conflictCopies: 'always' });
 
@@ -377,7 +377,7 @@ describe('defaultConflictName', () => {
     expect(
       defaultConflictName({
         path: 'docs/notes.md',
-        peer: 'device-b',
+        peerId: 'device-b',
         hash: '1f4a9c2e0000',
         entry: entry({ uuid: '1', path: 'docs/notes.md' }),
       }),
@@ -388,7 +388,7 @@ describe('defaultConflictName', () => {
     expect(
       defaultConflictName({
         path: 'LICENSE',
-        peer: 'p',
+        peerId: 'p',
         hash: 'abcdef1234',
         entry: entry({ uuid: '1', path: 'LICENSE' }),
       }),

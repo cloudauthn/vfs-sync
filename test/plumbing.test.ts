@@ -16,7 +16,7 @@ import type { LogRow, VFSAdapter, VFSChangeFeed } from '../src/types.js';
 const facts = (uuid: string, at: number): Omit<LogRow, 'op'> => ({
   batch: 'b1',
   at,
-  peer: 'device-a',
+  peerId: 'device-a',
   uuid,
   type: 'write',
   kind: 'file',
@@ -61,7 +61,7 @@ describe('VFSStore.header', () => {
     const cold = new VFSStore(watched);
     const header = await cold.header();
 
-    expect(header.storeId).toBe((await node.file()).storeId);
+    expect(header.syncId).toBe((await node.file()).syncId);
     expect(header.state).toBe(await node.state());
     expect(header).not.toHaveProperty('entries');
     // A bounded probe, not the whole file.
@@ -71,8 +71,8 @@ describe('VFSStore.header', () => {
 
   it('serves the header from memory once the file is in hand', async () => {
     const store = new VFSStore(new MemoryAdapter('m'));
-    const file = await store.init({ peer: 'device-a' });
-    expect((await store.header()).peer).toBe(file.peer);
+    const file = await store.init({ peerId: 'device-a' });
+    expect((await store.header()).peerId).toBe(file.peerId);
   });
 
   /**
@@ -82,7 +82,7 @@ describe('VFSStore.header', () => {
   it('grows the probe rather than truncating a large header', async () => {
     const adapter = new MemoryAdapter('crowded');
     const store = new VFSStore(adapter);
-    const file = await store.init({ peer: 'device-a' });
+    const file = await store.init({ peerId: 'device-a' });
     for (let i = 0; i < 400; i++) {
       file.peers[`peer-${i}-${'x'.repeat(40)}`] = {
         lastSync: 1000 + i,
@@ -388,7 +388,7 @@ describe('appending without a native append', () => {
   it('extends the log through the conditional write', async () => {
     const base = new MemoryAdapter('drive-like');
     const store = new VFSStore(conditional(base));
-    const file = await store.init({ peer: 'device-a' });
+    const file = await store.init({ peerId: 'device-a' });
 
     await store.append([await makeRow({ ...facts('u1', 100) })], file);
     await store.append([await makeRow({ ...facts('u2', 200) })], file);
@@ -407,7 +407,7 @@ describe('appending without a native append', () => {
       await self.write('.vfs/commits', encoder.encode('{"op":"other","uuid":"u9"}\n'));
     });
     const store = new VFSStore(adapter);
-    const file = await store.init({ peer: 'device-a' });
+    const file = await store.init({ peerId: 'device-a' });
 
     await store.append([await makeRow({ ...facts('u1', 100) })], file);
 
@@ -448,7 +448,7 @@ describe('memoised store reads', () => {
 
   it('reports an archive that has been deleted as nothing at all', async () => {
     const store = new VFSStore(new MemoryAdapter('m'));
-    await store.init({ peer: 'device-a' });
+    await store.init({ peerId: 'device-a' });
     expect(await store.readArchive(1_700_000_000_000)).toEqual([]);
   });
 });

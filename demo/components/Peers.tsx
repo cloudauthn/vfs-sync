@@ -35,7 +35,7 @@ function PeerCard({ model, view }: { model: DemoModel; view: PeerView }): JSX.El
       <ul class="files">
         {view.files.length === 0 && <li class="empty">empty</li>}
         {view.files.map((file) => {
-          const selected = model.selection?.peer === view.key && model.selection.path === file.path;
+          const selected = model.selection?.peerId === view.key && model.selection.path === file.path;
           const conflict = file.path.includes('(conflict ');
           const cls = [selected ? 'selected' : '', conflict ? 'conflict' : ''].filter(Boolean).join(' ');
           return (

@@ -2,60 +2,9 @@ import { describe, expect, it } from 'vitest';
 import { MemoryAdapter } from '../src/adapters/memory.js';
 import { ScopedAdapter } from '../src/adapters/scoped.js';
 import { VFSNode } from '../src/vfs-node.js';
-import { sync, syncUntilStable } from '../src/sync.js';
+import { sync } from '../src/sync.js';
 import type { VFSAdapter } from '../src/types.js';
-import { decoder, encoder, peer, put } from './helpers.js';
-
-describe('storeId', () => {
-  it('mints one at init and keeps it on reopen', async () => {
-    const fs = new MemoryAdapter('a');
-    const first = await VFSNode.open(fs);
-    const minted = (await first.file()).storeId;
-    expect(minted).toBeTruthy();
-
-    const again = await VFSNode.open(fs);
-    expect((await again.file()).storeId).toBe(minted);
-  });
-
-  it('lives in the header of vfs.json, alongside the peer id', async () => {
-    const fs = new MemoryAdapter('fresh');
-    const node = await VFSNode.open(fs, { id: 'device-a' });
-    const file = await node.file();
-
-    expect(file.peer).toBe('device-a');
-    expect(file.storeId).toBeTruthy();
-    // v1's config.json is gone; the header carries what it used to.
-    expect(await fs.stat('.vfs/config.json')).toBeNull();
-    expect(decoder.decode(await fs.read('.vfs/vfs.json'))).toContain('"storeId"');
-  });
-
-  it('both sides of a sync adopt the smaller of their two ids', async () => {
-    const a = await peer('a');
-    const b = await peer('b');
-    await put(a, 'x.txt', 'x');
-    const smaller = [(await a.node.file()).storeId, (await b.node.file()).storeId].sort().at(0);
-
-    await sync(a.node, b.node);
-
-    expect((await a.node.file()).storeId).toBe(smaller);
-    expect((await b.node.file()).storeId).toBe(smaller);
-  });
-
-  it('settles on one id across a chain', async () => {
-    const a = await peer('a');
-    const b = await peer('b');
-    const c = await peer('c');
-    await put(a, 'x.txt', 'x');
-
-    await syncUntilStable([
-      { a: a.node, b: b.node },
-      { a: b.node, b: c.node },
-    ]);
-
-    const ids = await Promise.all([a, b, c].map(async (p) => (await p.node.file()).storeId));
-    expect(new Set(ids).size).toBe(1);
-  });
-});
+import { decoder, encoder, peer } from './helpers.js';
 
 describe('ScopedAdapter', () => {
   it('maps paths into the base and listing paths back out', async () => {

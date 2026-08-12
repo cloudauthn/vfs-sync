@@ -163,7 +163,7 @@ export interface VFSEntry {
    */
   updated: number;
   /** Peer that last changed this entry. Travels with it, so credit survives relays. */
-  peer: string;
+  peerId: string;
   deleted?: true;
   /** Hash this version descends from. */
   prev?: Hash | null;
@@ -203,7 +203,7 @@ export interface LogRow {
   /** Groups the operations of one save or one merge, so the UI can narrate them. */
   batch: string;
   at: number;
-  peer: string;
+  peerId: string;
   uuid: string;
   type: LogOpType;
   kind: EntryKind;
@@ -250,11 +250,19 @@ export interface LocalState {
 
 /** The whole of `.vfs/vfs.json`. Header first, `entries` last. */
 export interface VFSFile {
-  version: 2;
-  /** Identity of the dataset; converges on the lexicographically smaller. */
-  storeId: string;
-  /** Identity of this node. */
-  peer: string;
+  /** Format version. Reading is migrated forward; writing is always the latest. */
+  version: 2 | 3;
+  /**
+   * Identity of the group this folder belongs to, minted on its first sync.
+   *
+   * `null` — explicitly, not an absent key — means it has never synced and will
+   * adopt whichever group it first meets. Two folders that both carry a
+   * non-null value and disagree are separate meshes, and pairing them is
+   * refused rather than guessed at.
+   */
+  syncId: string | null;
+  /** Identity of this node. Minted at init and never converges. */
+  peerId: string;
   /** Digest of the live entries over the converging fields. */
   state: Hash;
   /** Extensions that get a three-way text merge. Converges by union. */
@@ -280,7 +288,7 @@ export interface PendingConflict {
   /** Where the losing copy was parked. */
   copyPath: string;
   /** Peer that wrote the losing version. */
-  peer: string;
+  peerId: string;
   /** Set when the copy's bytes stayed on the peer that made it. */
   held?: string;
   /** Hash of the common ancestor, when it was known. */

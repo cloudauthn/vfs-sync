@@ -40,7 +40,7 @@ export function canonicalEntry(entry: VFSEntry): VFSEntry {
     size: entry.size,
     created: entry.created,
     updated: entry.updated,
-    peer: entry.peer,
+    peerId: entry.peerId,
   };
   if (entry.deleted) out.deleted = true;
   if (entry.prev !== undefined) out.prev = entry.prev;
@@ -96,9 +96,14 @@ export async function normalizeFile(file: VFSFile): Promise<VFSFile> {
  */
 export function encodeVFSFile(file: VFSFile): Uint8Array {
   const header: Array<[string, unknown]> = [
-    ['version', 2],
-    ['storeId', file.storeId],
-    ['peer', file.peer],
+    // From the file, not a literal: a migrated file written back out claiming
+    // its old version would be migrated again on every read.
+    ['version', file.version],
+    // `canonicalJSON(undefined)` is `'null'` at top level, so an unaffiliated
+    // folder writes an explicit `null` for free — and that `null` is what tells
+    // "never synced" apart from "written by an engine that had no syncId".
+    ['syncId', file.syncId],
+    ['peerId', file.peerId],
     ['state', file.state],
     ['text', file.text],
     ['log', file.log],
@@ -110,12 +115,104 @@ export function encodeVFSFile(file: VFSFile): Uint8Array {
   return encodeText(`{\n${lines.join('\n')}\n${ENTRIES_KEY}\n${entries.join(',\n')}\n]}\n`);
 }
 
+/** The version this engine writes. Reading goes back as far as {@link FORMAT_CHANGES}. */
+export const CURRENT_VERSION = 3;
+
+/** A file as it came off disk, before any migration has interpreted it. */
+type RawFile = Record<string, unknown>;
+
+/**
+ * One step in the format's history, and whether it can be reconciled.
+ *
+ * Three kinds, not two, and the distinction decides whether a change is safe to
+ * release in one go:
+ *
+ * | kind | new engine reads old | **old engine reads new** |
+ * | --- | --- | --- |
+ * | `additive` | yes, nothing to do | **yes** — new fields it ignores |
+ * | `migratable` | yes, via `migrate` | **no** |
+ * | `breaking` | no | no |
+ *
+ * The second column is the one that matters, because on shared storage the old
+ * engine *is* going to read what the new one writes. A `migratable` step is not
+ * safe to roll out all at once even when its `migrate` is perfect: migration
+ * solves reading forward, not the engine behind surviving.
+ */
+export type FormatChange =
+  | { version: number; kind: 'additive'; note: string }
+  | { version: number; kind: 'migratable'; note: string; migrate: (file: RawFile) => RawFile }
+  | { version: number; kind: 'breaking'; note: string };
+
+export const FORMAT_CHANGES: FormatChange[] = [
+  {
+    version: 3,
+    kind: 'migratable',
+    note: 'peer -> peerId in the header and entries; storeId retired into syncId',
+    migrate: (file) => {
+      const peers = (file.peers ?? {}) as Record<string, unknown>;
+      const entries = (file.entries ?? []) as RawFile[];
+      const { peer, storeId, ...rest } = file;
+      return {
+        ...rest,
+        version: 3,
+        peerId: peer,
+        // Seeded, never minted. In v2 `storeId` converged on the smaller and was
+        // transitive, so a mesh already shared one value and every peer derives
+        // the same `syncId` without coordinating. Minting a fresh one per folder
+        // would split a legitimate mesh into `foreign-mesh` on first contact.
+        //
+        // An empty `peers` means nobody has ever been met, so there is no
+        // affiliation to preserve. That heuristic lives here, runs once per
+        // folder, and disappears with the file it migrated.
+        syncId: Object.keys(peers).length > 0 ? (storeId ?? null) : null,
+        entries: entries.map((entry) => {
+          const { peer: wrote, ...fields } = entry;
+          return { ...fields, peerId: wrote };
+        }),
+      };
+    },
+  },
+];
+
+/**
+ * Brings a file up to {@link CURRENT_VERSION}, one declared step at a time.
+ *
+ * `vfs.json` is small, singular and rewritten on every commit, so it migrates
+ * **eagerly**, here, on read. The log cannot: closed segments are immutable and
+ * cached forever, so they migrate in the reader instead. The rule that falls out
+ * and is worth stating: *what is mutable migrates eagerly, what is immutable
+ * migrates in the reader.*
+ */
+export function migrateFile(file: RawFile): RawFile {
+  let out = file;
+  const from = typeof out.version === 'number' ? out.version : 0;
+  for (const change of FORMAT_CHANGES) {
+    if (change.version <= from) continue;
+    if (change.kind !== 'migratable') break;
+    out = change.migrate(out);
+  }
+  return out;
+}
+
+/**
+ * Whether this engine can interpret `version`, and if not, why.
+ *
+ * Only the newer engine can answer: an older one cannot diagnose a version it
+ * does not know exists. That asymmetry is why the check belongs to whoever has
+ * the table.
+ */
+export function readable(version: number): boolean {
+  if (version > CURRENT_VERSION) return false;
+  return FORMAT_CHANGES.every((change) => change.version <= version || change.kind === 'migratable');
+}
+
 export function decodeVFSFile(data: Uint8Array): VFSFile {
-  const file = JSON.parse(decodeText(data)) as VFSFile;
+  const file = migrateFile(JSON.parse(decodeText(data)) as RawFile) as unknown as VFSFile;
   file.entries ??= [];
   file.peers ??= {};
   file.local ??= {};
   file.text ??= [];
+  file.syncId ??= null;
   return file;
 }
 
@@ -142,11 +239,13 @@ export function headerOf(file: VFSFile): VFSHeader {
 }
 
 /** A fresh, empty store file. */
-export function emptyFile(peer: string, storeId: string, segment: number, text: string[]): VFSFile {
+export function emptyFile(peerId: string, segment: number, text: string[]): VFSFile {
   return {
-    version: 2,
-    storeId,
-    peer,
+    version: CURRENT_VERSION,
+    // Affiliation records a sync that happened. A folder nobody has met yet
+    // has none, and says so.
+    syncId: null,
+    peerId,
     state: '',
     text,
     log: { segment, digest: ZERO_DIGEST, rows: 0, size: 0 },

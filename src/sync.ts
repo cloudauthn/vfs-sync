@@ -9,7 +9,7 @@ import type {
   ConflictReport,
   MergeOptions,
 } from './merge.js';
-import { extensionOf } from './vfs-file.js';
+import { CURRENT_VERSION, extensionOf, readable } from './vfs-file.js';
 import { holds, materialised } from './vfs-node.js';
 import type { ContentHandle, ContentSource, VFSNode } from './vfs-node.js';
 import { stateDigest } from './vfs-file.js';
@@ -51,6 +51,17 @@ export interface SyncOptions {
    * abort this sync pass.
    */
   approveMerge?: (preview: SyncDryRunResult) => Promise<boolean> | boolean;
+  /**
+   * Authorises merging two folders the pairing guard stopped, by naming one of
+   * the two `syncId`s the {@link PairingError} reported.
+   *
+   * Specific on purpose: a blanket `true` would disarm the guard at this call
+   * site forever, including a different collision months later. A `peerId`
+   * collision is **not** authorisable this way — merging two nodes with one
+   * identity is not a decision anyone can make well, and the remedy lies
+   * outside sync.
+   */
+  adopt?: { syncId: string };
 }
 
 export interface SyncResult {
@@ -83,7 +94,7 @@ export interface SyncDryRunAction {
 export interface SyncDryRunResult {
   /** False when the final `sync()` call would be a no-op. */
   changed: boolean;
-  /** Whether `sync()` would first converge `storeId`/`text` config. */
+  /** Whether `sync()` would first converge the `text` config. */
   configChanged: boolean;
   conflicts: ConflictReport[];
   /** Predicted content copies performed in each direction. */
@@ -123,19 +134,16 @@ export async function sync(a: VFSNode, b: VFSNode, options: SyncOptions = {}): P
   const fileA = await a.file();
   const fileB = await b.file();
 
-  // ---- 2. config converges: storeId on the smaller, `text` by union
-  const storeId = [fileA.storeId, fileB.storeId].sort()[0] as string;
-  const text = [...new Set([...fileA.text, ...fileB.text])].sort();
-  const configChanged =
-    fileA.storeId !== storeId ||
-    fileB.storeId !== storeId ||
-    fileA.text.join() !== text.join() ||
-    fileB.text.join() !== text.join();
-  fileA.storeId = fileB.storeId = storeId;
-  fileA.text = [...text];
-  fileB.text = [...text];
+  // ---- 2. may these two folders merge at all? Nothing of the merge has been
+  //         written yet, which is the property that makes throwing safe here.
+  const syncId = pair(fileA, fileB, options.adopt);
 
-  // ---- 3. one comparison decides whether there is anything to do at all
+  // ---- 3. config converges: `text` by union
+  const config = convergeConfig(fileA, fileB);
+  const configChanged = config.changed;
+  applyConfig(fileA, fileB, config);
+
+  // ---- 4. one comparison decides whether there is anything to do at all
   const at = now();
   if (
     fileA.state === fileB.state &&
@@ -143,7 +151,7 @@ export async function sync(a: VFSNode, b: VFSNode, options: SyncOptions = {}): P
     !refillable(a, fileA, fileB) &&
     !refillable(b, fileB, fileA)
   ) {
-    await close(a, b, fileA, fileB, [], [], at);
+    await close(a, b, fileA, fileB, [], [], at, syncId);
     return {
       changed: configChanged,
       conflicts: [],
@@ -153,7 +161,7 @@ export async function sync(a: VFSNode, b: VFSNode, options: SyncOptions = {}): P
     };
   }
 
-  // ---- 4/5. entries, and the log only where the entries cannot answer alone
+  // ---- 5/6. entries, and the log only where the entries cannot answer alone
   const sources: Array<Iterable<LogRow> | Iterable<VFSEntry>> = [fileA.entries, fileB.entries];
   let rowsA: LogRow[] = [];
   let rowsB: LogRow[] = [];
@@ -164,7 +172,7 @@ export async function sync(a: VFSNode, b: VFSNode, options: SyncOptions = {}): P
 
   if (needsLog(fileA.entries, fileB.entries)) {
     rowsA = await a.store.logRows();
-    rowsB = await readPeerLog(b, fileA.peers[b.id]);
+    rowsB = await readPeerLog(b, fileA.peers[b.peerId]);
     const snapA = await a.store.readSnapshot(fileA);
     const snapB = await b.store.readSnapshot(fileB);
     ownA.add(rowsA).add(snapA);
@@ -173,8 +181,8 @@ export async function sync(a: VFSNode, b: VFSNode, options: SyncOptions = {}): P
   }
   const history = History.from(sources);
 
-  const sides = { peer: a.id, entries: fileA.entries, knows: (uuid: string) => ownA.knows(uuid) };
-  const other = { peer: b.id, entries: fileB.entries, knows: (uuid: string) => ownB.knows(uuid) };
+  const sides = { peerId: a.peerId, entries: fileA.entries, knows: (uuid: string) => ownA.knows(uuid) };
+  const other = { peerId: b.peerId, entries: fileB.entries, knows: (uuid: string) => ownB.knows(uuid) };
 
   // ---- merge
   const mergeOptions: MergeOptions = {
@@ -182,7 +190,7 @@ export async function sync(a: VFSNode, b: VFSNode, options: SyncOptions = {}): P
     heldAt: options.heldAt ?? HELD_AT,
     text: (path) => {
       const extension = extensionOf(path);
-      return extension !== '' && text.includes(extension);
+      return extension !== '' && config.text.includes(extension);
     },
     ...(options.conflictCopies !== undefined ? { conflictCopies: options.conflictCopies } : {}),
     ...(options.conflictName ? { conflictName: options.conflictName } : {}),
@@ -290,7 +298,7 @@ export async function sync(a: VFSNode, b: VFSNode, options: SyncOptions = {}): P
 
   await a.adopt(target, fileA);
   await b.adopt(target, fileB);
-  await close(a, b, fileA, fileB, rowsForA, rowsForB, at);
+  await close(a, b, fileA, fileB, rowsForA, rowsForB, at, syncId);
 
   return {
     changed: true,
@@ -333,16 +341,16 @@ export async function syncDryRun(
   const fileA = await a.file();
   const fileB = await b.file();
 
+  // The guard runs here too, and this is the healthy order: ask first, do not
+  // rescue afterwards. Nothing has been written, so a caller can discover a
+  // `foreign-mesh` without either folder having been touched.
+  pair(fileA, fileB, options.adopt);
+
   const entriesA = scanA.entries;
   const entriesB = scanB.entries;
 
-  const storeId = [fileA.storeId, fileB.storeId].sort()[0] as string;
-  const text = [...new Set([...fileA.text, ...fileB.text])].sort();
-  const configChanged =
-    fileA.storeId !== storeId ||
-    fileB.storeId !== storeId ||
-    fileA.text.join() !== text.join() ||
-    fileB.text.join() !== text.join();
+  // Computed, never applied: a dry run must leave both folders untouched.
+  const { text, changed: configChanged } = convergeConfig(fileA, fileB);
 
   const sources: Array<Iterable<LogRow> | Iterable<VFSEntry>> = [entriesA, entriesB, scanA.rows, scanB.rows];
   let rowsA: LogRow[] = [];
@@ -352,7 +360,7 @@ export async function syncDryRun(
 
   if (needsLog(entriesA, entriesB)) {
     rowsA = await a.store.logRows();
-    rowsB = await readPeerLog(b, fileA.peers[b.id]);
+    rowsB = await readPeerLog(b, fileA.peers[b.peerId]);
     const snapA = await a.store.readSnapshot(fileA);
     const snapB = await b.store.readSnapshot(fileB);
     ownA.add(rowsA).add(snapA);
@@ -361,8 +369,8 @@ export async function syncDryRun(
   }
   const history = History.from(sources);
 
-  const sides = { peer: a.id, entries: entriesA, knows: (uuid: string) => ownA.knows(uuid) };
-  const other = { peer: b.id, entries: entriesB, knows: (uuid: string) => ownB.knows(uuid) };
+  const sides = { peerId: a.peerId, entries: entriesA, knows: (uuid: string) => ownA.knows(uuid) };
+  const other = { peerId: b.peerId, entries: entriesB, knows: (uuid: string) => ownB.knows(uuid) };
 
   const mergeOptions: MergeOptions = {
     history,
@@ -441,7 +449,7 @@ interface PlannedChanges {
 }
 
 function planChanges(currentEntries: VFSEntry[], target: VFSEntry[], node: VFSNode): PlannedChanges {
-  const nodeId = node.id;
+  const nodeId = node.peerId;
   const current = new Map(currentEntries.map((entry) => [entry.uuid, entry]));
   const currentLive = currentEntries.filter((entry) => !entry.deleted);
   const targetByUuid = new Set(target.map((entry) => entry.uuid));
@@ -528,6 +536,156 @@ function planChanges(currentEntries: VFSEntry[], target: VFSEntry[], node: VFSNo
   };
 }
 
+export type PairingCode = 'version-unreconcilable' | 'peer-collision' | 'foreign-mesh';
+
+/** Enough of one side to frame the decision the library refuses to make. */
+export interface PairingSide {
+  peerId: string;
+  syncId: string | null;
+  version: number;
+  /** Live entries, so a caller can say "1,240 files against 890". */
+  entries: number;
+  log: { segment: number; digest: Hash };
+}
+
+/**
+ * Two folders that must not be merged without someone saying so.
+ *
+ * The engine's other errors are strings for humans. A caller cannot build a
+ * decision out of one of those: it needs the case, and the data to frame it.
+ */
+export class PairingError extends Error {
+  readonly code: PairingCode;
+  readonly a: PairingSide;
+  readonly b: PairingSide;
+
+  constructor(code: PairingCode, message: string, a: PairingSide, b: PairingSide) {
+    super(message);
+    this.name = 'PairingError';
+    this.code = code;
+    this.a = a;
+    this.b = b;
+  }
+}
+
+function sideOf(file: VFSFile): PairingSide {
+  return {
+    peerId: file.peerId,
+    syncId: file.syncId,
+    version: file.version,
+    entries: file.entries.filter((entry) => !entry.deleted).length,
+    log: { segment: file.log.segment, digest: file.log.digest },
+  };
+}
+
+/**
+ * Whether these two folders may merge at all, and which group id survives if
+ * they may.
+ *
+ * Two checks, in this order and not the other:
+ *
+ * 1. **version** — can I interpret this file? Reading `peerId` and `syncId`
+ *    means nothing until you know which version wrote them, so this comes
+ *    first. `decodeVFSFile` has already migrated everything it can, so a file
+ *    still short of the current version is one no `migrate` covers.
+ * 2. **identity** — should I merge with this group?
+ *
+ * The benign `syncId` combinations are not errors and are what ordinary use
+ * looks like: equal (every sync after the first), both `null` (two virgin
+ * folders, mint one), and one set against one `null` (a folder joining a
+ * group — it has no affiliation to lose, so no tiebreak is needed).
+ *
+ * The library detects, describes and stops. It does not ask, and it does not
+ * decide: that is coherent with not interpreting content, and the question is
+ * not "which folder wins" — there is no such mode. Resolution stays per file
+ * and per version, with ancestry above the clock. The only thing decided here
+ * is **whether to merge at all**.
+ */
+function pair(fileA: VFSFile, fileB: VFSFile, adopt?: { syncId: string }): string {
+  const a = sideOf(fileA);
+  const b = sideOf(fileB);
+
+  for (const side of [a, b]) {
+    if (side.version === CURRENT_VERSION) continue;
+    throw new PairingError(
+      'version-unreconcilable',
+      readable(side.version)
+        ? `a version ${side.version} folder did not migrate to ${CURRENT_VERSION}`
+        : `version ${side.version} cannot be read by an engine that writes ${CURRENT_VERSION}`,
+      a,
+      b,
+    );
+  }
+
+  if (a.peerId === b.peerId) {
+    // Not a bet against chance — `randomId()` is a UUIDv4 and a random
+    // collision is negligible. The collisions that happen are certainties: a
+    // copied `.vfs`, or a caller deriving `options.id` from something that is
+    // not unique. Deliberately one code for both, because a clone predating
+    // the first sync and an imposed id are identical from here; the log digests
+    // travel in the error so a caller can tell them apart without the library
+    // committing to a conclusion it would be guessing at.
+    throw new PairingError(
+      'peer-collision',
+      `both folders identify as peer ${a.peerId}: one of them is a copy, or the id was imposed`,
+      a,
+      b,
+    );
+  }
+
+  if (a.syncId !== null && b.syncId !== null && a.syncId !== b.syncId) {
+    // Authorisation is specific: naming one of the two ids proves the caller
+    // saw *this* collision. `{ adopt: true }` would disarm the guard at this
+    // call site forever, including a different collision months later. It is
+    // the idiom `writeIf(path, data, tag)` already uses.
+    if (!adopt || (adopt.syncId !== a.syncId && adopt.syncId !== b.syncId)) {
+      throw new PairingError(
+        'foreign-mesh',
+        `these folders belong to different groups (${a.syncId} and ${b.syncId})`,
+        a,
+        b,
+      );
+    }
+  }
+
+  // The smaller survives — deterministic and transitive, so a whole mesh
+  // settles on one value without coordinating. Minting needs no agreement
+  // either: `sync()` has both files in front of it and hands one id to both.
+  if (a.syncId !== null && b.syncId !== null) return [a.syncId, b.syncId].sort()[0] as string;
+  return a.syncId ?? b.syncId ?? randomId();
+}
+
+interface ConvergedConfig {
+  text: string[];
+  changed: boolean;
+}
+
+/**
+ * The config both files have to agree on, and whether they already do.
+ *
+ * `text` converges by **union**, so no peer loses a classification another one
+ * added. Group identity is deliberately not here: `syncId` is decided by the
+ * pairing guard and written in `close()`, because affiliation records a sync
+ * that happened rather than one that was attempted.
+ *
+ * Computed without writing, because `syncDryRun()` has to answer the same
+ * question without touching either folder. One implementation for both: a
+ * second copy is a second answer.
+ */
+function convergeConfig(fileA: VFSFile, fileB: VFSFile): ConvergedConfig {
+  const text = [...new Set([...fileA.text, ...fileB.text])].sort();
+  return {
+    text,
+    changed: fileA.text.join() !== text.join() || fileB.text.join() !== text.join(),
+  };
+}
+
+/** Writes a converged config onto both files. `sync()` only — never the dry run. */
+function applyConfig(fileA: VFSFile, fileB: VFSFile, config: ConvergedConfig): void {
+  fileA.text = [...config.text];
+  fileB.text = [...config.text];
+}
+
 /**
  * Content `node` wants, does not have, and the other side looks able to hand
  * over.
@@ -547,7 +705,7 @@ function refillable(node: VFSNode, own: VFSFile, other: VFSFile): boolean {
   const missing: Hash[] = [];
   for (const entry of own.entries) {
     if (entry.deleted || entry.kind !== 'file' || !entry.hash) continue;
-    if (entry.held && entry.held !== node.id) continue;
+    if (entry.held && entry.held !== node.peerId) continue;
     if (materialised(entry) || !node.wants(entry)) continue;
     missing.push(entry.hash);
   }
@@ -617,22 +775,29 @@ async function close(
   rowsForA: LogRow[],
   rowsForB: LogRow[],
   at: number,
+  syncId: string,
 ): Promise<void> {
   if (rowsForA.length > 0) await a.store.append(rowsForA, fileA);
   if (rowsForB.length > 0) await b.store.append(rowsForB, fileB);
 
-  fileA.peers[b.id] = {
+  fileA.peers[b.peerId] = {
     lastSync: at,
     segment: fileB.log.segment,
     offset: fileB.log.size,
     digest: fileB.log.digest,
   };
-  fileB.peers[a.id] = {
+  fileB.peers[a.peerId] = {
     lastSync: at,
     segment: fileA.log.segment,
     offset: fileA.log.size,
     digest: fileA.log.digest,
   };
+  // Affiliation lands here, with the peer marks, for two reasons: both files are
+  // written in the same pass, so there is no window where one is affiliated and
+  // the other is not; and a sync that fails before reaching this point leaves
+  // neither affiliated — the `syncId` records a sync that happened, not one that
+  // was attempted.
+  fileA.syncId = fileB.syncId = syncId;
   await a.store.write(fileA);
   await b.store.write(fileB);
 }
@@ -754,8 +919,8 @@ async function autoMergeText(
         base: baseText,
         a: decodeText(mine),
         b: decodeText(theirs),
-        peerA: a.id,
-        peerB: b.id,
+        peerA: a.peerId,
+        peerB: b.peerId,
       });
     }
     if (text === null) continue;
@@ -771,7 +936,7 @@ async function autoMergeText(
     entry.hash = hash;
     entry.size = data.byteLength;
     entry.updated = Math.max(context.at, left.updated, right.updated) + 1;
-    entry.peer = a.id;
+    entry.peerId = a.peerId;
     entry.prev = winner.hash;
     if (loser.hash) entry.prev2 = loser.hash;
 
@@ -785,7 +950,7 @@ async function autoMergeText(
     context.rows.push({
       batch: context.batch,
       at: entry.updated,
-      peer: a.id,
+      peerId: a.peerId,
       uuid: entry.uuid,
       type: 'write',
       kind: 'file',
@@ -848,7 +1013,10 @@ export interface MeshEdge {
 
 export interface MeshResult {
   edge: MeshEdge;
-  result: SyncResult;
+  /** Absent when this edge threw — see {@link MeshResult.error}. */
+  result?: SyncResult;
+  /** The edge failed. Every other edge in the pass still ran. */
+  error?: Error;
 }
 
 /**
@@ -857,7 +1025,16 @@ export interface MeshResult {
  */
 export async function syncMesh(edges: MeshEdge[], options: SyncOptions = {}): Promise<MeshResult[]> {
   const results: MeshResult[] = [];
-  for (const edge of edges) results.push({ edge, result: await sync(edge.a, edge.b, options) });
+  for (const edge of edges) {
+    // Per edge, because one badly paired pair must not paralyse the mesh. A
+    // throw used to abort the loop and lose every result already collected: in
+    // a mesh of five folders with one foreign pairing, none of them synced.
+    try {
+      results.push({ edge, result: await sync(edge.a, edge.b, options) });
+    } catch (error) {
+      results.push({ edge, error: error instanceof Error ? error : new Error(String(error)) });
+    }
+  }
   return results;
 }
 
@@ -871,7 +1048,10 @@ export async function syncUntilStable(
   for (let round = 0; round < maxRounds; round++) {
     const results = await syncMesh(edges, options);
     rounds.push(results);
-    if (!results.some((item) => item.result.changed)) break;
+    // An edge that threw is not progress. Counting it as change would keep the
+    // loop going to `maxRounds` on every call, for a failure that repeats
+    // identically each time.
+    if (!results.some((item) => item.result?.changed)) break;
   }
   return rounds;
 }

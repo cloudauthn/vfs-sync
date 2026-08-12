@@ -98,7 +98,7 @@ async function step(peers: Peer[], next: () => number, round: number): Promise<v
   const live = Object.keys(peer.fs.snapshot());
 
   if (roll < 0.5) {
-    await peer.node.write(name, encoder.encode(`r${round}-${peer.node.id}-${Math.floor(next() * 5)}`));
+    await peer.node.write(name, encoder.encode(`r${round}-${peer.node.peerId}-${Math.floor(next() * 5)}`));
     return;
   }
   if (roll < 0.7 && live.length > 0) {

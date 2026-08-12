@@ -62,7 +62,7 @@ describe('explorer caches', () => {
     await vi.waitFor(() => expect(model.newTab?.rows?.length).toBe(2));
     // Two full rebuilds of the tree, and not one re-read of a store's header.
     expect(storeProbes(calls)).toEqual([]);
-    expect(model.newTab?.rows?.[0]?.info?.storeId).toBeTruthy();
+    expect(model.newTab?.rows?.[0]?.info).toBeTruthy();
 
     // The refresh button is the escape hatch: it re-reads everything.
     await model.reload();

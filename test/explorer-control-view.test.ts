@@ -129,7 +129,7 @@ describe('explorer .vfs view', () => {
     const details = model.details;
     expect(details?.control).toBe(true);
     expect(details?.hash).toMatch(/^[0-9a-f]{64}$/);
-    expect(details?.text).toContain('"storeId"');
+    expect(details?.text).toContain('"syncId"');
     expect(details?.entry).toBeUndefined(); // the store never tracks itself
     expect(details?.across).toEqual([]);
     // selecting inside `.vfs` unfolds it, so the row is where the details say

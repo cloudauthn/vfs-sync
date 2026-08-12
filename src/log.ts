@@ -19,7 +19,7 @@ import type { Hash, LogRow } from './types.js';
  * which is the whole basis of the dedup.
  */
 export async function opId(row: Omit<LogRow, 'op' | 'batch'>): Promise<Hash> {
-  return sha256(encodeText([row.peer, row.uuid, row.at, row.type, row.path, row.hash ?? ''].join('|')));
+  return sha256(encodeText([row.peerId, row.uuid, row.at, row.type, row.path, row.hash ?? ''].join('|')));
 }
 
 /** Fills in the `op` of a row whose facts are already decided. */
@@ -33,7 +33,7 @@ export function canonicalRow(row: LogRow): LogRow {
     op: row.op,
     batch: row.batch,
     at: row.at,
-    peer: row.peer,
+    peerId: row.peerId,
     uuid: row.uuid,
     type: row.type,
     kind: row.kind,
@@ -65,7 +65,12 @@ export function parseRows(data: Uint8Array): LogRow[] {
     const text = line.trim();
     if (!text || !text.startsWith('{') || !text.endsWith('}')) continue;
     try {
-      rows.push(JSON.parse(text) as LogRow);
+      const row = JSON.parse(text) as LogRow & { peer?: string };
+      // The lazy half of the v2 -> v3 migration. Closed segments are immutable
+      // and cached forever, so renaming a key in them would break the invariant
+      // the cache rests on, for no gain. A permanent one-line cost instead.
+      row.peerId ??= row.peer as string;
+      rows.push(row);
     } catch {
       // a torn line: the next read from a clean offset will bring it whole
     }

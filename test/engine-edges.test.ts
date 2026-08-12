@@ -17,8 +17,8 @@ describe('VFSNode basics', () => {
     const first = await VFSNode.open(adapter);
     const second = await VFSNode.open(adapter);
 
-    expect(first.id).toMatch(/\w/);
-    expect(second.id).toBe(first.id);
+    expect(first.peerId).toMatch(/\w/);
+    expect(second.peerId).toBe(first.peerId);
   });
 
   it('keeps one step of history inline, in place of a commit graph', async () => {

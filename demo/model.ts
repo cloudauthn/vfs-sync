@@ -24,7 +24,7 @@ interface Peer {
 }
 
 interface Selection {
-  peer: string;
+  peerId: string;
   path: string;
 }
 
@@ -164,7 +164,7 @@ export class DemoModel {
   // ----------------------------------------------------------------- actions
 
   async select(peer: Peer, path: string): Promise<void> {
-    this.selection = { peer: peer.key, path };
+    this.selection = { peerId: peer.key, path };
     this.editorText = this.decoder.decode(await peer.node.read(path));
     this.editorEnabled = true;
     this.editorTitle = `${peer.label} / ${path}`;
@@ -179,7 +179,7 @@ export class DemoModel {
 
   async save(): Promise<void> {
     if (!this.selection) return;
-    const peer = this.peerOf(this.selection.peer);
+    const peer = this.peerOf(this.selection.peerId);
     if (!peer) return;
     await peer.node.write(this.selection.path, this.encoder.encode(this.editorText));
     this.log(`saved ${this.selection.path} on ${peer.label}`);
@@ -201,15 +201,15 @@ export class DemoModel {
     // intent and travels as a rename rather than as delete + create.
     await peer.node.rename(path, name);
     this.log(`renamed ${path} → ${name} on ${peer.label}`);
-    if (this.selection?.peer === peer.key && this.selection.path === path) {
-      this.selection = { peer: peer.key, path: name };
+    if (this.selection?.peerId === peer.key && this.selection.path === path) {
+      this.selection = { peerId: peer.key, path: name };
     }
     await this.render();
   }
 
   async deleteFile(peer: Peer, path: string): Promise<void> {
     await peer.node.delete(path);
-    if (this.selection?.peer === peer.key && this.selection.path === path) this.clearSelection();
+    if (this.selection?.peerId === peer.key && this.selection.path === path) this.clearSelection();
     this.log(`deleted ${path} on ${peer.label}`);
     await this.render();
   }
@@ -251,8 +251,10 @@ export class DemoModel {
     this.emit();
     try {
       const rounds = await syncUntilStable(this.edges);
-      const changed = rounds.flat().filter((r) => r.result.changed);
-      const conflicts = rounds.flat().flatMap((r) => r.result.conflicts);
+      const changed = rounds.flat().filter((r) => r.result?.changed);
+      const conflicts = rounds.flat().flatMap((r) => r.result?.conflicts ?? []);
+      const failed = rounds.flat().filter((r) => r.error);
+      for (const edge of failed) this.log(`${edge.edge.a.name} <-> ${edge.edge.b.name}: ${edge.error?.message}`, 'warn');
       if (changed.length === 0) {
         this.log('already in sync');
       } else {
@@ -286,7 +288,7 @@ export class DemoModel {
     const winner = conflict.winner === 'a' ? conflict.a : conflict.b;
     this.log(
       `conflict on ${conflict.path} (${conflict.kind}) — ` +
-        `${winner?.peer ?? conflict.winner} has the newer version` +
+        `${winner?.peerId ?? conflict.winner} has the newer version` +
         (conflict.copy ? `, kept ${conflict.copy.path}` : ''),
       'conflict',
     );
@@ -295,7 +297,7 @@ export class DemoModel {
   /** The selected file may have been rewritten or removed by a sync. */
   private async refreshSelection(): Promise<void> {
     if (!this.selection) return;
-    const peer = this.peerOf(this.selection.peer);
+    const peer = this.peerOf(this.selection.peerId);
     if (!peer) return this.clearSelection();
     const stat = await peer.adapter.stat(this.selection.path);
     if (!stat) return this.clearSelection();

@@ -134,7 +134,7 @@ export interface ScanResult {
 export class VFSNode {
   readonly adapter: VFSAdapter;
   readonly store: VFSStore;
-  readonly id: string;
+  readonly peerId: string;
   /** Size from which content takes the streaming path. See {@link VFSNodeOptions}. */
   readonly streamThreshold: number;
 
@@ -145,7 +145,7 @@ export class VFSNode {
   private constructor(adapter: VFSAdapter, id: string, options: VFSNodeOptions, store: VFSStore) {
     this.adapter = adapter;
     this.store = store;
-    this.id = id;
+    this.peerId = id;
     this.ignore = options.ignore;
     this.policy = options.materialize;
     this.now = options.now ?? (() => Date.now());
@@ -157,12 +157,12 @@ export class VFSNode {
     const storeOptions: VFSStoreOptions = { ...(options.now ? { now: options.now } : {}) };
     if (options.rotateAt !== undefined) storeOptions.rotateAt = options.rotateAt;
     const store = new VFSStore(adapter, CONTROL_DIR, storeOptions);
-    const file = await store.init(options.id ? { peer: options.id } : {});
-    if (options.id && file.peer !== options.id) {
-      file.peer = options.id;
+    const file = await store.init(options.id ? { peerId: options.id } : {});
+    if (options.id && file.peerId !== options.id) {
+      file.peerId = options.id;
       await store.write(file);
     }
-    return new VFSNode(adapter, file.peer, options, store);
+    return new VFSNode(adapter, file.peerId, options, store);
   }
 
   get name(): string {
@@ -500,7 +500,7 @@ export class VFSNode {
         size: item.stat.kind === 'file' ? item.stat.size : 0,
         created: prior?.created ?? at,
         updated: changed || moved ? at : (prior?.updated ?? at),
-        peer: changed || moved ? this.id : (prior?.peer ?? this.id),
+        peerId: changed || moved ? this.peerId : (prior?.peerId ?? this.peerId),
         mtime: item.stat.mtime,
       };
       if (changed) entry.prev = prior?.hash ?? null;
@@ -522,7 +522,7 @@ export class VFSNode {
         rows.push({
           batch,
           at,
-          peer: this.id,
+          peerId: this.peerId,
           uuid,
           type: changed ? 'write' : 'rename',
           kind: entry.kind,
@@ -564,14 +564,14 @@ export class VFSNode {
         size: 0,
         created: entry.created,
         updated: at,
-        peer: this.id,
+        peerId: this.peerId,
         deleted: true,
         prev: entry.hash,
       });
       rows.push({
         batch,
         at,
-        peer: this.id,
+        peerId: this.peerId,
         uuid: entry.uuid,
         type: 'delete',
         kind: entry.kind,
@@ -711,7 +711,7 @@ export class VFSNode {
       }
       // Content the far peer chose to keep to itself (§4): the entry travels,
       // the bytes do not, and the explorer paints it as remote.
-      if (entry.held && entry.held !== this.id) continue;
+      if (entry.held && entry.held !== this.peerId) continue;
       // Content this node's policy declines. The `materialised` half is not
       // optional: a policy that turns false for something already on disk must
       // not skip the write, or the file would sit at the old hash while the
@@ -876,7 +876,7 @@ export class VFSNode {
       // the same question `apply()` asked: the policy decides what arrives, and
       // bytes already here are kept current whatever it says.
       const onDisk =
-        !(entry.held && entry.held !== this.id) && (this.wants(entry) || materialised(before));
+        !(entry.held && entry.held !== this.peerId) && (this.wants(entry) || materialised(before));
       // Nothing this apply touched: the two node-local fields still describe
       // the file on disk, so carry them over. On Drive re-statting an untouched
       // entry is a round trip per file, which for a catalogue is the whole cost
@@ -1005,7 +1005,7 @@ export class VFSNode {
         reason: entry.reason ?? 'binary',
         path: disputed?.path ?? entry.path,
         copyPath: entry.path,
-        peer: entry.peer,
+        peerId: entry.peerId,
         ...(entry.held ? { held: entry.held } : {}),
         ...(entry.base ? { base: entry.base } : {}),
         mine: {
@@ -1039,7 +1039,7 @@ export class VFSNode {
     if (choice === 'theirs' && !here) {
       // Say so, rather than failing on a read of a file that was never going to
       // be here.
-      const why = copy.held && copy.held !== this.id ? `held on ${copy.held}` : 'not materialised here';
+      const why = copy.held && copy.held !== this.peerId ? `held on ${copy.held}` : 'not materialised here';
       throw new Error(`the losing version of ${copy.path} is ${why}`);
     }
     if (choice !== 'mine' && disputed) {
@@ -1074,7 +1074,7 @@ export class VFSNode {
             size: 0,
             created: doomed.created,
             updated: at,
-            peer: this.id,
+            peerId: this.peerId,
             deleted: true,
             prev: doomed.hash,
           }
@@ -1083,7 +1083,7 @@ export class VFSNode {
     const row = await makeRow({
       batch: randomId(),
       at,
-      peer: this.id,
+      peerId: this.peerId,
       uuid,
       type: 'delete',
       kind: doomed.kind,

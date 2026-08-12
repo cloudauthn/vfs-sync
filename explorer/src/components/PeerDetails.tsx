@@ -15,7 +15,7 @@ export function PeerDetails({ model, peer }: { model: ExplorerModel; peer: Peer 
       </DetailsShell>
     );
   }
-  if (!details || details.peer !== peer.key) {
+  if (!details || details.peerId !== peer.key) {
     return (
       <DetailsShell>
         <RootDetails model={model} peer={peer} />
@@ -130,12 +130,12 @@ function ConflictSection({
               class="vfs-ghost"
               title={
                 conflict.held
-                  ? `${conflict.peer} kept the bytes — sync with it first`
+                  ? `${conflict.peerId} kept the bytes — sync with it first`
                   : `Promote ${conflict.copyPath}`
               }
               onClick={() => void model.resolveConflict(peer, conflict.uuid, 'theirs')}
             >
-              {conflict.held ? `Keep ${conflict.peer}’s (remote)` : `Keep ${conflict.peer}’s`}
+              {conflict.held ? `Keep ${conflict.peerId}’s (remote)` : `Keep ${conflict.peerId}’s`}
             </button>
           </div>
         </div>
@@ -312,7 +312,7 @@ function FileSections({
               ],
               ['Entry uuid', entry?.uuid ?? '—'],
               ['Updated', entry ? formatTime(entry.updated) : '—'],
-              ['Last edited by', entry?.peer ?? '—'],
+              ['Last edited by', entry?.peerId ?? '—'],
               ['Previous version', entry?.prev ? entry.prev.slice(0, 12) : '—'],
               ['Moved from', entry?.prevPath ?? '—'],
               ['Backend id', entry?.native ?? '—'],

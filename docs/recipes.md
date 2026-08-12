@@ -451,7 +451,7 @@ for (const row of sortRows(await node.store.logRows()).slice(-20)) {
   console.log(
     row.op.slice(0, 7),
     row.type.padEnd(6),
-    row.peer.padEnd(12),
+    row.peerId.padEnd(12),
     new Date(row.at).toISOString(),
     row.path,
   );

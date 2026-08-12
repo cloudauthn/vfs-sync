@@ -205,11 +205,11 @@ function BrowseRowItem({
           <button
             class="vfs-vfsline"
             style={{ paddingLeft: row.depth * 14 + 24 }}
-            title={`Pairing id ${row.info.storeId} — open this vFS in a tab`}
+            title={`Pairing id ${row.info.syncId ?? 'not yet paired'} — open this vFS in a tab`}
             onClick={() => void model.openVfsTab(source, row.path)}
           >
             <span class="vfs-chip">vFS</span>
-            <span class="vfs-vfsid">{row.info.storeId}</span>
+            <span class="vfs-vfsid">{row.info.syncId ?? 'unpaired'}</span>
           </button>
         )}
         {loading && (
@@ -328,7 +328,7 @@ function BrowseDetails({
             />
             {data.info ? (
               <>
-                <Section title="vFS" rows={[['Pairing id', data.info.storeId]]} />
+                <Section title="vFS" rows={[['Pairing id', data.info.syncId ?? 'unpaired']]} />
                 <button class="vfs-primary" onClick={() => void model.openVfsTab(source, data.path)}>
                   Open as tab
                 </button>

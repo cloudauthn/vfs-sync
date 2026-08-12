@@ -134,14 +134,14 @@ export class VFSStore {
   }
 
   /** Opens an existing store, or lays down a fresh one. */
-  async init(options: { peer?: string; storeId?: string } = {}): Promise<VFSFile> {
+  async init(options: { peerId?: string } = {}): Promise<VFSFile> {
     const data = await this.readFile(this.filePath);
     if (data) {
       this.file = decodeVFSFile(data);
       return this.file;
     }
     return this.write(
-      emptyFile(options.peer ?? randomId(), options.storeId ?? randomId(), this.now(), [
+      emptyFile(options.peerId ?? randomId(), this.now(), [
         ...DEFAULT_TEXT_EXTENSIONS,
       ]),
     );

@@ -36,13 +36,13 @@ export type ConflictCopyPolicy = 'always' | 'edits' | false;
 
 export interface ConflictNameInfo {
   path: string;
-  peer: string;
+  peerId: string;
   hash: string;
   entry: VFSEntry;
 }
 
 export interface MergeSide {
-  peer: string;
+  peerId: string;
   entries: VFSEntry[];
   /**
    * Has *this* peer ever heard of this uuid — by entry, by log, or by snapshot?
@@ -82,7 +82,7 @@ export const HELD_AT = 64 * 1024 * 1024;
 export function defaultConflictName(info: ConflictNameInfo): string {
   const dir = dirname(info.path);
   const [stem, ext] = splitExtension(basename(info.path));
-  const name = `${stem} (conflict ${info.peer} ${info.hash.slice(0, 8)})${ext}`;
+  const name = `${stem} (conflict ${info.peerId} ${info.hash.slice(0, 8)})${ext}`;
   return dir ? `${dir}/${name}` : name;
 }
 
@@ -223,7 +223,7 @@ export function mergeEntries(a: MergeSide, b: MergeSide, options: MergeOptions =
       size: content.size,
       created: Math.min(left.created, right.created),
       updated: content.updated,
-      peer: content.peer,
+      peerId: content.peerId,
     };
     if (content.deleted) merged.deleted = true;
     if (content.prev !== undefined) merged.prev = content.prev;
@@ -317,19 +317,19 @@ function conflictCopy(
     // piling up near-duplicates on every pass.
     uuid: `conflict:${uuid}:${loser.hash}`,
     kind: loser.kind,
-    path: nameConflict({ path, peer: loser.peer, hash: loser.hash as string, entry: loser }),
+    path: nameConflict({ path, peerId: loser.peerId, hash: loser.hash as string, entry: loser }),
     hash: loser.hash,
     size: loser.size,
     created: loser.updated,
     updated: loser.updated,
-    peer: loser.peer,
+    peerId: loser.peerId,
     conflictOf: uuid,
     reason,
   };
   if (loser.prev) copy.base = loser.prev;
   // A 700 MB re-dump would otherwise be 700 MB on every peer until someone
   // resolved it. The entry travels; the bytes stay put until asked for.
-  if (loser.size >= heldAt) copy.held = loser.peer;
+  if (loser.size >= heldAt) copy.held = loser.peerId;
   return copy;
 }
 
@@ -377,7 +377,7 @@ function resolvePathCollisions(
       for (const loser of ranked.slice(1)) {
         const aside = nameConflict({
           path,
-          peer: loser.peer,
+          peerId: loser.peerId,
           hash: loser.hash ?? loser.uuid,
           entry: loser,
         });
@@ -419,7 +419,7 @@ function resolvePathCollisions(
  */
 export function pickNewer(left: VFSEntry, right: VFSEntry): VFSEntry {
   if (left.updated !== right.updated) return left.updated > right.updated ? left : right;
-  const leftKey = `${left.hash ?? ''}|${left.peer}|${left.uuid}`;
-  const rightKey = `${right.hash ?? ''}|${right.peer}|${right.uuid}`;
+  const leftKey = `${left.hash ?? ''}|${left.peerId}|${left.uuid}`;
+  const rightKey = `${right.hash ?? ''}|${right.peerId}|${right.uuid}`;
   return leftKey >= rightKey ? left : right;
 }

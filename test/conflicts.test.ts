@@ -32,7 +32,7 @@ describe('pending conflicts', () => {
     expect(pending[0]).toMatchObject({
       reason: 'binary',
       path: 'notes.bin',
-      peer: 'device-a',
+      peerId: 'device-a',
     });
     expect(pending[0]?.copyPath).toMatch(/conflict device-a/);
     // Both peers see the same pending decision — it converged like any entry.
@@ -139,7 +139,7 @@ describe('text conflicts', () => {
     expect(files(a)).toEqual(files(c));
 
     const again = await syncUntilStable(edges, { maxRounds: 3 });
-    expect(again.flat().flatMap((item) => item.result.conflicts)).toHaveLength(0);
+    expect(again.flat().flatMap((item) => item.result?.conflicts ?? [])).toHaveLength(0);
   });
 
   it('fall back to a copy when the edits collide', async () => {

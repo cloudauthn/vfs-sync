@@ -34,7 +34,7 @@ function entry(partial: Partial<VFSEntry> & { uuid: string; path: string }): VFS
     size: 1,
     created: 1000,
     updated: 1000,
-    peer: 'device-a',
+    peerId: 'device-a',
     ...partial,
   };
 }
@@ -43,7 +43,7 @@ function row(partial: Partial<LogRow> & { op: string; uuid: string }): LogRow {
   return {
     batch: 'batch',
     at: 1000,
-    peer: 'device-a',
+    peerId: 'device-a',
     type: 'write',
     kind: 'file',
     path: 'a.txt',
@@ -54,7 +54,7 @@ function row(partial: Partial<LogRow> & { op: string; uuid: string }): LogRow {
 describe('vfs.json', () => {
   it('round-trips', async () => {
     const file = await normalizeFile({
-      ...emptyFile('device-a', 'store-1', 1785102000000, ['xml']),
+      ...emptyFile('device-a', 1785102000000, ['xml']),
       entries: [entry({ uuid: 'b', path: 'b.txt' }), entry({ uuid: 'a', path: 'a.txt' })],
     });
     expect(decodeVFSFile(encodeVFSFile(file))).toEqual(file);
@@ -62,7 +62,7 @@ describe('vfs.json', () => {
 
   it('puts the header first, so a range read can stop early', async () => {
     const file = await normalizeFile({
-      ...emptyFile('device-a', 'store-1', 1, []),
+      ...emptyFile('device-a', 1, []),
       entries: Array.from({ length: 200 }, (_, i) =>
         entry({ uuid: `u${i}`, path: `file-${i}.txt` }),
       ),
@@ -74,13 +74,13 @@ describe('vfs.json', () => {
     // Only the head of the file, as `readRange` would deliver it.
     const header = parseHeader(bytes.slice(0, 1024));
     expect(header?.state).toBe(file.state);
-    expect(header?.storeId).toBe('store-1');
+    expect(header?.syncId).toBeNull();
     expect(header).not.toHaveProperty('entries');
   });
 
   it('asks for more when the prefix stopped short of the entries', async () => {
     const file = await normalizeFile({
-      ...emptyFile('device-a', 'store-1', 1, []),
+      ...emptyFile('device-a', 1, []),
       entries: [entry({ uuid: 'a', path: 'a.txt' })],
     });
     expect(parseHeader(encodeVFSFile(file).slice(0, 20))).toBeNull();
@@ -116,13 +116,13 @@ describe('state digest', () => {
       entry({
         uuid: 'a',
         path: 'a.txt',
-        // per-backend, per-route, per-peer: none of it may move the digest
+        // per-backend, per-route, per-peerId: none of it may move the digest
         native: 'drive-7',
         mtime: 999,
         created: 4,
         prev: 'older',
         prevPath: 'was.txt',
-        peer: 'device-b',
+        peerId: 'device-b',
       }),
     ];
     expect(await stateDigest(decorated)).toBe(await stateDigest(plain));
@@ -164,7 +164,7 @@ describe('commits log', () => {
   it('gives the same op id to the same operation on any replica', async () => {
     const facts = {
       at: 5,
-      peer: 'device-a',
+      peerId: 'device-a',
       uuid: 'u1',
       type: 'write' as const,
       kind: 'file' as const,
@@ -207,7 +207,7 @@ describe('rotation', () => {
     const adapter = new MemoryAdapter('device-a');
     let clock = 1000;
     const store = new VFSStore(adapter, '.vfs', { now: () => (clock += 1000) });
-    const file = await store.init({ peer: 'device-a', storeId: 'store-1' });
+    const file = await store.init({ peerId: 'device-a' });
 
     file.entries = [entry({ uuid: 'a', path: 'a.txt' })];
     const facts = row({ op: '', uuid: 'a' });
@@ -228,7 +228,7 @@ describe('rotation', () => {
     const adapter = new MemoryAdapter('device-a');
     let clock = 1000;
     const store = new VFSStore(adapter, '.vfs', { now: () => (clock += 1000) });
-    const file = await store.init({ peer: 'device-a', storeId: 'store-1' });
+    const file = await store.init({ peerId: 'device-a' });
 
     file.entries = [entry({ uuid: 'old', path: 'old.txt', hash: null, deleted: true })];
     await store.rotate(file);
