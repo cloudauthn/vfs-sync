@@ -424,3 +424,62 @@ describe('the log migrates in the reader', () => {
     expect((await makeRow(legacy)).op).toBe(fresh.op);
   });
 });
+
+describe('reidentify', () => {
+  it('mints a new identity and keeps the group', async () => {
+    const a = await peer('a');
+    const b = await peer('b');
+    await put(a, 'x.txt', 'x');
+    await sync(a.node, b.node);
+    const group = (await a.node.file()).syncId;
+
+    const minted = await a.node.reidentify();
+
+    expect(minted).not.toBe('a');
+    expect(a.node.peerId).toBe(minted);
+    expect((await a.node.file()).peerId).toBe(minted);
+    // Reidentifying is not leaving the mesh. Clearing the group would turn a
+    // repairable collision into a foreign-mesh, which is worse than the bug.
+    expect((await a.node.file()).syncId).toBe(group);
+  });
+
+  it('repairs a copied .vfs so the two can sync', async () => {
+    const a = await peer('twin');
+    const b = await peer('twin');
+    await put(a, 'x.txt', 'from the original');
+    await expect(sync(a.node, b.node)).rejects.toThrow(/identify as peer twin/);
+
+    await b.node.reidentify();
+
+    await expect(sync(a.node, b.node)).resolves.toBeTruthy();
+    expect(files(b)['x.txt']).toBe('from the original');
+  });
+
+  it('does not rewrite who made past changes', async () => {
+    const a = await peer('a');
+    await put(a, 'x.txt', 'written as a');
+    await a.node.commit();
+
+    await a.node.reidentify();
+
+    // The entry records who changed it, and that is history.
+    const entry = (await a.node.live()).find((item) => item.path === 'x.txt');
+    expect(entry?.peerId).toBe('a');
+    const rows = await a.node.store.logRows();
+    expect(rows.every((row) => row.peerId === 'a')).toBe(true);
+  });
+
+  it('is undone by an imposed id, which is the case it cannot fix', async () => {
+    const fs = new MemoryAdapter('imposed', { clock: () => tick() });
+    const first = await VFSNode.open(fs, { id: 'derived-from-hostname', now: () => tick() });
+    const minted = await first.reidentify();
+    expect(minted).not.toBe('derived-from-hostname');
+
+    // `options.id` overwrites the stored id on open, so a caller deriving it
+    // from something non-unique gets the same collision straight back. The
+    // library cannot tell this apart from a copied folder — hence the remedy
+    // being offered rather than applied.
+    const again = await VFSNode.open(fs, { id: 'derived-from-hostname', now: () => tick() });
+    expect(again.peerId).toBe('derived-from-hostname');
+  });
+});

@@ -482,7 +482,23 @@ different collision months later — it is the same "prove you knew the prior st
 **`peer-collision` is not authorisable.** Merging two nodes with one identity is not a decision
 anyone can make well: `peers` is keyed by `peerId`, so the two share a slot, each sync overwrites
 the other's mark, and the log offset that mark carries is then applied to a log it does not describe.
-The remedy lies outside sync.
+
+The remedy is `node.reidentify()`, which mints a fresh `peerId` and returns it. It fixes one of the
+two causes:
+
+| Cause | Fixed by `reidentify()`? |
+| --- | --- |
+| the `.vfs` folder was copied | **yes** |
+| `options.id` is derived from something non-unique | **no** — the next `open()` imposes it again |
+
+The library cannot tell those apart: a clone predating the first sync and an imposed id look
+identical from here. So it offers the operation rather than applying one, and a caller who
+reidentifies and collides again has learned which case they are in.
+
+`syncId` survives the call — reidentifying is not leaving the group, and for a copied folder both
+sides are replicas of one mesh. Entries and log rows keep the old `peerId`, because that records who
+changed what. One visible cost: every peer that has met this node holds a mark keyed by the old id,
+so the next sync with each of them re-reads the whole log rather than the tail since an offset.
 
 ### Format versions
 

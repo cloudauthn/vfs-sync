@@ -137,7 +137,7 @@ export interface ScanResult {
 export class VFSNode {
   readonly adapter: VFSAdapter;
   readonly store: VFSStore;
-  readonly peerId: string;
+  private id: string;
   /** Size from which content takes the streaming path. See {@link VFSNodeOptions}. */
   readonly streamThreshold: number;
 
@@ -154,7 +154,7 @@ export class VFSNode {
   private constructor(adapter: VFSAdapter, id: string, options: VFSNodeOptions, store: VFSStore) {
     this.adapter = adapter;
     this.store = store;
-    this.peerId = id;
+    this.id = id;
     this.ignore = options.ignore;
     this.policy = options.materialize;
     this.now = options.now ?? (() => Date.now());
@@ -176,6 +176,44 @@ export class VFSNode {
 
   get name(): string {
     return this.adapter.name;
+  }
+
+  /** This node's identity. Minted at init; only {@link VFSNode.reidentify} moves it. */
+  get peerId(): string {
+    return this.id;
+  }
+
+  /**
+   * Mints a fresh identity for this node, and returns it.
+   *
+   * The remedy for a `peer-collision`, which `sync()` refuses to authorise —
+   * merging two nodes with one identity is not a decision anyone can make well.
+   * **It fixes one of the two causes.** A copied `.vfs` folder is repaired by
+   * this; a caller passing a non-unique `options.id` is not, because the next
+   * `open()` imposes the same id again. The library cannot tell those apart —
+   * a clone predating the first sync and an imposed id look identical — so it
+   * offers the operation and leaves the judgement to whoever knows.
+   *
+   * What deliberately does *not* change:
+   *
+   * - **`syncId`.** Reidentifying is not leaving the group, and for the case
+   *   this actually fixes both copies are replicas of one mesh. Clearing it
+   *   would turn a repairable collision into a `foreign-mesh`.
+   * - **Entries and log rows.** Their `peerId` records who changed what. That
+   *   is history, and the log is immutable in any case.
+   *
+   * One visible consequence: every peer that has met this node holds a mark
+   * keyed by the old id, so the next sync with each of them re-reads the whole
+   * log instead of the tail since an offset. Once per peer, then the new mark
+   * takes over.
+   */
+  async reidentify(): Promise<string> {
+    const file = await this.store.read();
+    const minted = randomId();
+    file.peerId = minted;
+    this.id = minted;
+    await this.store.write(file);
+    return minted;
   }
 
   /** True when this content should go through the streaming path. */
