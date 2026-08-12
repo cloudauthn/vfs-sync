@@ -220,9 +220,9 @@ Use the same predicate on every peer. Where they differ, the file still arrives 
 and its entry stays live there, but that peer stops watching it: an edit made locally is never
 noticed and never travels, so the two sides drift apart without either reporting anything.
 
-### Recovering files a pre-0.1.25 rule deleted
+### Recovering files a pre-0.2.0 rule deleted
 
-Before 0.1.25 an exclusion rule read as a deletion: the entry became a tombstone and the tombstone
+Before 0.2.0 an exclusion rule read as a deletion: the entry became a tombstone and the tombstone
 travelled. The peer that *added* the rule kept its bytes — its walk simply stopped visiting the path
 — so the file is usually still there, orphaned: present on disk, dead in the mesh. The peers that
 did not have the rule yet are the ones that lost it.
