@@ -220,6 +220,38 @@ Use the same predicate on every peer. Where they differ, the file still arrives 
 and its entry stays live there, but that peer stops watching it: an edit made locally is never
 noticed and never travels, so the two sides drift apart without either reporting anything.
 
+### Recovering files a pre-0.1.25 rule deleted
+
+Before 0.1.25 an exclusion rule read as a deletion: the entry became a tombstone and the tombstone
+travelled. The peer that *added* the rule kept its bytes — its walk simply stopped visiting the path
+— so the file is usually still there, orphaned: present on disk, dead in the mesh. The peers that
+did not have the rule yet are the ones that lost it.
+
+That asymmetry is what makes recovery possible, and it is a procedure rather than an API because
+nothing distinguishes a tombstone caused by the bug from one somebody meant. Run this on the peer
+that has the rule and still has the file:
+
+```ts
+// 1. upgrade first, or every step below runs next to the bug that caused this
+// 2. reopen without the rule and reconcile: the walk sees the path again, and
+//    the old entry is a tombstone, so the file is adopted as a new one
+const open = await VFSNode.open(adapter, {});
+await open.commit();
+
+// 3. propagate to the peers that lost it
+await syncUntilStable(edges);
+
+// 4. put the rule back — it now preserves the entry instead of tombstoning it
+const ruled = await VFSNode.open(adapter, { ignore });
+await ruled.commit();
+```
+
+It costs the file's identity: the recovered entry gets a new `uuid`, the old tombstone stays in the
+log as history, and ancestry starts over. Content comes back, provenance does not.
+
+If no peer still has the bytes on disk — the file was deleted on the ignoring peer too, after the
+tombstone — it is gone, and the answer is a backup. There is no object store to recover it from.
+
 To read patterns from a file instead:
 
 ```ts
