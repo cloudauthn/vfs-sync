@@ -104,6 +104,17 @@ export interface MergeOptions {
   text?: (path: string) => boolean;
   /** Size from which a conflict copy stays on the peer that made it (§4). */
   heldAt?: number;
+  /**
+   * Entries that keep any path they are contesting, overriding the deterministic
+   * rule — a person answered a `path-collision`, and the answer names who keeps
+   * the name.
+   *
+   * It arrives here rather than being patched onto the merged tree afterwards
+   * because unpicking an aside rename means unpicking the subtree that travelled
+   * with it, and re-deriving a name for the entry that now yields. Both already
+   * live in {@link resolvePathCollisions}, correctly, once.
+   */
+  keepers?: ReadonlySet<string>;
 }
 
 export interface MergeResult {
@@ -305,9 +316,36 @@ export function mergeEntries(a: MergeSide, b: MergeSide, options: MergeOptions =
   for (const copy of copies) if (!entries.some((entry) => entry.uuid === copy.uuid)) entries.push(copy);
 
   return {
-    entries: sortEntries(resolvePathCollisions(entries, conflicts, nameConflict)),
+    entries: sortEntries(resolvePathCollisions(entries, conflicts, nameConflict, options.keepers)),
     conflicts,
   };
+}
+
+/**
+ * The copy the merge declined to park, minted after the fact because somebody
+ * answered `keep-both`.
+ *
+ * {@link ConflictCopyPolicy} governs a pass nobody is watching — `'edits'` lets
+ * a winning delete really delete, which is the right default for a phone syncing
+ * at 4am. An answer is a person, present, naming this file, and when the two
+ * disagree the answer wins: a caller who asked for both versions and got one has
+ * been lied to, whatever they configured months earlier.
+ *
+ * `null` when there is nothing to park — the loser is itself a deletion, and a
+ * deletion has no bytes to keep beside anything.
+ */
+export function copyForAnswer(report: ConflictReport, options: MergeOptions = {}): VFSEntry | null {
+  const winner = report.winner === 'a' ? report.a : report.b;
+  const loser = report.winner === 'a' ? report.b : report.a;
+  if (!winner || !loser || !loser.hash) return null;
+  return conflictCopy(
+    report.uuid,
+    loser,
+    report.path,
+    report.kind,
+    options.conflictName ?? defaultConflictName,
+    options.heldAt ?? HELD_AT,
+  );
 }
 
 /**
@@ -390,6 +428,7 @@ function resolvePathCollisions(
   entries: VFSEntry[],
   conflicts: ConflictReport[],
   nameConflict: (info: ConflictNameInfo) => string,
+  keepers: ReadonlySet<string> = new Set(),
 ): VFSEntry[] {
   for (let round = 0; round <= entries.length; round++) {
     const byPath = new Map<string, VFSEntry[]>();
@@ -408,7 +447,14 @@ function resolvePathCollisions(
 
     const moves: Array<{ from: string; to: string }> = [];
     for (const [path, bucket] of collided) {
-      const ranked = [...bucket].sort((x, y) => (pickNewer(x, y) === x ? -1 : 1));
+      // An answer outranks the deterministic rule, and only for the entry it
+      // named: everything it did not name is still ordered the way both peers
+      // would order it unprompted.
+      const ranked = [...bucket].sort((x, y) => {
+        const chosen = keepers.has(x.uuid);
+        if (chosen !== keepers.has(y.uuid)) return chosen ? -1 : 1;
+        return pickNewer(x, y) === x ? -1 : 1;
+      });
       const keeper = ranked[0] as VFSEntry;
       for (const loser of ranked.slice(1)) {
         const aside = nameConflict({
@@ -417,7 +463,11 @@ function resolvePathCollisions(
           hash: loser.hash ?? loser.uuid,
           entry: loser,
         });
-        moves.push({ from: loser.path, to: aside });
+        // Only a directory has a subtree to take with it. A file claiming one
+        // would take the *keeper's* children, which live under the same name it
+        // is being moved out of — and the keeper would be left with a directory
+        // and a file on one path, the one thing the tree may not hold.
+        if (loser.kind === 'directory') moves.push({ from: loser.path, to: aside });
         loser.prevPath = loser.path;
         loser.path = aside;
         loser.conflictOf ??= keeper.uuid;

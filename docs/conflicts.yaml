@@ -19,6 +19,16 @@
 #   - `# +` marks the one thing still missing: an answer for
 #     `version-unreconcilable` other than giving up.
 #
+# ## One rule about the two dimensions
+#
+# A `content` or `delete-edit` answer settles **two versions of one file**, and
+# it mints a new version carrying both parents — otherwise the next peer to do
+# the arithmetic reaches the engine's original answer and undoes it. A
+# `path-collision` or `kind` answer settles **two different files wanting one
+# name**: it renames, it never overwrites, and there is no shared identity to
+# mint a version of. `replace` is offered only in the first dimension, because
+# bytes cannot answer which of two files keeps a name.
+#
 # ## Two rules that hold for every variant
 #
 #   - `side` names the side that **stays as it is**; the other yields. 'a' and
@@ -150,8 +160,9 @@ delete-edit:
     ctxB: *version
   returns:
     - { action: keep, side: a | b } # confirm the deletion, or resurrect the edit
-    - { action: keep-both } # ! broken today: with conflictCopies 'edits' a winning
-      # deletion parks no copy, so this keeps only the deletion
+    - { action: keep-both } # the deletion applies and the edit is parked beside it.
+      # `conflictCopies` does not govern this: the policy is for a pass nobody is
+      # watching, and an answer is a person naming this file
     - { action: replace, content: Uint8Array }
     - { action: abort }
 
@@ -173,6 +184,10 @@ path-collision:
     ctxB: *version
   returns:
     - { action: keep, side: a | b } # that one keeps the path; the other is renamed aside
+    - { action: keep-both } # accepted, and it confirms rather than changes: both
+      # entries survive a name collision already. A caller whose policy is "never
+      # lose anything" is describing this outcome, and refusing them would
+      # deadlock a mesh over a question that is already answered
     - { action: abort }
 
 kind:
@@ -192,6 +207,7 @@ kind:
     ctxB: *version
   returns:
     - { action: keep, side: a | b } # the other is renamed aside with its subtree, never deleted
+    - { action: keep-both } # as in path-collision: a confirmation, not a change
     - { action: abort }
 
 location:

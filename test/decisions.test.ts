@@ -285,6 +285,198 @@ describe('decisions', () => {
   });
 });
 
+/**
+ * `conflictCopies` is a policy for a pass nobody is watching — `'edits'`
+ * deliberately lets a winning delete really delete. An answer is a person,
+ * present, naming this file. When the two disagree the answer wins, or somebody
+ * asked for both versions and was handed one.
+ */
+describe("an answer of 'both' keeps both", () => {
+  /** One side deletes, the other edits, and the deletion is the newer of the two. */
+  async function deletedAndEdited() {
+    const a = await peer('device-a');
+    const b = await peer('device-b');
+    await put(a, 'notes.bin', 'shared');
+    await sync(a.node, b.node);
+
+    await put(b, 'notes.bin', 'edited on B');
+    await b.node.commit();
+    await a.node.delete('notes.bin');
+    return { a, b };
+  }
+
+  it('parks the edit a winning deletion would otherwise take with it', async () => {
+    const { a, b } = await deletedAndEdited();
+    const [report] = await stoppedBy(a.node, b.node);
+    expect(report?.reason).toBe('delete-edit');
+
+    const applied = await sync(a.node, b.node, {
+      decisions: [{ id: report?.id as string, action: 'keep-both' }],
+    });
+
+    expect(applied.applied).toBe(true);
+    // The deletion is confirmed...
+    expect(files(a)['notes.bin']).toBeUndefined();
+    // ...and the edited version is beside it rather than gone.
+    const copies = Object.entries(files(a)).filter(([path]) => path.includes('conflict'));
+    expect(copies).toHaveLength(1);
+    expect(copies[0]?.[1]).toBe('edited on B');
+    expect(files(b)).toEqual(files(a));
+    expect(await a.node.conflicts()).toHaveLength(1);
+  });
+
+  it('parks it even where the policy says never', async () => {
+    const { a, b } = await deletedAndEdited();
+    const [report] = await stoppedBy(a.node, b.node);
+
+    await sync(a.node, b.node, {
+      conflictCopies: false,
+      decisions: [{ id: report?.id as string, action: 'keep-both' }],
+    });
+
+    expect(Object.values(files(a))).toEqual(['edited on B']);
+  });
+
+  it('records both parents, so a third peer does not raise it again', async () => {
+    const { a, b } = await disputed();
+    const c = await peer('device-c');
+    // C holds the version that loses, which is what would re-raise it.
+    await settle(a.node, c.node);
+
+    const [report] = await stoppedBy(a.node, b.node);
+    await sync(a.node, b.node, { decisions: [{ id: report?.id as string, action: 'keep-both' }] });
+
+    const decided = (await a.node.live()).find((entry) => entry.path === 'notes.bin');
+    expect(decided?.prev).toBeTypeOf('string');
+    expect(decided?.prev2).toBeTypeOf('string');
+    // Answered once, by a person, and not asked of anybody else.
+    expect(await stoppedBy(a.node, c.node)).toEqual([]);
+  });
+});
+
+/**
+ * Two entries contesting one name are two *files*, not two versions — so the
+ * answer renames, and it must never overwrite. The assertion that catches the
+ * difference is that both folders end the pass holding the same thing.
+ */
+describe('an answer about a name', () => {
+  /** Two files both sides know, renamed onto one name from either end. */
+  async function collided() {
+    const a = await peer('device-a');
+    const b = await peer('device-b');
+    await put(a, 'one.txt', 'first');
+    await put(a, 'two.txt', 'second');
+    await sync(a.node, b.node);
+
+    await a.node.rename('one.txt', 'merged.txt');
+    await a.node.commit();
+    await b.node.rename('two.txt', 'merged.txt');
+
+    const collision = (await stoppedBy(a.node, b.node)).find(
+      (conflict) => conflict.reason === 'path-collision',
+    );
+    return { a, b, collision };
+  }
+
+  it('confirms the entry already on the path, and keeps the other', async () => {
+    const { a, b, collision } = await collided();
+
+    const applied = await sync(a.node, b.node, {
+      decisions: [{ id: collision?.id as string, action: 'keep', side: 'a' }],
+    });
+
+    expect(applied.applied).toBe(true);
+    expect(files(a)['merged.txt']).toBe('second');
+    // Nothing overwritten, nothing lost, and the two folders agree.
+    expect(Object.values(files(a)).sort()).toEqual(['first', 'second']);
+    expect(files(b)).toEqual(files(a));
+  });
+
+  it('swaps which one yields when it names the side moved aside', async () => {
+    const { a, b, collision } = await collided();
+
+    await sync(a.node, b.node, {
+      decisions: [{ id: collision?.id as string, action: 'keep', side: 'b' }],
+    });
+
+    expect(files(a)['merged.txt']).toBe('first');
+    expect(Object.values(files(a)).sort()).toEqual(['first', 'second']);
+    expect(files(b)).toEqual(files(a));
+  });
+
+  /** A directory on one side, a file on the other, on one name. */
+  async function fileVersusDirectory(order: 'file first' | 'directory first') {
+    const a = await peer('device-a');
+    const b = await peer('device-b');
+    await put(a, 'seed.txt', 'seed');
+    await sync(a.node, b.node);
+
+    if (order === 'directory first') {
+      await put(a, 'shared/one.txt', 'one');
+      await put(a, 'shared/two.txt', 'two');
+      await a.node.commit();
+      await put(b, 'shared', 'a file, not a folder');
+    } else {
+      await put(b, 'shared', 'a file, not a folder');
+      await b.node.commit();
+      await put(a, 'shared/one.txt', 'one');
+      await put(a, 'shared/two.txt', 'two');
+      await a.node.commit();
+    }
+    return { a, b };
+  }
+
+  it('takes the subtree along when a directory is the one moved aside', async () => {
+    const { a, b } = await fileVersusDirectory('directory first');
+    const collision = (await stoppedBy(a.node, b.node)).find((one) => one.reason === 'kind');
+
+    // The file is the newer entry, so it is the one holding the name.
+    await sync(a.node, b.node, {
+      decisions: [{ id: collision?.id as string, action: 'keep', side: 'a' }],
+    });
+
+    expect(files(a)['shared']).toBe('a file, not a folder');
+    const moved = Object.keys(files(a)).filter((path) => path.includes('conflict')).sort();
+    expect(moved).toHaveLength(2);
+    expect(moved.every((path) => path.endsWith('/one.txt') || path.endsWith('/two.txt'))).toBe(true);
+    expect(files(b)).toEqual(files(a));
+  });
+
+  /**
+   * The mirror, and the one that was broken: a *file* has no subtree, so moving
+   * it aside must not touch anything. It shared the contested name with a
+   * directory, and everything under that name belongs to the directory that
+   * kept it.
+   */
+  it('leaves the winning directory its children when a file yields the name', async () => {
+    const { a, b } = await fileVersusDirectory('file first');
+    const collision = (await stoppedBy(a.node, b.node)).find((one) => one.reason === 'kind');
+
+    await sync(a.node, b.node, {
+      decisions: [{ id: collision?.id as string, action: 'keep', side: 'a' }],
+    });
+
+    expect(files(a)['shared/one.txt']).toBe('one');
+    expect(files(a)['shared/two.txt']).toBe('two');
+    // The file is aside, and it is not sitting on the directory's own name.
+    const aside = Object.keys(files(a)).find((path) => path.includes('conflict'));
+    expect(files(a)[aside as string]).toBe('a file, not a folder');
+    expect(Object.keys(files(a)).some((path) => path.startsWith(`${aside as string}/`))).toBe(false);
+    expect(files(b)).toEqual(files(a));
+  });
+
+  /** And it is not the decision that does it: the same tree with nobody asked. */
+  it('does the same when the deterministic rule leaves the directory on the name', async () => {
+    const { a, b } = await fileVersusDirectory('file first');
+
+    await settle(a.node, b.node);
+
+    expect(files(a)['shared/one.txt']).toBe('one');
+    expect(files(a)['shared/two.txt']).toBe('two');
+    expect(files(b)).toEqual(files(a));
+  });
+});
+
 describe('the payload carries what the decision needs', () => {
   it('says whether each version can be read here', async () => {
     const { a, b } = await disputed();

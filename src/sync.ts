@@ -2,7 +2,7 @@ import { decodeText, encodeText, randomId, sha256 } from './hash.js';
 import { History } from './history.js';
 import { MAX_TEXT_MERGE, diff3 } from './diff3.js';
 import { makeRow, missingRows } from './log.js';
-import { HELD_AT, mergeEntries } from './merge.js';
+import { HELD_AT, copyForAnswer, mergeEntries } from './merge.js';
 import type {
   ConflictCopyPolicy,
   ConflictNameInfo,
@@ -580,6 +580,17 @@ async function planSync(
     }
   }
 
+  // ---- the shape of the tree, before its contents
+  //
+  // An answer about a *name* changes the tree the merge produces, so it is asked
+  // first and fed back into a second merge — the aside rename, the subtree a
+  // directory takes with it, and the fixed point all stay in the one function
+  // that gets them right, instead of being unpicked afterwards.
+  const answers = new Map<string, ConflictAnswer>();
+  let declined = await collectAnswers(merge, options, isPathConflict, answers);
+  const keepers = keepersFrom(merge.conflicts, answers);
+  if (keepers.size > 0) merge = mergeEntries(sides, other, { ...mergeOptions, keepers });
+
   // ---- text: try to settle a content conflict rather than park a copy
   const overlay = new Map<Hash, Uint8Array>();
   const extra: Array<Omit<LogRow, 'op'>> = [];
@@ -594,7 +605,10 @@ async function planSync(
   });
 
   // ---- decisions: what a person settled, after the engine settled what it could
-  const decided = await applyDecisions(a, merge, options, {
+  if (await collectAnswers(merge, options, (report) => !isPathConflict(report), answers)) {
+    declined = true;
+  }
+  const settled = await applyAnswers(a, merge, answers, options, {
     overlay,
     rows: extra,
     batch,
@@ -618,9 +632,9 @@ async function planSync(
     configChanged: config.changed,
     conflicts: merge.conflicts,
     pending: merge.conflicts
-      .filter((report) => needsDeciding(report) && !decided.settled.has(report.uuid))
+      .filter((report) => needsDeciding(report) && !settled.has(conflictKey(report)))
       .map((report) => entryPayload(report, target)),
-    declined: decided.declined,
+    declined,
     target,
     overlay,
     extra,
@@ -1314,20 +1328,6 @@ async function autoMergeText(
 }
 
 /**
- * Settles the conflicts a person answered, and reports which ones those were.
- *
- * **A decision mints a new version.** Adopting the chosen side's entry as it
- * stands would not survive: the loser carries the older `updated`, so the next
- * peer to meet this mesh redoes the same arithmetic the engine did, reaches the
- * same answer, and puts the other version back. The decision would quietly undo
- * itself, days later, on a machine nobody was looking at.
- *
- * So the new version carries **two parents** — the winner's hash and the
- * loser's — which is exactly what the automatic text merge records, and for
- * exactly the same reason. A decision is a merge performed by a person and has
- * to leave the same trace as one performed by `diff3`.
- */
-/**
  * A conflict in the shape the contract describes, so `decide` and
  * `ConflictError` hand out the same thing.
  */
@@ -1363,40 +1363,59 @@ function entryPayload(report: ConflictReport, target: VFSEntry[] = []): Conflict
 }
 
 /**
- * Settles the conflicts somebody answered, and reports which ones those were.
+ * A collision over a **name**, rather than over the contents of a file.
+ *
+ * Both come out of one merge and both are answered through one callback, but
+ * they are not the same question and cannot share a code path: here the two
+ * sides are different files with their own uuids and their own histories,
+ * nothing is at risk, and the answer only says which of them keeps the name.
+ */
+function isPathConflict(report: ConflictReport): boolean {
+  return report.kind === 'path-collision' || report.kind === 'kind';
+}
+
+/**
+ * What an answer is filed under.
+ *
+ * A content dispute is filed under the file — one uuid, two versions of it. A
+ * path collision is filed under the **name**, because answering it swaps which
+ * of the two entries yields: the report that comes back from the second merge
+ * names the other uuid, and it is not a new question, it is the same one already
+ * answered.
+ */
+function conflictKey(report: ConflictReport): string {
+  return isPathConflict(report) ? `path:${report.path}` : report.uuid;
+}
+
+/**
+ * Gathers what somebody answered, without settling anything yet.
  *
  * Answers arrive two ways and both land here: as `decisions` from a UI that went
  * away and came back, and from `decide` asked in the moment. The array wins when
  * both answer the same conflict — it is the answer a person has already seen and
  * confirmed, while the callback may be a policy that never looked.
  *
- * **A decision mints a new version.** Adopting the chosen side's entry as it
- * stands would not survive: the loser carries the older `updated`, so the next
- * peer to meet this mesh redoes the same arithmetic the engine did, reaches the
- * same answer, and puts the other version back. The decision would quietly undo
- * itself, days later, on a machine nobody was looking at.
- *
- * So the new version carries **two parents** — the winner's hash and the
- * loser's — which is exactly what the automatic text merge records, and for
- * exactly the same reason. A decision is a merge performed by a person and has
- * to leave the same trace as one performed by `diff3`.
+ * Asking is separate from applying because the two dimensions settle in order:
+ * an answer about a *name* changes the tree the merge produces, so it has to be
+ * known before the tree is final, while an answer about *contents* is applied to
+ * that tree afterwards. Each conflict is still put to somebody exactly once —
+ * `answers` carries across both rounds and an entry already in it is not
+ * asked again.
  */
-async function applyDecisions(
-  a: VFSNode,
+async function collectAnswers(
   merge: { entries: VFSEntry[]; conflicts: ConflictReport[] },
   options: SyncOptions,
-  context: { overlay: Map<Hash, Uint8Array>; rows: Array<Omit<LogRow, 'op'>>; batch: string; at: number },
-): Promise<{ settled: Set<string>; declined: boolean }> {
-  const settled = new Set<string>();
+  wanted: (report: ConflictReport) => boolean,
+  answers: Map<string, ConflictAnswer>,
+): Promise<boolean> {
   let declined = false;
-  const outstanding = merge.conflicts.filter(needsDeciding);
-  if (outstanding.length === 0) return { settled, declined };
-
   const given = new Map<string, SyncDecision>();
   for (const decision of options.decisions ?? []) given.set(decision.id, decision);
 
-  for (const report of outstanding) {
-    if (!report.a || !report.b) continue;
+  for (const report of merge.conflicts) {
+    if (!needsDeciding(report) || !wanted(report) || !report.a || !report.b) continue;
+    const key = conflictKey(report);
+    if (answers.has(key)) continue;
     let answer: ConflictAnswer | null | undefined = given.get(report.uuid);
 
     if (answer) {
@@ -1413,14 +1432,79 @@ async function applyDecisions(
       if (answer || options.decide) declined = true;
       continue;
     }
+    answers.set(key, answer);
+  }
+  return declined;
+}
 
-    // "Keep both" is the outcome the merge already reached on its own, so there
-    // is nothing to mint — the answer was that the parked copy is right.
-    if (answer.action === 'keep-both') {
-      settled.add(report.uuid);
+/**
+ * The entries a person put in charge of a name they were contesting.
+ *
+ * Derived from the first merge's reports and never from a later one: after the
+ * swap the same collision is reported with the two sides exchanged, and reading
+ * `side` off *that* would flip the answer back on every pass.
+ */
+function keepersFrom(
+  conflicts: ConflictReport[],
+  answers: Map<string, ConflictAnswer>,
+): Set<string> {
+  const keepers = new Set<string>();
+  for (const report of conflicts) {
+    if (!isPathConflict(report) || !report.b) continue;
+    const answer = answers.get(conflictKey(report));
+    // `a` is the entry the merge left on the path, so naming it asks for what
+    // already happened. Only `b` — the one renamed aside — is a change.
+    if (answer?.action === 'keep' && answer.side === 'b') keepers.add(report.b.uuid);
+  }
+  return keepers;
+}
+
+/**
+ * Settles the conflicts somebody answered, and reports which ones those were.
+ *
+ * **A decision mints a new version.** Adopting the chosen side's entry as it
+ * stands would not survive: the loser carries the older `updated`, so the next
+ * peer to meet this mesh redoes the same arithmetic the engine did, reaches the
+ * same answer, and puts the other version back. The decision would quietly undo
+ * itself, days later, on a machine nobody was looking at.
+ *
+ * So the new version carries **two parents** — the winner's hash and the
+ * loser's — which is exactly what the automatic text merge records, and for
+ * exactly the same reason. A decision is a merge performed by a person and has
+ * to leave the same trace as one performed by `diff3`.
+ */
+async function applyAnswers(
+  a: VFSNode,
+  merge: { entries: VFSEntry[]; conflicts: ConflictReport[] },
+  answers: Map<string, ConflictAnswer>,
+  options: SyncOptions,
+  context: { overlay: Map<Hash, Uint8Array>; rows: Array<Omit<LogRow, 'op'>>; batch: string; at: number },
+): Promise<Set<string>> {
+  const settled = new Set<string>();
+  if (answers.size === 0) return settled;
+
+  for (const report of merge.conflicts) {
+    if (!needsDeciding(report) || !report.a || !report.b) continue;
+    const key = conflictKey(report);
+    const answer = answers.get(key);
+    if (!answer) continue;
+
+    // A name is not a version. Which entry keeps the path was carried out by the
+    // merge — the other one is at its aside name with its subtree, nothing was
+    // overwritten to get there, and there is no shared identity to mint a
+    // version of.
+    //
+    // `keep-both` counts as an answer here even though the contract does not
+    // offer it: both entries *do* survive a name collision, so a caller whose
+    // policy is "never lose anything" is describing this outcome correctly, and
+    // refusing them would deadlock a mesh over a question already answered.
+    // `replace` is the one that is left outstanding — bytes cannot answer which
+    // of two files keeps a name.
+    if (isPathConflict(report)) {
+      if (answer.action === 'keep' || answer.action === 'keep-both') settled.add(key);
       continue;
     }
-    if (answer.action !== 'keep' && answer.action !== 'replace') {
+    if (answer.action !== 'keep' && answer.action !== 'replace' && answer.action !== 'keep-both') {
       // `adopt` and `reidentify` answer a pairing refusal, not a file.
       continue;
     }
@@ -1438,8 +1522,14 @@ async function applyDecisions(
       context.overlay.set(hash, data);
       chosen = { ...winner, hash, size: data.byteLength, path: entry.path };
       delete chosen.deleted;
-    } else {
+    } else if (answer.action === 'keep') {
       chosen = answer.side === 'a' ? report.a : report.b;
+    } else {
+      // Keep both: the winner stays where it is and the loser is parked beside
+      // it. Still a decision, and it mints like every other one — without that,
+      // the next peer holding the loser reaches the engine's original answer and
+      // raises the question a person has already been asked.
+      chosen = winner;
     }
 
     entry.kind = chosen.kind;
@@ -1452,8 +1542,15 @@ async function applyDecisions(
     if (chosen.deleted) entry.deleted = true;
     else delete entry.deleted;
 
-    // The copy existed only to hold the pending decision. It has been made.
-    if (report.copy) {
+    if (answer.action === 'keep-both') {
+      // The merge parks a copy by policy, and a winning delete under `'edits'`
+      // parks none — so `keep-both` on a delete-versus-edit would keep only the
+      // deletion. The answer is more specific than the policy: mint it here.
+      const copy = report.copy ?? copyForAnswer(report, mergeCopyOptions(options));
+      if (copy && !merge.entries.some((item) => item.uuid === copy.uuid)) merge.entries.push(copy);
+      if (copy) report.copy = copy;
+    } else if (report.copy) {
+      // The copy existed only to hold the pending decision. It has been made.
       const at = merge.entries.indexOf(report.copy);
       if (at >= 0) merge.entries.splice(at, 1);
       delete report.copy;
@@ -1472,9 +1569,17 @@ async function applyDecisions(
       prev: winner.hash ?? null,
       ...(loser.hash ? { prev2: loser.hash } : {}),
     });
-    settled.add(report.uuid);
+    settled.add(key);
   }
-  return { settled, declined };
+  return settled;
+}
+
+/** The two options that shape a conflict copy, wherever one is minted. */
+function mergeCopyOptions(options: SyncOptions): MergeOptions {
+  return {
+    ...(options.conflictName ? { conflictName: options.conflictName } : {}),
+    ...(options.heldAt !== undefined ? { heldAt: options.heldAt } : {}),
+  };
 }
 
 async function readAt(node: VFSNode, path: string): Promise<Uint8Array | null> {

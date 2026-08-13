@@ -237,6 +237,12 @@ await sync(a, b, { conflictCopies: 'edits' });
 | `'always'` | Also keep the content when a delete beats an edit. Nothing is ever lost. |
 | `false` | No copies. The loser is discarded. |
 
+**This is the policy for a pass nobody is watching**, which is why `'edits'` lets a delete delete: a
+phone syncing at 4am has no one to ask. An explicit `keep-both` outranks it — including `false` — for
+the one file it names. A caller who configured a policy months ago and answers this dispute today has
+made the more specific statement, and handing them one version after they asked for both would be a
+lie whichever way the policy was set.
+
 A `'location'` conflict never produces a copy under any policy: only the path was in dispute, so
 copying the file would just duplicate it. It is also never a *pending* conflict — the file lands on
 one of the two paths and that is that, so asking would be noise.
@@ -334,7 +340,14 @@ An answer names the conflict by `id` and says what happens:
   payload's own `ctxA`/`ctxB` — not the arguments of `sync(a, b)`, which a path collision has nothing
   to do with.
 - **`keep-both`** is the answer for "these are two different files" and equally for "not now": what
-  it leaves behind is a [pending conflict](#pending-conflicts) to resolve later.
+  it leaves behind is a [pending conflict](#pending-conflicts) to resolve later. It keeps both
+  **whatever `conflictCopies` says** — that policy governs a pass nobody is watching, and an answer
+  is a person naming this file. On a `delete-edit` it is what stops a winning deletion from taking
+  the other side's edit with it.
+- **Answering renames, when the conflict is about a name.** `path-collision` and `kind` are two
+  *files* contesting one path: naming a side says which of them keeps it, the other stays at the name
+  it was moved to, and nothing is overwritten either way. `replace` is not offered there — bytes
+  cannot answer which of two files keeps a name.
 - A decision may carry the two hashes it was made about (`a`, `b`). Worth the two lines: an answer to
   a dispute that **moved on** while the user was looking at it is then ignored and asked again,
   rather than applied to a version they never saw.
@@ -356,6 +369,7 @@ against.
 | `location`, the same file renamed differently on each side | no — one path wins deterministically and no content is at risk |
 | `content`, two different versions | **yes** |
 | `delete-edit`, one deleted and one edited | **yes** |
+| `path-collision`, two files wanting one name | **yes** — nothing is at risk, but which one keeps the name is not the engine's to guess |
 | `kind`, a file against a directory | **yes** |
 
 ### The consequence, stated plainly
