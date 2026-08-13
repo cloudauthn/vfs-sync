@@ -1,6 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { sync, syncUntilStable } from '../src/sync.js';
-import { entryAt, files, get, peer, put, settle, stabilise } from './helpers.js';
+import { entryAt, files, get, peer, put, settle, stabilise, sync, syncUntilStable } from './helpers.js';
 
 describe('sync', () => {
   it('copies files both ways on a first encounter', async () => {
@@ -105,13 +104,12 @@ describe('sync', () => {
     await a.node.commit(); // A records first, so B's version is the newer one
     await put(b, 'notes.bin', 'from B');
 
-    const result = await sync(a.node, b.node);
+    const result = await sync(a.node, b.node, { dryRun: true });
 
     expect(result.conflicts).toHaveLength(1);
     expect(result.conflicts[0]?.winner).toBe('b');
-    // Reported, and nothing written: the copy below exists because the user
+    // Planned, and nothing written: the copy below exists because the user
     // answered "keep both", not because the engine decided for them.
-    expect(result.applied).toBe(false);
     expect(files(a)).toEqual({ 'notes.bin': 'from A' });
 
     await settle(a.node, b.node);

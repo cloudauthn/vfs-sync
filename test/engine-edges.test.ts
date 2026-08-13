@@ -1,10 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import { MemoryAdapter } from '../src/adapters/memory.js';
-import { sync } from '../src/sync.js';
 import { VFSNode } from '../src/vfs-node.js';
 import { walk } from '../src/walk.js';
 import type { VFSAdapter } from '../src/types.js';
-import { decoder, encoder, entryAt, files, get, peer, put } from './helpers.js';
+import { decoder, encoder, entryAt, files, get, peer, put, sync } from './helpers.js';
 
 describe('VFSNode basics', () => {
   it('exposes the backend name', async () => {

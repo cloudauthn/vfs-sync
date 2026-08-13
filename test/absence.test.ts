@@ -1,9 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import type { MemoryAdapter } from '../src/adapters/memory.js';
-import { sync } from '../src/sync.js';
 import { VFSNode } from '../src/vfs-node.js';
 import type { VFSEntry } from '../src/types.js';
-import { encoder, files, peer, put, settle, tick } from './helpers.js';
+import { encoder, files, peer, put, settle, sync, tick } from './helpers.js';
 
 /**
  * Phase 1: absence stops being evidence of deletion.
@@ -160,7 +159,7 @@ describe('absence is not evidence of deletion', () => {
     await put(a, 'game.bin', 'a re-dump from A');
     await a.node.commit();
     await put(b, 'game.bin', 'a re-dump from B');
-    await settle(a.node, b.node, 'both', { heldAt: 8 });
+    await settle(a.node, b.node, { action: 'keep-both' }, { heldAt: 8 });
 
     // B keeps its own side. The copy it is dropping is held on A, so there is
     // no file here whose removal a scan could read as the deletion — B has to

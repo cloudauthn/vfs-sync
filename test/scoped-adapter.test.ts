@@ -2,9 +2,8 @@ import { describe, expect, it } from 'vitest';
 import { MemoryAdapter } from '../src/adapters/memory.js';
 import { ScopedAdapter } from '../src/adapters/scoped.js';
 import { VFSNode } from '../src/vfs-node.js';
-import { sync } from '../src/sync.js';
 import type { VFSAdapter } from '../src/types.js';
-import { decoder, encoder, peer } from './helpers.js';
+import { decoder, encoder, peer, sync } from './helpers.js';
 
 describe('ScopedAdapter', () => {
   it('maps paths into the base and listing paths back out', async () => {

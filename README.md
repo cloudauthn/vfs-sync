@@ -38,15 +38,23 @@ const result = await sync(laptop, phone);
 ```
 
 **A sync writes nothing while a conflict is waiting for a person** — not the disputed file, and not
-the files travelling alongside it. It reports, you decide, you sync again:
+the files travelling alongside it. Answer in the moment:
 
 ```ts
-const result = await sync(laptop, phone);
+await sync(laptop, phone, {
+  decide: async (conflict) => await askTheUser(conflict),   // or null to abort the pass
+});
+```
 
-if (result.pending.length > 0) {
+Or let it stop, and answer after a round trip through your UI:
+
+```ts
+try {
+  await sync(laptop, phone);
+} catch (error) {
+  if (!(error instanceof ConflictError)) throw error;
   // Nothing was written. Both folders are exactly as they were.
-  const decisions = await askTheUser(result.pending);   // 'a' | 'b' | 'both' | bytes
-  await sync(laptop, phone, { decisions });
+  await sync(laptop, phone, { decisions: await askTheUser(error.conflicts) });
 }
 ```
 
@@ -83,7 +91,8 @@ await sync(laptop, phone);
 
 ### When both sides changed
 
-The newer edit wins, and the other is kept beside it rather than being overwritten:
+Nothing is decided behind your back. The pass stops, hands you both versions, and writes nothing
+until you say what happens:
 
 ```ts
 const encode = (text: string) => new TextEncoder().encode(text);
@@ -91,14 +100,13 @@ const encode = (text: string) => new TextEncoder().encode(text);
 await laptop.write('cover.jpg', encode('taken on the laptop'));
 await phone.write('cover.jpg', encode('taken on the phone'));
 
-const { conflicts } = await sync(laptop, phone);
-
-conflicts[0].kind;        // 'content'
-conflicts[0].copy?.path;  // 'cover (conflict device-a b34883c4).jpg'
+await sync(laptop, phone, {
+  decide: () => ({ action: 'keep-both' }),   // or 'keep' one side, or 'replace' with your own bytes
+});
+// both peers now hold cover.jpg and 'cover (conflict device-a b34883c4).jpg'
 ```
 
-Both peers end up with the same two files. Nothing is lost silently, and nothing needs a server to
-adjudicate.
+Nothing is lost silently, and nothing needs a server to adjudicate.
 
 Text is different: for extensions on the store's `text` list (`xml`, `nfo`, `m3u`, `cue`, `md`, …)
 a **three-way merge** is attempted first, so two people editing different parts of the same

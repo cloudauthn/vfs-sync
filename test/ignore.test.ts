@@ -1,9 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import { MemoryAdapter } from '../src/adapters/memory.js';
 import { IGNORE_FILE, matchIgnore, parseIgnore } from '../src/ignore.js';
-import { sync } from '../src/sync.js';
 import { VFSNode } from '../src/vfs-node.js';
-import { counting, encoder, files, peer, put, tick } from './helpers.js';
+import { counting, encoder, files, peer, put, sync, tick } from './helpers.js';
 
 /**
  * Phase 3: exclusion rules with a file format.

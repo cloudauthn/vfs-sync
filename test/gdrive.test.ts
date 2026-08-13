@@ -1,8 +1,8 @@
 import { describe, expect, it } from 'vitest';
+import { sync } from './helpers.js';
 import { GDriveAdapter } from '../src/adapters/gdrive.js';
 import { MemoryAdapter } from '../src/adapters/memory.js';
 import { VFSNode } from '../src/vfs-node.js';
-import { sync } from '../src/sync.js';
 import { walk } from '../src/walk.js';
 import { makeFakeDrive } from './fake-drive.js';
 

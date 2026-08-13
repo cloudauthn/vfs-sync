@@ -1,4 +1,5 @@
 import { mkdtemp, rm } from 'node:fs/promises';
+import { sync } from './helpers.js';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
@@ -11,7 +12,6 @@ import { makeFakeDrive } from './fake-drive.js';
 import { VFSNode } from '../src/vfs-node.js';
 import { sha256 } from '../src/hash.js';
 import { collect, readRange, readStream, writeStream } from '../src/stream.js';
-import { sync } from '../src/sync.js';
 import type { VFSAdapter, VFSListEntry } from '../src/types.js';
 import { FakeDirectoryHandle } from './fake-handle.js';
 

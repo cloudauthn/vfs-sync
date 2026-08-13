@@ -6,10 +6,9 @@ import { ScopedAdapter } from '../src/adapters/scoped.js';
 import { VFSStore } from '../src/store.js';
 import { makeRow } from '../src/log.js';
 import { VFSNode } from '../src/vfs-node.js';
-import { sync } from '../src/sync.js';
 import { collect } from '../src/stream.js';
 import { FakeDirectoryHandle } from './fake-handle.js';
-import { decoder, encoder, peer, put, settle } from './helpers.js';
+import { decoder, encoder, peer, put, settle, sync } from './helpers.js';
 import type { LogRow, VFSAdapter, VFSChangeFeed } from '../src/types.js';
 
 /** The facts of one log row, minus the id `makeRow` derives from them. */
@@ -139,7 +138,7 @@ describe('cold archives', () => {
 
   it('keeps a copy instead when the caller declines the cold read', async () => {
     const { a, b } = await laggingChain();
-    const result = await sync(a.node, b.node, { archives: false });
+    const result = await sync(a.node, b.node, { archives: false, dryRun: true });
 
     // Without the cold read the ancestry cannot be proved, so what would have
     // been a quiet propagation is a decision for the user instead.
@@ -147,7 +146,7 @@ describe('cold archives', () => {
     expect(result.pending).toHaveLength(1);
 
     // The state is the same either way; the cost is a copy nobody needed.
-    await settle(a.node, b.node, 'both', { archives: false });
+    await settle(a.node, b.node, { action: 'keep-both' }, { archives: false });
     expect(decoder.decode(await b.node.read('notes.bin'))).toBe('v4');
   });
 });

@@ -1,9 +1,9 @@
 import { mkdtemp, rm } from 'node:fs/promises';
+import { sync } from './helpers.js';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { NodeFsAdapter } from '../src/adapters/node-fs.js';
-import { sync } from '../src/sync.js';
 import { VFSNode } from '../src/vfs-node.js';
 
 const encoder = new TextEncoder();

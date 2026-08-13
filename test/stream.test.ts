@@ -1,4 +1,5 @@
 import { mkdtemp, rm } from 'node:fs/promises';
+import { sync } from './helpers.js';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
@@ -16,7 +17,6 @@ import {
   readStream,
   writeStream,
 } from '../src/stream.js';
-import { sync } from '../src/sync.js';
 import type { VFSAdapter } from '../src/types.js';
 import { VFSNode } from '../src/vfs-node.js';
 

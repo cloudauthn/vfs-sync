@@ -6,14 +6,15 @@
 #
 # ## Status
 #
-# The catalogue is complete — it is derived from every place the engine raises a
-# conflict, and the audit is in `_completeness` at the end. The delivery is not:
+# The catalogue is complete — derived from every place the engine raises a
+# conflict, with the audit in `_completeness` at the end. The delivery is nearly:
 #
-#   - Level 2 answers exist today as data, `sync(a, b, { decisions: [...] })`,
-#     with `keep` written as 'a' | 'b', `keep-both` as 'both' and `replace` as
-#     the bytes themselves.
-#   - Level 1 has no callback at all: it arrives as a thrown `PairingError`, and
-#     only `foreign-mesh` has an authorised path (`adopt: { syncId }`).
+#   - **Level 2 is built.** `decide` is asked once per conflict; without it the
+#     pass throws `ConflictError` carrying all of them, and the same answers go
+#     back in as `decisions`.
+#   - **Level 1 stops but cannot be answered through `decide` yet.** The refusal
+#     arrives in this shape, inside the same `ConflictError`; `foreign-mesh` is
+#     authorised the old way, with `adopt: { syncId }`.
 #   - `# +` marks a field or an action that does not exist yet.
 #
 # ## Two rules that hold for every variant
@@ -25,6 +26,9 @@
 #   - Returning nothing is `{ action: abort }`, and abort means **the whole pass
 #     writes nothing** — not just this conflict. All of them answered, or none
 #     of it happens.
+#   - Every payload carries `id`, and an answer names it back. For an entry
+#     conflict it is the file's uuid; for a pairing refusal it is the `reason`,
+#     because there is at most one of those per pass.
 
 version: 1
 
@@ -66,6 +70,7 @@ foreign-mesh:
   payload:
     reason: foreign-mesh
     level: pairing
+    id: foreign-mesh # the reason itself: at most one pairing refusal per pass
     ctxA: *folder
     ctxB: *folder
   returns:
@@ -81,6 +86,7 @@ peer-collision:
   payload:
     reason: peer-collision
     level: pairing
+    id: peer-collision # the reason itself: at most one pairing refusal per pass
     ctxA:
       <<: *folder
       everSynced: boolean # + the folder that never synced is the safe one to reidentify
@@ -101,6 +107,7 @@ version-unreconcilable:
   payload:
     reason: version-unreconcilable
     level: pairing
+    id: version-unreconcilable # the reason itself: at most one pairing refusal per pass
     engine: number # + the version this engine writes, so a caller can say which side is behind
     ctxA:
       <<: *folder
@@ -124,7 +131,7 @@ content:
   payload:
     reason: content
     level: entry
-    uuid: string # one file: both sides share it
+    id: string # the file's uuid — one file, so both sides share it
     path: string
     base: hash | null # the ancestor, when the chain turned one up
     textReason: block | size | eol | no-base | unreadable | null
@@ -141,7 +148,7 @@ delete-edit:
   payload:
     reason: delete-edit
     level: entry
-    uuid: string
+    id: string
     path: string
     ctxA: *version # `deleted` says which of the two is the deletion
     ctxB: *version
@@ -164,6 +171,7 @@ path-collision:
   payload:
     reason: path-collision
     level: entry
+    id: string # the losing entry's uuid — two files here, not one
     path: string # the contested name
     aside: string # what the loser would be renamed to
     ctxA: *entry
@@ -183,6 +191,7 @@ kind:
   payload:
     reason: kind
     level: entry
+    id: string
     path: string
     aside: string
     ctxA: *entry
@@ -201,7 +210,7 @@ location:
   payload:
     reason: location
     level: entry
-    uuid: string
+    id: string
     ctxA: { path: string, prevPath: string | null, updated: number, peerId: string }
     ctxB: { path: string, prevPath: string | null, updated: number, peerId: string }
   returns:

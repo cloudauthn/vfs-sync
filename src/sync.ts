@@ -27,37 +27,124 @@ export interface TextConflictInfo {
 }
 
 /**
- * How a reported conflict is settled, handed back into the next `sync()`.
+ * Everything the engine can stop for. The contract is `docs/conflicts.yaml`.
  *
- * `'a'`/`'b'` name a **side of this pass**, not an owner — `sync(a, b)` belongs
- * to neither peer, so `'mine'`/`'theirs'` would only mean something from one of
- * the two ends. `'both'` keeps the winner in place and parks the loser beside
- * it, which is the answer for "not now" as much as for "these are two different
- * files". Bytes settle it outright with content the caller composed.
+ * Two levels, one vocabulary: a `pairing` refusal is about the two folders and
+ * there is at most one per pass, decided before the merge is computed; an
+ * `entry` conflict is about one file and there are as many as there are files.
+ * They differ in every mechanical way and in none of the ways a caller cares
+ * about — both stop the pass, both need an answer, both leave the folders as
+ * they were when the answer does not come.
  */
-export interface SyncDecision {
-  uuid: string;
-  choice: 'a' | 'b' | 'both' | Uint8Array;
-  /**
-   * The two versions this decision was made about, as the report gave them.
-   *
-   * Optional, and worth passing: a decision that names a dispute which has moved
-   * on since the user looked at it is **ignored**, and the conflict is reported
-   * again rather than settled on their behalf with something they never saw.
-   */
+export type ConflictReason =
+  | 'foreign-mesh'
+  | 'peer-collision'
+  | 'version-unreconcilable'
+  | 'content'
+  | 'delete-edit'
+  | 'kind'
+  | 'location';
+
+/** One folder, as much of it as framing a pairing decision needs. */
+export interface FolderContext {
+  peerId: string;
+  syncId: string | null;
+  version: number;
+  /** Live entries, so a caller can say "1,240 files against 890". */
+  entries: number;
+  log: { segment: number; digest: Hash };
+  /** Whether this folder has ever completed a sync with anyone. */
+  everSynced: boolean;
+}
+
+/** One version of one file, as much of it as framing a decision needs. */
+export interface VersionContext {
+  path: string;
+  hash: Hash | null;
+  size: number;
+  updated: number;
+  peerId: string;
+  kind: EntryKind;
+  deleted: boolean;
+}
+
+/**
+ * What arrives at {@link SyncOptions.decide}, and what a {@link ConflictError}
+ * carries one of per unanswered conflict.
+ *
+ * `'a'` and `'b'` always mean `ctxA` and `ctxB` **of this payload** — never the
+ * arguments of `sync(a, b)`. A path collision is between two entries, and which
+ * peer contributed each is not the question being answered.
+ */
+export interface ConflictPayload {
+  reason: ConflictReason;
+  level: 'pairing' | 'entry';
+  /** What an answer names: the entry's uuid, or the `reason` for a pairing refusal. */
+  id: string;
+  /** Absent on a pairing refusal. */
+  path?: string;
+  /** The ancestor, when the chain turned one up. */
+  base?: Hash;
+  /** Why the three-way merge did not settle it, when one was attempted. */
+  textReason?: TextMergeReason;
+  /** The version this engine writes — `version-unreconcilable` only. */
+  engine?: number;
+  ctxA: FolderContext | VersionContext;
+  ctxB: FolderContext | VersionContext;
+}
+
+/**
+ * How a conflict is settled.
+ *
+ * **`side` names the side that stays as it is; the other yields.** That holds
+ * for every action that takes one: the version that survives, the `syncId` both
+ * adopt, the peer that keeps its identity. Naming it `wins` would be a trap —
+ * for `reidentify` the side named is the one that does *not* change.
+ */
+export type ConflictAnswer =
+  | { action: 'keep'; side: 'a' | 'b' }
+  | { action: 'keep-both' }
+  | { action: 'replace'; content: Uint8Array }
+  | { action: 'adopt'; side: 'a' | 'b' }
+  | { action: 'reidentify'; side: 'a' | 'b' }
+  | { action: 'abort' };
+
+/**
+ * An answer handed back as data, for a UI that went away and came back.
+ *
+ * Same vocabulary as {@link SyncOptions.decide}, plus the two hashes the answer
+ * was given about: pass them and an answer to a dispute that has **moved on**
+ * since the user looked at it is ignored and reported again, rather than
+ * applied to a version they never saw.
+ */
+export type SyncDecision = ConflictAnswer & {
+  id: string;
   a?: Hash | null;
   b?: Hash | null;
-}
+};
 
 export interface SyncOptions {
   /**
-   * Settles conflicts a previous pass reported in {@link SyncResult.pending}.
+   * Settles conflicts a previous pass reported.
    *
    * A decision that names no live conflict is ignored, so a stale list costs
-   * nothing, and a partial one is ordinary: whatever is left undecided keeps the
-   * pass from writing, and comes back in `pending`.
+   * nothing. A partial one is ordinary — and what is left unanswered still stops
+   * the pass, because half a decision is not a decision.
    */
   decisions?: SyncDecision[];
+  /**
+   * Asked once per conflict, before anything is written.
+   *
+   * Without it, a conflict nobody answered **throws** {@link ConflictError} with
+   * all of them — because `pending` in a returned result can be ignored by
+   * accident, and a pass that stopped for a conflict then looks exactly like a
+   * pass that had nothing to do.
+   *
+   * With it, answering `{ action: 'abort' }` (or nothing) is an answer: the pass
+   * returns with `applied: false` and writes nothing. A person cancelling a
+   * dialog is an outcome, not a failure.
+   */
+  decide?: (conflict: ConflictPayload) => Promise<ConflictAnswer | null> | ConflictAnswer | null;
   conflictCopies?: ConflictCopyPolicy;
   conflictName?: (info: ConflictNameInfo) => string;
   now?: () => number;
@@ -93,7 +180,7 @@ export interface SyncOptions {
   approveMerge?: (preview: SyncResult) => Promise<boolean> | boolean;
   /**
    * Authorises merging two folders the pairing guard stopped, by naming one of
-   * the two `syncId`s the {@link PairingError} reported.
+   * the two `syncId`s the {@link ConflictError} reported.
    *
    * Specific on purpose: a blanket `true` would disarm the guard at this call
    * site forever, including a different collision months later. A `peerId`
@@ -171,6 +258,8 @@ interface SyncPlan {
   configChanged: boolean;
   conflicts: ConflictReport[];
   pending: ConflictReport[];
+  /** A conflict was put to somebody and they said no. Not the same as unanswered. */
+  declined: boolean;
   /** The entry list both peers adopt. */
   target: VFSEntry[];
   /** Content minted during planning (auto-merged text), by hash. */
@@ -226,7 +315,20 @@ export async function sync(a: VFSNode, b: VFSNode, options: SyncOptions = {}): P
   // is known by now — including the 900 files that have nothing to do with the
   // dispute — and none of it lands, so the folder the user is looking at does
   // not change under them while they decide.
-  if (plan.pending.length > 0) return preview;
+  //
+  // Somebody was asked and said no: that is an answer, and an answer comes back
+  // as a result. Nobody was asked at all: that throws, because a `pending` in a
+  // returned result can be ignored by accident, and a pass that stopped for a
+  // conflict then looks exactly like a pass that had nothing to do.
+  if (plan.pending.length > 0) {
+    if (plan.declined) return preview;
+    throw new ConflictError(
+      plan.pending.map(entryPayload),
+      plan.pending.length === 1
+        ? `${plan.pending[0]?.path} needs a decision`
+        : `${plan.pending.length} conflicts need a decision`,
+    );
+  }
 
   const approve = options.approveMerge;
   if (!plan.quiet && approve && !(await approve(preview))) {
@@ -248,11 +350,20 @@ export async function sync(a: VFSNode, b: VFSNode, options: SyncOptions = {}): P
  *   wins, deterministically, and no content is at risk: nobody has to choose
  *   between two versions, because there is only one.
  *
+ * - **nothing at risk on either side** — neither version has content. This is a
+ *   directory one peer removed and the other still had: a directory has no
+ *   hash, so `descends()` cannot prove the removal is a propagation and the
+ *   merge classifies it as a divergence. It is not one. Nothing can be lost by
+ *   taking the winner, and there are no two versions for a person to compare.
+ *   Any file that *was* under it is an entry of its own and conflicts on its
+ *   own terms.
+ *
  * What is left is `content`, `delete-edit` and `kind`: two versions, and no way
  * for the engine to know which one a person meant to keep.
  */
 function needsDeciding(report: ConflictReport): boolean {
-  return !report.settled && report.kind !== 'location';
+  if (report.settled || report.kind === 'location') return false;
+  return !!report.a?.hash || !!report.b?.hash;
 }
 
 /** A plan turned into the shape callers see. */
@@ -332,6 +443,7 @@ async function planSync(
       configChanged: config.changed,
       conflicts: [],
       pending: [],
+      declined: false,
       target: [],
       overlay: new Map(),
       extra: [],
@@ -416,7 +528,7 @@ async function planSync(
   });
 
   // ---- decisions: what a person settled, after the engine settled what it could
-  const decided = await applyDecisions(a, merge, options.decisions ?? [], {
+  const decided = await applyDecisions(a, merge, options, {
     overlay,
     rows: extra,
     batch,
@@ -439,7 +551,10 @@ async function planSync(
     at,
     configChanged: config.changed,
     conflicts: merge.conflicts,
-    pending: merge.conflicts.filter((report) => needsDeciding(report) && !decided.has(report.uuid)),
+    pending: merge.conflicts.filter(
+      (report) => needsDeciding(report) && !decided.settled.has(report.uuid),
+    ),
+    declined: decided.declined,
     target,
     overlay,
     extra,
@@ -608,36 +723,40 @@ function planChanges(currentEntries: VFSEntry[], target: VFSEntry[], node: VFSNo
   };
 }
 
-export type PairingCode = 'version-unreconcilable' | 'peer-collision' | 'foreign-mesh';
+/**
+ * Conflicts nobody answered.
+ *
+ * One error for both levels, because they are one question — a pairing refusal
+ * is simply a `conflicts` of length one with `level: 'pairing'`. The engine's
+ * other failures are strings for humans; a caller cannot build a decision out of
+ * one of those, so this carries the cases and the data to frame them.
+ *
+ * Thrown only when there was no {@link SyncOptions.decide} to ask. A callback
+ * that answered `abort` was asked and said no, which returns rather than throws.
+ */
+export class ConflictError extends Error {
+  readonly conflicts: ConflictPayload[];
+
+  constructor(conflicts: ConflictPayload[], message: string) {
+    super(message);
+    this.name = 'ConflictError';
+    this.conflicts = conflicts;
+  }
+
+  /** True when the pass stopped over the two folders rather than over their files. */
+  get pairing(): boolean {
+    return this.conflicts.some((conflict) => conflict.level === 'pairing');
+  }
+}
 
 /** Enough of one side to frame the decision the library refuses to make. */
-export interface PairingSide {
+interface PairingSide {
   peerId: string;
   syncId: string | null;
   version: number;
-  /** Live entries, so a caller can say "1,240 files against 890". */
   entries: number;
   log: { segment: number; digest: Hash };
-}
-
-/**
- * Two folders that must not be merged without someone saying so.
- *
- * The engine's other errors are strings for humans. A caller cannot build a
- * decision out of one of those: it needs the case, and the data to frame it.
- */
-export class PairingError extends Error {
-  readonly code: PairingCode;
-  readonly a: PairingSide;
-  readonly b: PairingSide;
-
-  constructor(code: PairingCode, message: string, a: PairingSide, b: PairingSide) {
-    super(message);
-    this.name = 'PairingError';
-    this.code = code;
-    this.a = a;
-    this.b = b;
-  }
+  everSynced: boolean;
 }
 
 function sideOf(file: VFSFile): PairingSide {
@@ -647,6 +766,9 @@ function sideOf(file: VFSFile): PairingSide {
     version: file.version,
     entries: file.entries.filter((entry) => !entry.deleted).length,
     log: { segment: file.log.segment, digest: file.log.digest },
+    // Which folder is the safe one to reidentify: one that never synced has no
+    // peer holding marks against its id.
+    everSynced: Object.keys(file.peers).length > 0,
   };
 }
 
@@ -679,13 +801,11 @@ function pair(fileA: VFSFile, fileB: VFSFile, adopt?: { syncId: string }): strin
 
   for (const side of [a, b]) {
     if (side.version === CURRENT_VERSION) continue;
-    throw new PairingError(
-      'version-unreconcilable',
+    throw new ConflictError(
+      [{ ...pairingPayload('version-unreconcilable', a, b), engine: CURRENT_VERSION }],
       readable(side.version)
         ? `a version ${side.version} folder did not migrate to ${CURRENT_VERSION}`
         : `version ${side.version} cannot be read by an engine that writes ${CURRENT_VERSION}`,
-      a,
-      b,
     );
   }
 
@@ -697,11 +817,9 @@ function pair(fileA: VFSFile, fileB: VFSFile, adopt?: { syncId: string }): strin
     // the first sync and an imposed id are identical from here; the log digests
     // travel in the error so a caller can tell them apart without the library
     // committing to a conclusion it would be guessing at.
-    throw new PairingError(
-      'peer-collision',
+    throw new ConflictError(
+      [pairingPayload('peer-collision', a, b)],
       `both folders identify as peer ${a.peerId}: one of them is a copy, or the id was imposed`,
-      a,
-      b,
     );
   }
 
@@ -711,11 +829,9 @@ function pair(fileA: VFSFile, fileB: VFSFile, adopt?: { syncId: string }): strin
     // call site forever, including a different collision months later. It is
     // the idiom `writeIf(path, data, tag)` already uses.
     if (!adopt || (adopt.syncId !== a.syncId && adopt.syncId !== b.syncId)) {
-      throw new PairingError(
-        'foreign-mesh',
+      throw new ConflictError(
+        [pairingPayload('foreign-mesh', a, b)],
         `these folders belong to different groups (${a.syncId} and ${b.syncId})`,
-        a,
-        b,
       );
     }
   }
@@ -725,6 +841,13 @@ function pair(fileA: VFSFile, fileB: VFSFile, adopt?: { syncId: string }): strin
   // either: `sync()` has both files in front of it and hands one id to both.
   if (a.syncId !== null && b.syncId !== null) return [a.syncId, b.syncId].sort()[0] as string;
   return a.syncId ?? b.syncId ?? randomId();
+}
+
+/** A pairing refusal in the shape every other conflict arrives in. */
+function pairingPayload(reason: ConflictReason, a: PairingSide, b: PairingSide): ConflictPayload {
+  // `id` is the reason itself: there is at most one pairing refusal per pass, so
+  // it needs nothing to tell it from another one.
+  return { reason, level: 'pairing', id: reason, ctxA: a, ctxB: b };
 }
 
 interface ConvergedConfig {
@@ -1089,28 +1212,92 @@ async function autoMergeText(
  * exactly the same reason. A decision is a merge performed by a person and has
  * to leave the same trace as one performed by `diff3`.
  */
+/**
+ * A conflict in the shape the contract describes, so `decide` and
+ * `ConflictError` hand out the same thing.
+ */
+function entryPayload(report: ConflictReport): ConflictPayload {
+  const context = (entry: VFSEntry): VersionContext => ({
+    path: entry.path,
+    hash: entry.hash,
+    size: entry.size,
+    updated: entry.updated,
+    peerId: entry.peerId,
+    kind: entry.kind,
+    deleted: !!entry.deleted,
+  });
+  return {
+    reason: report.kind,
+    level: 'entry',
+    id: report.uuid,
+    path: report.path,
+    ...(report.base ? { base: report.base } : {}),
+    ...(report.textReason ? { textReason: report.textReason } : {}),
+    ctxA: context(report.a as VFSEntry),
+    ctxB: context(report.b as VFSEntry),
+  };
+}
+
+/**
+ * Settles the conflicts somebody answered, and reports which ones those were.
+ *
+ * Answers arrive two ways and both land here: as `decisions` from a UI that went
+ * away and came back, and from `decide` asked in the moment. The array wins when
+ * both answer the same conflict — it is the answer a person has already seen and
+ * confirmed, while the callback may be a policy that never looked.
+ *
+ * **A decision mints a new version.** Adopting the chosen side's entry as it
+ * stands would not survive: the loser carries the older `updated`, so the next
+ * peer to meet this mesh redoes the same arithmetic the engine did, reaches the
+ * same answer, and puts the other version back. The decision would quietly undo
+ * itself, days later, on a machine nobody was looking at.
+ *
+ * So the new version carries **two parents** — the winner's hash and the
+ * loser's — which is exactly what the automatic text merge records, and for
+ * exactly the same reason. A decision is a merge performed by a person and has
+ * to leave the same trace as one performed by `diff3`.
+ */
 async function applyDecisions(
   a: VFSNode,
   merge: { entries: VFSEntry[]; conflicts: ConflictReport[] },
-  decisions: SyncDecision[],
+  options: SyncOptions,
   context: { overlay: Map<Hash, Uint8Array>; rows: Array<Omit<LogRow, 'op'>>; batch: string; at: number },
-): Promise<Set<string>> {
+): Promise<{ settled: Set<string>; declined: boolean }> {
   const settled = new Set<string>();
-  if (decisions.length === 0) return settled;
-  const byUuid = new Map(merge.conflicts.map((report) => [report.uuid, report]));
+  let declined = false;
+  const outstanding = merge.conflicts.filter(needsDeciding);
+  if (outstanding.length === 0) return { settled, declined };
 
-  for (const decision of decisions) {
-    const report = byUuid.get(decision.uuid);
-    if (!report || !report.a || !report.b) continue;
-    // Made about a dispute that has moved on: report it again rather than settle
-    // it on the user's behalf with a version they never saw.
-    if (decision.a !== undefined && decision.a !== (report.a.hash ?? null)) continue;
-    if (decision.b !== undefined && decision.b !== (report.b.hash ?? null)) continue;
+  const given = new Map<string, SyncDecision>();
+  for (const decision of options.decisions ?? []) given.set(decision.id, decision);
 
-    // "Keep both" is the outcome the engine would have reached on its own, so
-    // there is nothing to mint — the answer was that the parked copy is right.
-    if (decision.choice === 'both') {
+  for (const report of outstanding) {
+    if (!report.a || !report.b) continue;
+    let answer: ConflictAnswer | null | undefined = given.get(report.uuid);
+
+    if (answer) {
+      const decision = answer as SyncDecision;
+      // Answered about a dispute that has moved on: ask again rather than settle
+      // it on the user's behalf with a version they never saw.
+      const stale =
+        (decision.a !== undefined && decision.a !== (report.a.hash ?? null)) ||
+        (decision.b !== undefined && decision.b !== (report.b.hash ?? null));
+      if (stale) answer = null;
+    }
+    if (!answer && options.decide) answer = await options.decide(entryPayload(report));
+    if (!answer || answer.action === 'abort') {
+      if (answer || options.decide) declined = true;
+      continue;
+    }
+
+    // "Keep both" is the outcome the merge already reached on its own, so there
+    // is nothing to mint — the answer was that the parked copy is right.
+    if (answer.action === 'keep-both') {
       settled.add(report.uuid);
+      continue;
+    }
+    if (answer.action !== 'keep' && answer.action !== 'replace') {
+      // `adopt` and `reidentify` answer a pairing refusal, not a file.
       continue;
     }
 
@@ -1121,14 +1308,14 @@ async function applyDecisions(
     const at = Math.max(context.at, report.a.updated, report.b.updated) + 1;
 
     let chosen: VFSEntry;
-    if (decision.choice instanceof Uint8Array) {
-      const data = decision.choice;
+    if (answer.action === 'replace') {
+      const data = answer.content;
       const hash = await sha256(data);
       context.overlay.set(hash, data);
       chosen = { ...winner, hash, size: data.byteLength, path: entry.path };
       delete chosen.deleted;
     } else {
-      chosen = decision.choice === 'a' ? report.a : report.b;
+      chosen = answer.side === 'a' ? report.a : report.b;
     }
 
     entry.kind = chosen.kind;
@@ -1163,7 +1350,7 @@ async function applyDecisions(
     });
     settled.add(report.uuid);
   }
-  return settled;
+  return { settled, declined };
 }
 
 async function readAt(node: VFSNode, path: string): Promise<Uint8Array | null> {

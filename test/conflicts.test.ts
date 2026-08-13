@@ -1,7 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { sync } from '../src/sync.js';
 import { VFSNode } from '../src/vfs-node.js';
-import { files, get, peer, put, settle, stabilise, tick } from './helpers.js';
+import { files, get, peer, put, settle, stabilise, sync, tick } from './helpers.js';
 import type { Peer } from './helpers.js';
 
 /**
@@ -156,13 +155,12 @@ describe('text conflicts', () => {
     await put(a, 'gamelist.xml', '<one/>\n<LEFT/>\n<three/>\n');
     await a.node.commit();
     await put(b, 'gamelist.xml', '<one/>\n<RIGHT/>\n<three/>\n');
-    const result = await sync(a.node, b.node);
+    const result = await sync(a.node, b.node, { dryRun: true });
 
     expect(result.merged).toBe(0);
     expect(result.conflicts).toHaveLength(1);
     // The merge could not settle it, so it is the user's to answer.
     expect(result.pending).toHaveLength(1);
-    expect(result.applied).toBe(false);
 
     await settle(a.node, b.node);
     const [pending] = await a.node.conflicts();
@@ -204,11 +202,11 @@ describe('text conflicts', () => {
     await a.node.commit();
     await put(b, 'gamelist.xml', '<one/>\n<RIGHT/>\n');
 
-    const result = await sync(a.node, b.node, { resolveText: async () => null });
+    const result = await sync(a.node, b.node, { resolveText: async () => null, dryRun: true });
     expect(result.merged).toBe(0);
     expect(result.pending).toHaveLength(1);
 
-    await settle(a.node, b.node);
+    await settle(a.node, b.node, { action: 'keep-both' }, { resolveText: async () => null });
     expect(await a.node.conflicts()).toHaveLength(1);
   });
 
@@ -221,7 +219,7 @@ describe('text conflicts', () => {
     await put(a, 'notes.rom', 'ONE\ntwo\nthree\n');
     await a.node.commit();
     await put(b, 'notes.rom', 'one\ntwo\nTHREE\n');
-    const result = await sync(a.node, b.node);
+    const result = await sync(a.node, b.node, { dryRun: true });
 
     // Sniffing the content would let one peer call it text and the other
     // binary, which is precisely the invariant §4 refuses to break.
@@ -262,7 +260,7 @@ describe('text selection by path', () => {
 
   it('leaves the same divergence binary when no policy claimed the path', async () => {
     const { a, b } = await divergedCatalog();
-    const result = await sync(a.node, b.node);
+    const result = await sync(a.node, b.node, { dryRun: true });
 
     expect(result.merged).toBe(0);
     expect(result.conflicts[0]?.text).toBeUndefined();
@@ -281,7 +279,7 @@ describe('text selection by path', () => {
     const { a, b } = await divergedCatalog();
     const late = async (p: Peer) =>
       VFSNode.open(p.fs, { id: p.node.peerId, now: () => tick(), text: catalog });
-    const result = await sync(await late(a), await late(b));
+    const result = await sync(await late(a), await late(b), { dryRun: true });
 
     expect(result.merged).toBe(0);
     expect(result.conflicts[0]?.text).toBe(true);
@@ -350,7 +348,7 @@ describe('why a text merge did not happen', () => {
     await put(a, 'gamelist.xml', '<ONE/>\r\n<two/>\r\n<three/>\r\n');
     await a.node.commit();
     await put(b, 'gamelist.xml', '<one/>\n<two/>\n<THREE/>\n');
-    const result = await sync(a.node, b.node);
+    const result = await sync(a.node, b.node, { dryRun: true });
 
     expect(result.merged).toBe(0);
     expect(result.conflicts[0]?.text).toBe(true);
@@ -366,7 +364,7 @@ describe('why a text merge did not happen', () => {
     await put(a, 'gamelist.xml', '<one/>\n<LEFT/>\n<three/>\n');
     await a.node.commit();
     await put(b, 'gamelist.xml', '<one/>\n<RIGHT/>\n<three/>\n');
-    const result = await sync(a.node, b.node);
+    const result = await sync(a.node, b.node, { dryRun: true });
 
     expect(result.conflicts[0]?.textReason).toBe('block');
   });
@@ -384,7 +382,7 @@ describe('why a text merge did not happen', () => {
     await put(a, 'gamelist.xml', '<ONE/>\n<two/>\n<three/>\n');
     await sync(a.node, relay.node);
     await put(c, 'gamelist.xml', '<one/>\n<two/>\n<THREE/>\n');
-    const result = await sync(relay.node, c.node);
+    const result = await sync(relay.node, c.node, { dryRun: true });
 
     expect(result.merged).toBe(0);
     expect(result.conflicts[0]?.textReason).toBe('unreadable');
@@ -400,7 +398,7 @@ describe('why a text merge did not happen', () => {
     await put(a, 'gamelist.xml', '<LEFT/>\n<two/>\n');
     await a.node.commit();
     await put(b, 'gamelist.xml', '<RIGHT/>\n<two/>\n');
-    const result = await sync(a.node, b.node, { autoMerge: false });
+    const result = await sync(a.node, b.node, { autoMerge: false, dryRun: true });
 
     expect(result.conflicts[0]?.text).toBe(true);
     expect(result.conflicts[0]?.textReason).toBeUndefined();
@@ -432,7 +430,7 @@ describe('conflict copies that are too big to travel', () => {
     await put(a, 'game.bin', 'a re-dump from A');
     await a.node.commit();
     await put(b, 'game.bin', 'a re-dump from B');
-    await settle(a.node, b.node, 'both', { heldAt: 8 });
+    await settle(a.node, b.node, { action: 'keep-both' }, { heldAt: 8 });
 
     const [pending] = await b.node.conflicts();
     expect(pending?.held).toBe('device-a');

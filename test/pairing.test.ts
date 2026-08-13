@@ -1,11 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import { MemoryAdapter } from '../src/adapters/memory.js';
 import { encodeRows, makeRow, parseRows } from '../src/log.js';
-import { sync, syncMesh, syncUntilStable, PairingError } from '../src/sync.js';
+import { ConflictError } from '../src/sync.js';
 import { CURRENT_VERSION, decodeVFSFile, encodeVFSFile, migrateFile } from '../src/vfs-file.js';
 import { VFSNode } from '../src/vfs-node.js';
+import type { FolderContext } from '../src/sync.js';
 import type { LogRow } from '../src/types.js';
-import { encoder, files, peer, put, tick } from './helpers.js';
+import { encoder, files, peer, put, sync, syncMesh, syncUntilStable, tick } from './helpers.js';
 
 /**
  * Phase 6: identity, and the guard that decides whether two folders may merge
@@ -48,11 +49,25 @@ function v2File(peer: string, storeId: string, withPeers: boolean) {
   };
 }
 
-async function pairedError(a: VFSNode, b: VFSNode): Promise<PairingError> {
+/**
+ * The one refusal the guard raised, in the shape every conflict arrives in:
+ * a pairing refusal is a `conflicts` of length one with `level: 'pairing'`.
+ */
+async function pairedError(
+  a: VFSNode,
+  b: VFSNode,
+): Promise<{ reason: string; a: FolderContext; b: FolderContext }> {
   try {
     await sync(a, b);
   } catch (error) {
-    return error as PairingError;
+    if (!(error instanceof ConflictError)) throw error;
+    const [conflict] = error.conflicts;
+    if (!conflict || conflict.level !== 'pairing') throw error;
+    return {
+      reason: conflict.reason,
+      a: conflict.ctxA as FolderContext,
+      b: conflict.ctxB as FolderContext,
+    };
   }
   throw new Error('expected the guard to stop this pairing');
 }
@@ -129,8 +144,8 @@ describe('the pairing guard', () => {
     await put(a, 'x.txt', 'x');
 
     const error = await pairedError(a.node, b.node);
-    expect(error).toBeInstanceOf(PairingError);
-    expect(error.code).toBe('peer-collision');
+    expect(error.reason).toBeTypeOf('string');
+    expect(error.reason).toBe('peer-collision');
     expect(error.a.peerId).toBe('twin');
     expect(error.b.peerId).toBe('twin');
   });
@@ -146,7 +161,7 @@ describe('the pairing guard', () => {
     await sync(c.node, d.node);
 
     const error = await pairedError(b.node, c.node);
-    expect(error.code).toBe('foreign-mesh');
+    expect(error.reason).toBe('foreign-mesh');
     expect(error.a.syncId).not.toBe(error.b.syncId);
     // Enough to frame the decision as "1,240 files against 890".
     expect(error.a.entries).toBe(1);
@@ -185,7 +200,7 @@ describe('the pairing guard', () => {
     const groupB = (await b.node.file()).syncId;
 
     // Ask first, do not rescue afterwards.
-    await expect(sync(b.node, c.node, { dryRun: true })).rejects.toThrow(PairingError);
+    await expect(sync(b.node, c.node, { dryRun: true })).rejects.toThrow(ConflictError);
     expect((await b.node.file()).syncId).toBe(groupB);
     expect(files(b)).not.toHaveProperty('y.txt');
   });
@@ -256,7 +271,7 @@ describe('a bad edge does not paralyse the mesh', () => {
       { a: a.node, b: b.node },
     ]);
 
-    expect(results[0]?.error).toBeInstanceOf(PairingError);
+    expect(results[0]?.error).toBeInstanceOf(ConflictError);
     expect(results[0]?.result).toBeUndefined();
     expect(results[1]?.result?.changed).toBe(true);
     // The good edge did its work despite the bad one going first.
@@ -351,7 +366,7 @@ describe('migration', () => {
     const here = await peer('here');
 
     const error = await pairedError(here.node, ahead);
-    expect(error.code).toBe('version-unreconcilable');
+    expect(error.reason).toBe('version-unreconcilable');
     expect(error.b.version).toBe(CURRENT_VERSION + 1);
   });
 

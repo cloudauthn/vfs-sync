@@ -283,40 +283,53 @@ the nine hundred files travelling alongside it that have nothing to do with the 
 complete before the first byte, so stopping costs two scans and leaves both folders exactly as they
 were.
 
-```ts
-const result = await sync(laptop, phone);
+There are two ways to answer, and they exist for two different UIs.
 
-if (result.pending.length > 0) {
-  // Nothing was written. This is the list the UI shows.
-  const decisions = await askTheUser(result.pending);
-  await sync(laptop, phone, { decisions });
+**In the moment**, one pass, for a UI that is in front of the user:
+
+```ts
+await sync(laptop, phone, {
+  decide: async (conflict) => await askTheUser(conflict),  // or null to abort the pass
+});
+```
+
+**After a round trip**, for a UI that goes away and comes back — and this is also what happens when
+you supply no way to answer at all: the pass throws with everything it stopped for.
+
+```ts
+try {
+  await sync(laptop, phone);
+} catch (error) {
+  if (!(error instanceof ConflictError)) throw error;
+  const answers = await askTheUser(error.conflicts);
+  await sync(laptop, phone, { decisions: answers });
 }
 ```
 
-A decision names a conflict and a side:
+It throws rather than returning quietly because a list in a returned result can be ignored by
+accident, and a pass that stopped for a conflict then looks exactly like a pass that had nothing to
+do. Being asked and answering `{ action: 'abort' }` is different: that returns, with
+`applied: false`. A person cancelling a dialog is an outcome, not a failure.
+
+An answer names the conflict by `id` and says what happens:
 
 ```ts
-type SyncDecision = {
-  uuid: string;
-  choice: 'a' | 'b' | 'both' | Uint8Array;
-  a?: Hash | null;   // the two versions it was made about
-  b?: Hash | null;
-};
+{ id, action: 'keep', side: 'a' }              // that version survives
+{ id, action: 'keep-both' }                    // winner in place, loser parked beside it
+{ id, action: 'replace', content: bytes }      // neither; content the caller composed
 ```
 
-- **`'a'` / `'b'`** — a side of *this pass*, not an owner. `sync(a, b)` belongs to neither peer, so
-  "mine" and "theirs" would only mean something from one end of it.
-- **`'both'`** — keep the winner where it is and park the loser beside it. This is the answer for
-  "these are two different files" and equally for "not now": what it leaves behind is a
-  [pending conflict](#pending-conflicts) to resolve later.
-- **bytes** — content the caller composed, from a three-column view or anywhere else.
+- **`side`** names the side that **stays as it is**; the other yields. `'a'` and `'b'` mean the
+  payload's own `ctxA`/`ctxB` — not the arguments of `sync(a, b)`, which a path collision has nothing
+  to do with.
+- **`keep-both`** is the answer for "these are two different files" and equally for "not now": what
+  it leaves behind is a [pending conflict](#pending-conflicts) to resolve later.
+- A decision may carry the two hashes it was made about (`a`, `b`). Worth the two lines: an answer to
+  a dispute that **moved on** while the user was looking at it is then ignored and asked again,
+  rather than applied to a version they never saw.
 
-Passing `a` and `b` is worth the two lines: a decision that names a dispute which **moved on** while
-the user was looking at it is ignored and reported again, rather than being applied to a version they
-never saw.
-
-An incomplete decision list is ordinary — the user answers two of five and gets on with their day.
-What is left keeps the pass from writing and comes back in `pending`.
+An incomplete set is ordinary — the user answers two of five and gets on with their day. What is left
+still stops the pass, because half a decision is not a decision.
 
 The full catalogue — every case the engine can stop for, the data each one carries, and the answers
 that are legal for it — is [`conflicts.yaml`](./conflicts.yaml), and it is the contract this is built

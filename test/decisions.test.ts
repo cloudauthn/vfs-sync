@@ -1,6 +1,18 @@
 import { describe, expect, it } from 'vitest';
-import { sync } from '../src/sync.js';
-import { encoder, files, get, peer, put, settle, stabilise } from './helpers.js';
+import { ConflictError } from '../src/sync.js';
+import type { ConflictPayload } from '../src/sync.js';
+import { encoder, files, get, peer, put, settle, stabilise, sync } from './helpers.js';
+
+/** The conflicts a pass refused to write over, as a caller with no `decide` sees them. */
+async function stoppedBy(a: Parameters<typeof sync>[0], b: Parameters<typeof sync>[1]): Promise<ConflictPayload[]> {
+  try {
+    await sync(a, b);
+  } catch (error) {
+    if (error instanceof ConflictError) return error.conflicts;
+    throw error;
+  }
+  return [];
+}
 
 /**
  * The rule this suite exists for: **a pass writes nothing at all while a
@@ -31,10 +43,9 @@ describe('a conflict stops the pass', () => {
     const { a, b } = await disputed();
     const before = { a: files(a), b: files(b) };
 
-    const result = await sync(a.node, b.node);
+    const stopped = await stoppedBy(a.node, b.node);
 
-    expect(result.pending).toHaveLength(1);
-    expect(result.applied).toBe(false);
+    expect(stopped).toHaveLength(1);
     expect(files(a)).toEqual(before.a);
     expect(files(b)).toEqual(before.b);
     // The file that had nothing to do with the dispute waits with it.
@@ -51,7 +62,7 @@ describe('a conflict stops the pass', () => {
     await put(a, 'notes.bin', 'from A');
     await put(b, 'notes.bin', 'from B');
 
-    expect((await sync(a.node, b.node)).pending).toHaveLength(1);
+    expect(await stoppedBy(a.node, b.node)).toHaveLength(1);
     expect((await a.node.file()).syncId).toBeNull();
     expect((await b.node.file()).syncId).toBeNull();
 
@@ -59,14 +70,64 @@ describe('a conflict stops the pass', () => {
     expect((await a.node.file()).syncId).toBeTypeOf('string');
   });
 
-  it('still reports the whole plan, so a UI can show what is waiting', async () => {
+  it('hands over the two versions, so a UI can show what is waiting', async () => {
     const { a, b } = await disputed();
+    const [stopped] = await stoppedBy(a.node, b.node);
+
+    expect(stopped?.reason).toBe('content');
+    expect(stopped?.level).toBe('entry');
+    expect(stopped?.path).toBe('notes.bin');
+    expect(stopped?.ctxA).toMatchObject({ path: 'notes.bin', peerId: 'device-a' });
+    expect(stopped?.ctxB).toMatchObject({ path: 'notes.bin', peerId: 'device-b' });
+  });
+
+  it('still plans the whole pass, which a dry run can read without throwing', async () => {
+    const { a, b } = await disputed();
+    const preview = await sync(a.node, b.node, { dryRun: true });
+
+    expect(preview.actions.toB.some((action) => action.path === 'unrelated.txt')).toBe(true);
+    expect(preview.pending).toHaveLength(1);
+    expect(preview.state).toBeTypeOf('string');
+  });
+
+  /**
+   * A directory has no hash, so nothing can prove its removal is a propagation
+   * and the merge reports a divergence. It is not one — and if it counted, every
+   * folder anyone deletes would block the mesh until a human said so.
+   */
+  it('does not stop for a directory one side removed and the other still had', async () => {
+    const a = await peer('device-a');
+    const b = await peer('device-b');
+    await put(a, 'roms/game.bin', 'a rom');
+    await sync(a.node, b.node);
+
+    await a.node.rename('roms/game.bin', 'moved/game.bin');
+    await a.node.commit();
     const result = await sync(a.node, b.node);
 
-    expect(result.actions.toB.some((action) => action.path === 'unrelated.txt')).toBe(true);
-    expect(result.pending[0]?.path).toBe('notes.bin');
-    expect(result.pending[0]?.a?.hash).not.toBe(result.pending[0]?.b?.hash);
-    expect(result.state).toBeTypeOf('string');
+    expect(result.pending).toEqual([]);
+    expect(result.applied).toBe(true);
+    expect(files(b)['moved/game.bin']).toBe('a rom');
+    expect(files(b)['roms/game.bin']).toBeUndefined();
+  });
+
+  /** The same shape with content on one side is the real thing, and it stops. */
+  it('does stop when one side deleted what the other edited', async () => {
+    const a = await peer('device-a');
+    const b = await peer('device-b');
+    await put(a, 'notes.bin', 'shared');
+    await sync(a.node, b.node);
+
+    await put(b, 'notes.bin', 'edited on B');
+    await b.node.commit();
+    await a.node.delete('notes.bin');
+
+    const stopped = await stoppedBy(a.node, b.node);
+
+    expect(stopped).toHaveLength(1);
+    expect(stopped[0]?.reason).toBe('delete-edit');
+    // The edit is still there, unanswered rather than discarded.
+    expect(files(b)['notes.bin']).toBe('edited on B');
   });
 
   /** What settles itself is not what needs a person. */
@@ -96,12 +157,12 @@ describe('a conflict stops the pass', () => {
 describe('decisions', () => {
   it('take the side the user picked, even when the engine picked the other', async () => {
     const { a, b } = await disputed();
-    const [report] = (await sync(a.node, b.node)).pending;
+    const [report] = await stoppedBy(a.node, b.node);
 
     // The engine's own answer is B's version; the user says A's.
-    expect(report?.winner).toBe('b');
+    expect((report?.ctxB as { updated: number }).updated).toBeGreaterThan((report?.ctxA as { updated: number }).updated);
     const applied = await sync(a.node, b.node, {
-      decisions: [{ uuid: report?.uuid as string, choice: 'a' }],
+      decisions: [{ id: report?.id as string, action: 'keep', side: 'a' }],
     });
 
     expect(applied.applied).toBe(true);
@@ -124,8 +185,8 @@ describe('decisions', () => {
     // C has A's losing version and nothing else, which is what would re-raise it.
     await settle(a.node, c.node);
 
-    const [report] = (await sync(a.node, b.node)).pending;
-    await sync(a.node, b.node, { decisions: [{ uuid: report?.uuid as string, choice: 'a' }] });
+    const [report] = await stoppedBy(a.node, b.node);
+    await sync(a.node, b.node, { decisions: [{ id: report?.id as string, action: 'keep', side: 'a' }] });
 
     const decided = (await a.node.live()).find((entry) => entry.path === 'notes.bin');
     expect(decided?.prev).toBeTypeOf('string');
@@ -142,10 +203,10 @@ describe('decisions', () => {
 
   it('accept content the caller composed', async () => {
     const { a, b } = await disputed();
-    const [report] = (await sync(a.node, b.node)).pending;
+    const [report] = await stoppedBy(a.node, b.node);
 
     await sync(a.node, b.node, {
-      decisions: [{ uuid: report?.uuid as string, choice: encoder.encode('merged by hand') }],
+      decisions: [{ id: report?.id as string, action: 'replace', content: encoder.encode('merged by hand') }],
     });
 
     expect(await get(a, 'notes.bin')).toBe('merged by hand');
@@ -154,10 +215,10 @@ describe('decisions', () => {
 
   it("park the loser when the answer is 'both'", async () => {
     const { a, b } = await disputed();
-    const [report] = (await sync(a.node, b.node)).pending;
+    const [report] = await stoppedBy(a.node, b.node);
 
     const applied = await sync(a.node, b.node, {
-      decisions: [{ uuid: report?.uuid as string, choice: 'both' }],
+      decisions: [{ id: report?.id as string, action: 'keep-both' }],
     });
 
     expect(applied.applied).toBe(true);
@@ -170,22 +231,19 @@ describe('decisions', () => {
 
   it('are ignored when they name a dispute that has moved on', async () => {
     const { a, b } = await disputed();
-    const [report] = (await sync(a.node, b.node)).pending;
+    const [report] = await stoppedBy(a.node, b.node);
     const decision = {
-      uuid: report?.uuid as string,
-      choice: 'a' as const,
-      a: report?.a?.hash ?? null,
-      b: report?.b?.hash ?? null,
+      id: report?.id as string,
+      action: 'keep' as const,
+      side: 'a' as const,
+      a: (report?.ctxA as { hash: string }).hash,
+      b: (report?.ctxB as { hash: string }).hash,
     };
 
     // B edits again while the user is still looking at the two columns.
     await put(b, 'notes.bin', 'from B, again');
 
-    const result = await sync(a.node, b.node, { decisions: [decision] });
-
-    expect(result.applied).toBe(false);
-    expect(result.pending).toHaveLength(1);
-    expect(result.pending[0]?.b?.hash).not.toBe(decision.b);
+    await expect(sync(a.node, b.node, { decisions: [decision] })).rejects.toThrow(ConflictError);
     expect(files(a)['notes.bin']).toBe('from A');
   });
 
@@ -200,16 +258,17 @@ describe('decisions', () => {
     await a.node.commit();
     for (const path of ['one.bin', 'two.bin']) await put(b, path, `from B: ${path}`);
 
-    const first = await sync(a.node, b.node);
-    expect(first.pending).toHaveLength(2);
+    const first = await stoppedBy(a.node, b.node);
+    expect(first).toHaveLength(2);
 
-    const half = await sync(a.node, b.node, {
-      decisions: [{ uuid: first.pending[0]?.uuid as string, choice: 'a' }],
+    const half = sync(a.node, b.node, {
+      decisions: [{ id: first[0]?.id as string, action: 'keep', side: 'a' }],
     });
-
-    expect(half.applied).toBe(false);
-    expect(half.pending).toHaveLength(1);
-    expect(half.pending[0]?.uuid).toBe(first.pending[1]?.uuid);
+    await expect(half).rejects.toThrow(ConflictError);
+    await half.catch((error: ConflictError) => {
+      expect(error.conflicts).toHaveLength(1);
+      expect(error.conflicts[0]?.id).toBe(first[1]?.id);
+    });
     // The decided one did not land either: one outstanding decision is enough.
     expect(files(a)['one.bin']).toBe('from A: one.bin');
   });
@@ -219,10 +278,93 @@ describe('decisions', () => {
     const b = await peer('device-b');
     await put(a, 'notes.md', 'hello');
 
-    const result = await sync(a.node, b.node, { decisions: [{ uuid: 'nope', choice: 'a' }] });
+    const result = await sync(a.node, b.node, { decisions: [{ id: 'nope', action: 'keep', side: 'a' }] });
 
     expect(result.applied).toBe(true);
     expect(files(b)).toEqual({ 'notes.md': 'hello' });
+  });
+});
+
+describe('decide', () => {
+  it('is asked once per conflict and settles the pass in one go', async () => {
+    const { a, b } = await disputed();
+    const seen: string[] = [];
+
+    const result = await sync(a.node, b.node, {
+      decide: (conflict) => {
+        seen.push(`${conflict.reason}:${conflict.path}`);
+        return { action: 'keep', side: 'a' };
+      },
+    });
+
+    expect(seen).toEqual(['content:notes.bin']);
+    expect(result.applied).toBe(true);
+    expect(await get(b, 'notes.bin')).toBe('from A');
+    // And the unrelated file travelled with it, in the same pass.
+    expect(files(b)['unrelated.txt']).toBe('a photo, morally');
+  });
+
+  /** Being asked and saying no is an answer. Answers come back; they do not throw. */
+  it('returns instead of throwing when the answer is no', async () => {
+    const { a, b } = await disputed();
+
+    const result = await sync(a.node, b.node, { decide: () => ({ action: 'abort' }) });
+
+    expect(result.applied).toBe(false);
+    expect(result.pending).toHaveLength(1);
+    expect(files(b)['unrelated.txt']).toBeUndefined();
+  });
+
+  it('treats no answer at all as the same no', async () => {
+    const { a, b } = await disputed();
+    const result = await sync(a.node, b.node, { decide: () => null });
+
+    expect(result.applied).toBe(false);
+    expect(files(b)['unrelated.txt']).toBeUndefined();
+  });
+
+  /**
+   * The array is what a person has already seen and confirmed; the callback may
+   * be a policy that never looked. So the array wins.
+   */
+  it('yields to a decision the caller already had in hand', async () => {
+    const { a, b } = await disputed();
+    const [report] = await stoppedBy(a.node, b.node);
+    let asked = 0;
+
+    await sync(a.node, b.node, {
+      decisions: [{ id: report?.id as string, action: 'keep', side: 'a' }],
+      decide: () => {
+        asked++;
+        return { action: 'keep', side: 'b' };
+      },
+    });
+
+    expect(asked).toBe(0);
+    expect(await get(b, 'notes.bin')).toBe('from A');
+  });
+
+  it('is not asked about anything that settled itself', async () => {
+    const a = await peer('device-a');
+    const b = await peer('device-b');
+    await put(a, 'gamelist.xml', '<one/>\n<two/>\n<three/>\n');
+    await sync(a.node, b.node);
+
+    await put(a, 'gamelist.xml', '<ONE/>\n<two/>\n<three/>\n');
+    await a.node.commit();
+    await put(b, 'gamelist.xml', '<one/>\n<two/>\n<THREE/>\n');
+
+    let asked = 0;
+    const result = await sync(a.node, b.node, {
+      decide: () => {
+        asked++;
+        return { action: 'abort' };
+      },
+    });
+
+    expect(asked).toBe(0);
+    expect(result.merged).toBe(1);
+    expect(result.applied).toBe(true);
   });
 });
 
@@ -270,10 +412,10 @@ describe('dryRun', () => {
     const { a, b } = await disputed();
 
     const preview = await sync(a.node, b.node, { dryRun: true });
-    const real = await sync(a.node, b.node);
+    const real = await stoppedBy(a.node, b.node);
 
     expect(preview.pending.map((report) => report.path)).toEqual(
-      real.pending.map((report) => report.path),
+      real.map((conflict) => conflict.path),
     );
     expect(files(b)['unrelated.txt']).toBeUndefined();
   });

@@ -138,7 +138,14 @@ export interface VFSAdapter {
 
 // ---------------------------------------------------------------- entries
 
-export type ConflictReason = 'binary' | 'block' | 'delete-edit' | 'kind';
+/**
+ * Why a parked conflict copy exists, recorded on the copy and read back long
+ * after the pass that made it.
+ *
+ * Not {@link ConflictReason} from `sync`, which names a case in the catalogue
+ * of things the engine stops for. This one only ever describes a copy.
+ */
+export type CopyReason = 'binary' | 'block' | 'delete-edit' | 'kind';
 
 /**
  * One row of `vfs.json`: the mirror of a single path in the working folder.
@@ -187,7 +194,7 @@ export interface VFSEntry {
   // ------------------------------------------------- pending conflict copy
   /** uuid of the entry in dispute. Present only on a conflict copy. */
   conflictOf?: string;
-  reason?: ConflictReason;
+  reason?: CopyReason;
   /** Hash of the ancestor, when whoever detected the conflict had it. */
   base?: Hash;
   /** Peer holding the bytes, for a copy too big to travel. */
@@ -292,7 +299,7 @@ export interface PendingConflict {
   uuid: string;
   /** uuid of the entry in dispute. */
   of: string;
-  reason: ConflictReason;
+  reason: CopyReason;
   /** Where the disputed file lives now (the winner). */
   path: string;
   /** Where the losing copy was parked. */

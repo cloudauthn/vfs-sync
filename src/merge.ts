@@ -2,7 +2,7 @@ import { History } from './history.js';
 import type { Diff3Reason } from './diff3.js';
 import { basename, dirname, splitExtension } from './path.js';
 import { sortEntries } from './vfs-file.js';
-import type { ConflictReason, Hash, VFSEntry } from './types.js';
+import type { CopyReason, Hash, VFSEntry } from './types.js';
 
 export type Side = 'a' | 'b';
 
@@ -337,7 +337,7 @@ function conflictCopy(
   nameConflict: (info: ConflictNameInfo) => string,
   heldAt: number,
 ): VFSEntry {
-  const reason: ConflictReason = kind === 'delete-edit' ? 'delete-edit' : kind === 'kind' ? 'kind' : 'binary';
+  const reason: CopyReason = kind === 'delete-edit' ? 'delete-edit' : kind === 'kind' ? 'kind' : 'binary';
   const copy: VFSEntry = {
     // Deterministic: re-merging the same pair yields the same copy rather than
     // piling up near-duplicates on every pass.

@@ -8,6 +8,7 @@ Everything is exported from `@cloudauthn/vfs-sync`, except `NodeFsAdapter`, whic
 - [sync](#sync)
 - [syncMesh / syncUntilStable](#syncmesh--syncuntilstable)
 - [Pairing](#pairing)
+- [ConflictError](#conflicterror)
 - [mergeEntries](#mergeentries)
 - [History](#history)
 - [diff3](#diff3)
@@ -310,22 +311,35 @@ const result = await sync(a, b, options?);
 
 Syncs one edge. Both peers end up with identical content and the same `state` digest.
 
-**A pass writes nothing while a conflict is waiting for a person.** Whatever `pending` reports has to
-be answered with `decisions` before anything lands — including the files that were not in dispute.
-See [deciding, before anything is written](./conflicts.md#deciding-before-anything-is-written).
+**A pass writes nothing while a conflict is waiting for a person** — not the disputed file, and not
+the files travelling alongside it. Without a way to answer, it **throws**
+[`ConflictError`](#conflicterror); with one, the answer settles it. The full catalogue of what can
+stop a pass is [`conflicts.yaml`](./conflicts.yaml).
+
+Answer in the moment, in one pass:
 
 ```ts
-const result = await sync(laptop, phone);
+await sync(laptop, phone, {
+  decide: async (conflict) => await askTheUser(conflict),   // or null to abort the pass
+});
+```
 
-if (result.pending.length > 0) {
-  const decisions = result.pending.map((report) => ({ uuid: report.uuid, choice: 'both' as const }));
+Or answer after a round trip through a UI:
+
+```ts
+try {
+  await sync(laptop, phone);
+} catch (error) {
+  if (!(error instanceof ConflictError)) throw error;
+  const decisions = error.conflicts.map((conflict) => ({ id: conflict.id, action: 'keep-both' }));
   await sync(laptop, phone, { decisions });
 }
 ```
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `decisions` | none | Settles conflicts a previous pass reported. `{ uuid, choice: 'a' \| 'b' \| 'both' \| Uint8Array }`. |
+| `decide` | none | Asked once per conflict, before anything is written. Return an answer, or `null` to abort the pass. |
+| `decisions` | none | The same answers as data, each naming a conflict by `id`. Wins over `decide` when both answer one. |
 | `conflictCopies` | `'edits'` | `'edits'`, `'always'` or `false`. See [conflicts.md](./conflicts.md#policy). |
 | `conflictName` | `defaultConflictName` | Names conflict copies. |
 | `heldAt` | 64 MB | Size from which a conflict copy stays on the peer that made it. |
@@ -484,16 +498,20 @@ an affiliation has none to lose.
 try {
   await sync(a, b);
 } catch (error) {
-  if (!(error instanceof PairingError)) throw error;
-  console.log(error.code, error.a.entries, 'files against', error.b.entries);
+  if (!(error instanceof ConflictError)) throw error;
+  const [refusal] = error.conflicts;          // at most one, with level: 'pairing'
+  console.log(refusal.reason, refusal.ctxA.entries, 'files against', refusal.ctxB.entries);
 }
 ```
 
-`PairingError` carries both sides — `peerId`, `syncId`, `version`, live entry count and log digest —
-so a caller can present *"1,240 files against 890"* instead of two uuids. The library detects,
-describes and stops: it does not ask, and it does not decide. Note what is **not** being decided
-here — there is no "this folder wins" mode. Resolution stays per file and per version, with ancestry
-above the clock; the only question settled is whether to merge at all.
+A pairing refusal arrives as [`ConflictError`](#conflicterror) like everything else — one
+`conflicts` entry with `level: 'pairing'`, carrying both folders' `peerId`, `syncId`, `version`, live
+entry count, log digest and whether either has ever synced. That is what lets a caller present
+*"1,240 files against 890"* instead of two uuids.
+
+The library detects, describes and stops. Note what is **not** being decided here — there is no "this
+folder wins" mode. Resolution stays per file and per version, with ancestry above the clock; the only
+question settled is whether to merge at all.
 
 To authorise a merge, name one of the two reported `syncId`s:
 
@@ -550,6 +568,51 @@ cosmetic — it answers whether the change can ship in one go:
 
 The second column is the one that matters, because on shared storage the old engine *is* going to
 read what the new one writes.
+
+---
+
+## ConflictError
+
+Everything the engine can stop for, in one error with one list.
+
+```ts
+try {
+  await sync(a, b);
+} catch (error) {
+  if (!(error instanceof ConflictError)) throw error;
+  for (const conflict of error.conflicts) {
+    console.log(conflict.level, conflict.reason, conflict.path ?? '');
+  }
+}
+```
+
+| | |
+| --- | --- |
+| `conflicts` | One payload per unanswered conflict. `level: 'pairing'` is about the two folders and there is at most one; `level: 'entry'` is about one file and there can be many. |
+| `pairing` | True when the pass stopped over the folders rather than over their files. |
+
+Thrown **only when there was nobody to ask**. A `decide` callback that answered `{ action: 'abort' }`
+was asked and said no, which comes back as a result with `applied: false` — a person cancelling a
+dialog is an outcome, not a failure. `dryRun` never throws either: its job is to report.
+
+Each payload names the conflict with `id` — the entry's uuid, or the `reason` for a pairing refusal —
+and that is what an answer names back. The shape of every variant, and the answers legal for each, is
+[`conflicts.yaml`](./conflicts.yaml).
+
+```ts
+type ConflictAnswer =
+  | { action: 'keep'; side: 'a' | 'b' }        // that version survives
+  | { action: 'keep-both' }                    // winner in place, loser parked beside it
+  | { action: 'replace'; content: Uint8Array } // neither; the caller's bytes
+  | { action: 'adopt'; side: 'a' | 'b' }       // both folders take that syncId
+  | { action: 'reidentify'; side: 'a' | 'b' }  // that peer keeps its id; the other mints one
+  | { action: 'abort' };
+```
+
+**`side` names the side that stays as it is**; the other yields. That holds for every action that
+takes one, which is why it is not called `wins`: for `reidentify` the side named is the one that does
+*not* change. `'a'` and `'b'` mean `ctxA` and `ctxB` of that payload — never the arguments of
+`sync(a, b)`.
 
 ---
 
@@ -773,7 +836,7 @@ import type {
   VFSAdapter, VFSListEntry, VFSStat, EntryKind, ByteRange,
   VFSChange, VFSChangeFeed,
   VFSEntry, VFSFile, VFSHeader, LogRow, LogMark, LogOpType, PeerMark, LocalState, Hash,
-  PendingConflict, ConflictReason,
+  PendingConflict, CopyReason,
   ConflictReport, ConflictKind, ConflictCopyPolicy, ConflictNameInfo,
   MergeItem, MergeOptions, MergeResult, MergeSide, Side,
   SyncOptions, SyncResult, TextConflictInfo, MeshEdge, MeshResult,
@@ -801,7 +864,7 @@ interface VFSEntry {
   native?: string;         // backend id (Drive fileId). Node-local.
   mtime?: number;          // disk mtime when `hash` was computed. Node-local.
   conflictOf?: string;     // only on a conflict copy
-  reason?: ConflictReason;
+  reason?: CopyReason;
   base?: Hash;
   held?: string;           // the copy's bytes stayed on this peer
 }

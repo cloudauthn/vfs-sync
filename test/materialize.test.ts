@@ -1,11 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import { MemoryAdapter } from '../src/adapters/memory.js';
 import { sha256 } from '../src/hash.js';
-import { sync } from '../src/sync.js';
 import { VFSNode } from '../src/vfs-node.js';
 import type { VFSEntry } from '../src/types.js';
 import type { Peer } from './helpers.js';
-import { encoder, files, peer, put, settle, tick } from './helpers.js';
+import { encoder, files, peer, put, settle, sync, tick } from './helpers.js';
 
 /**
  * Phase 2: selective materialisation.

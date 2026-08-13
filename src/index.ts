@@ -1,6 +1,6 @@
 export type {
   ByteRange,
-  ConflictReason,
+  CopyReason,
   EntryKind,
   Hash,
   LocalState,
@@ -95,16 +95,19 @@ export type {
   TextMergeReason,
 } from './merge.js';
 
-export { PairingError, sync, syncMesh, syncUntilStable } from './sync.js';
+export { ConflictError, sync, syncMesh, syncUntilStable } from './sync.js';
 export type {
   MeshEdge,
   MeshResult,
-  PairingCode,
-  PairingSide,
+  ConflictAnswer,
+  ConflictPayload,
+  ConflictReason,
+  FolderContext,
   SyncAction,
   SyncActionType,
   SyncDecision,
   SyncOptions,
+  VersionContext,
   SyncResult,
   TextConflictInfo,
 } from './sync.js';
