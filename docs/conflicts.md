@@ -318,6 +318,10 @@ never saw.
 An incomplete decision list is ordinary — the user answers two of five and gets on with their day.
 What is left keeps the pass from writing and comes back in `pending`.
 
+The full catalogue — every case the engine can stop for, the data each one carries, and the answers
+that are legal for it — is [`conflicts.yaml`](./conflicts.yaml), and it is the contract this is built
+against.
+
 ### What counts as needing a person
 
 `conflicts` is everything that diverged. `pending` is the subset nobody but a person can settle:

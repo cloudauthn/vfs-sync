@@ -1,0 +1,261 @@
+# The decision contract.
+#
+# Everything the engine can stop for, what it hands you, and what you may answer:
+#
+#   await sync(a, b, { decide: async (payload) => answer })
+#
+# ## Status
+#
+# The catalogue is complete — it is derived from every place the engine raises a
+# conflict, and the audit is in `_completeness` at the end. The delivery is not:
+#
+#   - Level 2 answers exist today as data, `sync(a, b, { decisions: [...] })`,
+#     with `keep` written as 'a' | 'b', `keep-both` as 'both' and `replace` as
+#     the bytes themselves.
+#   - Level 1 has no callback at all: it arrives as a thrown `PairingError`, and
+#     only `foreign-mesh` has an authorised path (`adopt: { syncId }`).
+#   - `# +` marks a field or an action that does not exist yet.
+#
+# ## Two rules that hold for every variant
+#
+#   - `side` names the side that **stays as it is**; the other yields. 'a' and
+#     'b' mean ctxA and ctxB of *this payload*, never the arguments of
+#     sync(a, b) — a conflict can be between two entries neither of which came
+#     from the peer you passed first.
+#   - Returning nothing is `{ action: abort }`, and abort means **the whole pass
+#     writes nothing** — not just this conflict. All of them answered, or none
+#     of it happens.
+
+version: 1
+
+# ---------------------------------------------------------------- shapes
+
+folder: &folder
+  peerId: string
+  syncId: string | null
+  version: number
+  entries: number # live entries, so a caller can say "1,240 files against 890"
+  log: { segment: number, digest: hash }
+
+version: &version
+  path: string
+  hash: hash | null # null on the side that is a deletion
+  size: number
+  updated: number
+  peerId: string
+  deleted: boolean
+  readable: boolean # + can these bytes be read here? no diff is possible without it
+
+entry: &entry
+  uuid: string
+  path: string
+  kind: file | directory
+  hash: hash | null
+  size: number
+  updated: number
+  peerId: string
+  subtree: number # + entries under it, 0 for a file; "this moves 412 files" is the decision
+
+# ------------------------------------------------- level 1: the two folders
+#
+# At most one per pass, asked before the merge is computed — a foreign mesh must
+# not be merged at all, so there is nothing to report about its files.
+
+foreign-mesh:
+  when: the two folders carry different syncIds — separate meshes
+  payload:
+    reason: foreign-mesh
+    level: pairing
+    ctxA: *folder
+    ctxB: *folder
+  returns:
+    - { action: adopt, side: a | b } # both take that side's syncId, then merge
+    - { action: abort }
+
+peer-collision:
+  when: one peerId on two folders — a copied .vfs, or a non-unique options.id
+  note: >
+    The engine cannot tell the two causes apart: a clone predating the first
+    sync and an imposed id look identical from here. Reidentifying fixes the
+    copy and is inert against an imposed id, which the next open() re-imposes.
+  payload:
+    reason: peer-collision
+    level: pairing
+    ctxA:
+      <<: *folder
+      everSynced: boolean # + the folder that never synced is the safe one to reidentify
+    ctxB:
+      <<: *folder
+      everSynced: boolean # +
+  returns:
+    - { action: reidentify, side: a | b } # + that side keeps its id; the other mints one
+    - { action: abort }
+
+version-unreconcilable:
+  when: a folder is not at the engine's format version
+  note: >
+    Raised per side, so it can fire with *both* folders behind — two v2 folders
+    meeting a v3 engine are both unreconcilable, and there is no "other side" to
+    pick. `readable: false` means the format cannot be read at all; `true` means
+    it could be but no migration covers it.
+  payload:
+    reason: version-unreconcilable
+    level: pairing
+    engine: number # + the version this engine writes, so a caller can say which side is behind
+    ctxA:
+      <<: *folder
+      readable: boolean # + whether this version can be read at all
+    ctxB:
+      <<: *folder
+      readable: boolean # +
+  returns:
+    # No `migrate` and no `override`: both would mean rewriting a folder into
+    # another format, and that migration does not exist. Offering the action
+    # would promise something the engine cannot do.
+    - { action: abort }
+
+# --------------------------------------------------------- level 2: a file
+#
+# Zero or more per pass, asked after the merge and after the automatic text
+# merges — so nothing that settled itself is ever asked about.
+
+content:
+  when: two versions of one file, and neither descends from the other
+  payload:
+    reason: content
+    level: entry
+    uuid: string # one file: both sides share it
+    path: string
+    base: hash | null # the ancestor, when the chain turned one up
+    textReason: block | size | eol | no-base | unreadable | null
+    ctxA: *version
+    ctxB: *version
+  returns:
+    - { action: keep, side: a | b } # mints a new version carrying both parents
+    - { action: keep-both } # winner in place, loser parked beside it
+    - { action: replace, content: Uint8Array } # neither; the caller's bytes, both parents
+    - { action: abort }
+
+delete-edit:
+  when: one side deleted the file, the other edited it
+  payload:
+    reason: delete-edit
+    level: entry
+    uuid: string
+    path: string
+    ctxA: *version # `deleted` says which of the two is the deletion
+    ctxB: *version
+  returns:
+    - { action: keep, side: a | b } # confirm the deletion, or resurrect the edit
+    - { action: keep-both } # ! broken today: with conflictCopies 'edits' a winning
+      # deletion parks no copy, so this keeps only the deletion
+    - { action: replace, content: Uint8Array }
+    - { action: abort }
+
+path-collision:
+  when: >
+    two *different* files claiming one path. Not two versions of one file —
+    two uuids, each with its own history, that happen to want the same name.
+  note: >
+    Reported today as `content`, which is the same word used for two versions of
+    one file. They are not the same decision: here nothing is overwritten and
+    nothing is lost — the loser is renamed aside — so the question is only which
+    one keeps the name.
+  payload:
+    reason: path-collision
+    level: entry
+    path: string # the contested name
+    aside: string # what the loser would be renamed to
+    ctxA: *entry
+    ctxB: *entry
+  returns:
+    - { action: keep, side: a | b } # that one keeps the path; the other is renamed aside
+    - { action: abort }
+
+kind:
+  when: >
+    a path collision where the two sides are not the same kind: a file on one
+    side, a directory on the other.
+  note: >
+    Its own reason because the consequence is not symmetrical — a directory
+    losing a name takes its entire subtree along, and `subtree` is the number
+    that decides it.
+  payload:
+    reason: kind
+    level: entry
+    path: string
+    aside: string
+    ctxA: *entry
+    ctxB: *entry
+  returns:
+    - { action: keep, side: a | b } # the other is renamed aside with its subtree, never deleted
+    - { action: abort }
+
+location:
+  when: the same file renamed differently on each side
+  asked: >
+    never by default, and it stays out of `pending`: one path wins
+    deterministically and no content is at risk. Listed because a consumer may
+    want to opt into being asked, and because leaving it undocumented invites
+    the question every time.
+  payload:
+    reason: location
+    level: entry
+    uuid: string
+    ctxA: { path: string, prevPath: string | null, updated: number, peerId: string }
+    ctxB: { path: string, prevPath: string | null, updated: number, peerId: string }
+  returns:
+    - { action: keep, side: a | b } # the file takes that side's path
+
+# ------------------------------------------------------------- not asked
+
+not_conflicts:
+  what: divergences the engine settles alone, and never asks about
+  cases:
+    - the same edit on both sides — one hash, nothing to decide
+    - one version descended from the other — propagation, not divergence
+    - a rename only one side made — the mover wins, and nothing is reported
+    - a text conflict the three-way merge settled — reported as history, never pending
+
+not_decisions:
+  what: >
+    failures that stop a sync and are *not* offered to `decide`, because no
+    answer would be safe. They are thrown.
+  cases:
+    - content arriving with a hash that does not match what the tree declares
+    - resolving with the losing version when its bytes are held on another peer
+    - dematerialising the last copy of a file no peer can serve
+
+text_reasons:
+  what: >
+    Why an eligible text conflict was not settled by diff3. A field on a
+    `content` conflict, never a conflict of its own. Each value changes what a
+    UI should offer.
+  values:
+    block: { means: both sides edited the same lines, offer: a three-column view — there is a base, fixes_itself: yes }
+    eol: { means: one side writes CRLF and the other LF, offer: normalise the terminators and it merges itself, fixes_itself: no }
+    size: { means: over 1 MB, offer: pick a side — a merge was never attempted, fixes_itself: not while it stays that size }
+    no-base: { means: no ancestor was retained here or on the peer, offer: pick a side and say why, fixes_itself: yes, once a version is recorded as text }
+    unreadable: { means: this peer holds the entry and not the bytes, offer: fetch the content then decide, fixes_itself: yes, once materialised }
+
+durable_reason:
+  what: >
+    What a parked copy records in vfs.json, read back by node.conflicts() long
+    after the pass that made it. Only `keep-both` produces one.
+  values: [binary, block, delete-edit, kind]
+  known_gap: >
+    'block' is declared, documented and never written: the merge only ever
+    produces binary, delete-edit and kind. A copy parked after a failed text
+    merge is labelled 'binary', which is false — it was text, it was attempted,
+    and the lines collided.
+
+_completeness:
+  audited: 2026-08-13, against every site that raises a conflict
+  sites:
+    - src/sync.ts pair() — three throws: version-unreconcilable, peer-collision, foreign-mesh
+    - src/merge.ts mergeEntries() — content, delete-edit (content dimension), location (location dimension)
+    - src/merge.ts resolvePathCollisions() — path-collision and kind, one per loser, run to a fixed point
+  found_missing: >
+    path-collision. Two different files on one path are reported today with the
+    same `content` kind as two versions of one file, and the two need different
+    questions. Named separately here.
