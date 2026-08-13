@@ -6,8 +6,18 @@ import type { CopyReason, Hash, VFSEntry } from './types.js';
 
 export type Side = 'a' | 'b';
 
-/** Immediate classification of a conflict, as reported back from `sync()`. */
-export type ConflictKind = 'content' | 'location' | 'delete-edit' | 'kind';
+/**
+ * Immediate classification of a conflict, as reported back from `sync()`.
+ *
+ * `content` and `path-collision` are not the same question and were once the
+ * same word. `content` is **two versions of one file**, and one of them is about
+ * to overwrite the other. `path-collision` is **two different files** — two
+ * uuids, two histories — that want the same name; nothing is overwritten and
+ * nothing is lost, because the loser is renamed aside. `kind` is that same
+ * collision when a directory is involved, which is its own reason because the
+ * loser takes its entire subtree with it.
+ */
+export type ConflictKind = 'content' | 'location' | 'delete-edit' | 'path-collision' | 'kind';
 
 export interface ConflictReport {
   uuid: string;
@@ -417,7 +427,7 @@ function resolvePathCollisions(
         // which peer contributed each is not the question being answered.
         conflicts.push({
           uuid: loser.uuid,
-          kind: keeper.kind === loser.kind ? 'content' : 'kind',
+          kind: keeper.kind === loser.kind ? 'path-collision' : 'kind',
           path,
           winner: 'a',
           a: keeper,

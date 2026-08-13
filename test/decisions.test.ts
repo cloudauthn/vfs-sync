@@ -285,6 +285,68 @@ describe('decisions', () => {
   });
 });
 
+describe('the payload carries what the decision needs', () => {
+  it('says whether each version can be read here', async () => {
+    const { a, b } = await disputed();
+    const [conflict] = await stoppedBy(a.node, b.node);
+
+    expect(conflict?.ctxA).toMatchObject({ readable: true, subtree: 0 });
+    expect(conflict?.ctxB).toMatchObject({ readable: true, subtree: 0 });
+    // Two versions of one file share an identity; two files colliding do not.
+    expect((conflict?.ctxA as { uuid: string }).uuid).toBe((conflict?.ctxB as { uuid: string }).uuid);
+  });
+
+  /**
+   * Two *different* files wanting one name is not two versions of one file, and
+   * calling both `content` made a consumer look at the uuids to tell them apart.
+   */
+  it('separates two files colliding on a path from two versions of one file', async () => {
+    const a = await peer('device-a');
+    const b = await peer('device-b');
+    await put(a, 'one.txt', 'first');
+    await put(a, 'two.txt', 'second');
+    await sync(a.node, b.node);
+
+    // Two files both sides know, renamed onto the same name from either end.
+    await a.node.rename('one.txt', 'merged.txt');
+    await a.node.commit();
+    await b.node.rename('two.txt', 'merged.txt');
+
+    const stopped = await stoppedBy(a.node, b.node);
+    const collision = stopped.find((conflict) => conflict.reason === 'path-collision');
+
+    expect(collision).toBeDefined();
+    expect(collision?.path).toBe('merged.txt');
+    expect((collision?.ctxA as { uuid: string }).uuid).not.toBe(
+      (collision?.ctxB as { uuid: string }).uuid,
+    );
+    // Nothing is at risk: the loser keeps its bytes at the name it was moved to.
+    expect((collision?.ctxB as { path: string }).path).toMatch(/conflict/);
+  });
+
+  it('counts what a directory would take with it', async () => {
+    const a = await peer('device-a');
+    const b = await peer('device-b');
+    await put(a, 'seed.txt', 'seed');
+    await sync(a.node, b.node);
+
+    // A directory on one side, a file on the other, on the same path.
+    await put(a, 'shared/one.txt', 'one');
+    await put(a, 'shared/two.txt', 'two');
+    await a.node.commit();
+    await put(b, 'shared', 'a file, not a folder');
+
+    const stopped = await stoppedBy(a.node, b.node);
+    const collision = stopped.find((conflict) => conflict.reason === 'kind');
+
+    expect(collision).toBeDefined();
+    const directory = [collision?.ctxA, collision?.ctxB].find(
+      (context) => (context as { kind: string }).kind === 'directory',
+    );
+    expect((directory as { subtree: number }).subtree).toBe(2);
+  });
+});
+
 describe('decide', () => {
   it('is asked once per conflict and settles the pass in one go', async () => {
     const { a, b } = await disputed();

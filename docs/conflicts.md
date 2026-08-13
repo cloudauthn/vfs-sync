@@ -61,20 +61,31 @@ const { conflicts } = await sync(a, b);
 // conflicts: []  — the hashes match, so there is nothing to resolve
 ```
 
-Four kinds are reported:
+Five kinds are reported:
 
 | `kind` | Meaning |
 | --- | --- |
 | `'content'` | Both sides changed the bytes, divergently. |
 | `'location'` | Both sides moved the file, to different paths. |
 | `'delete-edit'` | One side deleted it, the other edited it. |
-| `'kind'` | A file and a directory claiming the same path. |
+| `'path-collision'` | Two *different* files ended up wanting the same name. |
+| `'kind'` | The same collision with a directory on one side. |
 
 When content and location both diverge, it is reported as `'content'` — the more serious of the two.
 
+**`content` and `path-collision` are not the same question**, which is why they are not the same
+word. `content` is two versions of one file, and one is about to overwrite the other. A path
+collision is two files — two uuids, two histories — that want one name; nothing is overwritten,
+because the loser is renamed aside, so the only question is who keeps the name. The payload's two
+`uuid`s are the tell: shared for the first, different for the second.
+
+Two files created independently at the same path are *not* a collision — the merge pairs them by
+path as one file discovered twice, and reports `content`.
+
 A `'kind'` conflict is the one v2 introduces, by recording directories. Parking the loser stops
 being a local edit: if a directory loses, it is renamed **with every descendant**, in one batch, or
-the tree is inconsistent halfway through.
+the tree is inconsistent halfway through — which is why its payload carries `subtree`, the number of
+entries that would move with it.
 
 ---
 

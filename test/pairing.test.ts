@@ -199,8 +199,13 @@ describe('the pairing guard', () => {
     await sync(c.node, d.node);
     const groupB = (await b.node.file()).syncId;
 
-    // Ask first, do not rescue afterwards.
-    await expect(sync(b.node, c.node, { dryRun: true })).rejects.toThrow(ConflictError);
+    // A dry run reports rather than throws — that is its whole job — and a
+    // pairing refusal is reported like anything else that needs an answer.
+    const preview = await sync(b.node, c.node, { dryRun: true });
+    expect(preview.pending).toHaveLength(1);
+    expect(preview.pending[0]?.reason).toBe('foreign-mesh');
+    expect(preview.pending[0]?.level).toBe('pairing');
+    expect(preview.applied).toBe(false);
     expect((await b.node.file()).syncId).toBe(groupB);
     expect(files(b)).not.toHaveProperty('y.txt');
   });
@@ -249,6 +254,97 @@ describe('the pairing guard', () => {
     await expect(sync(a.node, b.node, { adopt: { syncId: 'anything' } })).rejects.toThrow(
       /identify as peer twin/,
     );
+  });
+});
+
+describe('answering the pairing question', () => {
+  /** The same authorisation `adopt: { syncId }` gives, through the door everything else uses. */
+  it('adopts one of the two groups when told which one stays', async () => {
+    const a = await peer('a');
+    const b = await peer('b');
+    const c = await peer('c');
+    const d = await peer('d');
+    await put(a, 'x.txt', 'x');
+    await put(c, 'y.txt', 'y');
+    await sync(a.node, b.node);
+    await sync(c.node, d.node);
+    const groupB = (await b.node.file()).syncId;
+    const stranger = (await c.node.file()).syncId;
+
+    const asked: string[] = [];
+    const result = await sync(b.node, c.node, {
+      decide: (conflict) => {
+        asked.push(`${conflict.level}:${conflict.reason}`);
+        return { action: 'adopt', side: 'a' };
+      },
+    });
+
+    expect(asked).toEqual(['pairing:foreign-mesh']);
+    expect(result.applied).toBe(true);
+    expect(files(c)).toHaveProperty('x.txt');
+    // Naming a side authorises *this* merge; which id survives is not the
+    // caller's to choose — the smaller one does, so a mesh settles on one value
+    // however many edges get authorised separately.
+    const groupC = (await c.node.file()).syncId;
+    expect(groupC).toBe((await b.node.file()).syncId);
+    expect(groupC).toBe([groupB, stranger].sort()[0]);
+  });
+
+  /** The remedy that existed and could not be reached from a sync. */
+  it('reidentifies the side that did not keep its id', async () => {
+    const a = await peer('twin');
+    const b = await peer('twin');
+    await put(a, 'x.txt', 'from the original');
+
+    const result = await sync(a.node, b.node, {
+      decide: (conflict) => {
+        expect(conflict.reason).toBe('peer-collision');
+        expect((conflict.ctxA as FolderContext).everSynced).toBe(false);
+        return { action: 'reidentify', side: 'a' };
+      },
+    });
+
+    expect(result.applied).toBe(true);
+    // A keeps the id it was named with; B is the one that yielded.
+    expect(a.node.peerId).toBe('twin');
+    expect(b.node.peerId).not.toBe('twin');
+    expect(files(b)['x.txt']).toBe('from the original');
+  });
+
+  it('stops when the answer is no, and says nothing was written', async () => {
+    const a = await peer('a');
+    const b = await peer('b');
+    const c = await peer('c');
+    const d = await peer('d');
+    await put(a, 'x.txt', 'x');
+    await put(c, 'y.txt', 'y');
+    await sync(a.node, b.node);
+    await sync(c.node, d.node);
+
+    const result = await sync(b.node, c.node, { decide: () => ({ action: 'abort' }) });
+
+    expect(result.applied).toBe(false);
+    expect(files(c)).not.toHaveProperty('x.txt');
+  });
+
+  it('takes the same answer as data, for a UI that went away and came back', async () => {
+    const a = await peer('a');
+    const b = await peer('b');
+    const c = await peer('c');
+    const d = await peer('d');
+    await put(a, 'x.txt', 'x');
+    await put(c, 'y.txt', 'y');
+    await sync(a.node, b.node);
+    await sync(c.node, d.node);
+
+    const stopped = await sync(b.node, c.node, { dryRun: true });
+    const [refusal] = stopped.pending;
+    await sync(b.node, c.node, {
+      decisions: [{ id: refusal?.id as string, action: 'adopt', side: 'b' }],
+    });
+
+    expect((await b.node.file()).syncId).toBe((await c.node.file()).syncId);
+    expect(files(b)).toHaveProperty('y.txt');
   });
 });
 
