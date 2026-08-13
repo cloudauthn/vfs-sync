@@ -270,10 +270,57 @@ renames and moves are tracked with certainty and the engine stays untouched. See
 [docs/adapters.md](docs/adapters.md#gdriveadapter) for the token setup (Google Identity Services,
 no backend).
 
-Not implemented: historical content (there is no object store, so a previous version cannot be
-recovered), deduplication between identical files, resumable/streaming uploads to Drive (uploads
-buffer whole), and delta transfer — streaming bounds memory, not bytes moved, so a file still
-travels in full.
+What is not implemented, and why, is under [Todos](#todos).
+
+## Project specs
+
+What the library guarantees, as opposed to what it happens to do today.
+
+**The folder is the truth.** The working folder *is* the content; `.vfs/` holds only metadata. There
+is no object store, so a previous version cannot be recovered and nothing is deduplicated — the
+trade that buys a folder you can open in Finder and a state you can read in one request.
+
+**One digest decides.** A whole folder's state is one hash over `uuid, kind, path, hash, size,
+updated` of its live entries. Two peers that agree on it have nothing to do, and that comparison is
+the floor cost of a quiet edge.
+
+**A mesh, not a hub.** A node knows only the peers it syncs with directly. Every edge syncs
+independently and changes travel down a chain. Any order of edits over any order of edges reaches one
+tree — a property test, not a hope.
+
+**A sync writes nothing while a conflict needs a person.** Not the disputed file, and not the nine
+hundred travelling alongside it. The whole plan is known before the first byte, so stopping costs two
+scans and leaves both folders exactly as they were. Being asked and declining is an answer, and comes
+back as a result; having nobody to ask is a `ConflictError`, because a list in a return value can be
+ignored by accident and a pass that stopped then looks like a pass with nothing to do.
+
+**One vocabulary for every conflict.** Two levels — a pairing refusal about the two folders, an entry
+conflict about one file — reach the caller in one shape, are answered through one callback or one
+array, and are catalogued in [`docs/conflicts.yaml`](./docs/conflicts.yaml). `legalAnswers(reason)`
+is that catalogue in code; an answer a reason does not admit throws rather than being ignored.
+
+**A decision leaves the trace a merge leaves.** Answering mints a new version carrying *both*
+parents — otherwise the next peer to do the arithmetic reaches the engine's original answer and
+quietly undoes the person's.
+
+**Correctness before cost, once.** The engine never guesses from content: a file is text because its
+extension says so, not because the bytes look textual — otherwise one peer merges what another parks.
+It never resolves with bytes it cannot fetch, never writes content whose hash does not match what the
+tree declares, and never dematerialises the last copy of a file no peer can serve. Those throw.
+
+## Todos
+
+- **`location` is never asked.** The same file renamed differently on each side settles
+  deterministically and nothing is at risk, so it stays out of `pending`. It is in the catalogue in
+  case a consumer wants to opt in; nobody has.
+- **The native transfer fast path** — two folders inside one backend still move every byte out
+  through the process and back. Planned in
+  [`SESSIONS/2026-08-12_12h49`](./SESSIONS/2026-08-12_12h49.phase-5-native-fast-path.session.md),
+  invisible to a consumer, blocking nothing.
+- **Resumable uploads to Drive** — uploads buffer whole, so streaming bounds memory, not bytes moved.
+- **Delta transfer** — a changed file still travels in full.
+- **Historical content and deduplication** — both given up with the object store, listed so the
+  absence reads as a decision.
 
 ## License
 

@@ -1053,9 +1053,9 @@ interface ConvergedConfig {
  * pairing guard and written in `close()`, because affiliation records a sync
  * that happened rather than one that was attempted.
  *
- * Computed without writing, because `syncDryRun()` has to answer the same
- * question without touching either folder. One implementation for both: a
- * second copy is a second answer.
+ * Computed without writing, because a `dryRun` has to answer the same question
+ * without touching either folder. One implementation for both: a second copy is
+ * a second answer.
  */
 function convergeConfig(fileA: VFSFile, fileB: VFSFile): ConvergedConfig {
   const text = [...new Set([...fileA.text, ...fileB.text])].sort();
