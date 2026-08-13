@@ -144,6 +144,71 @@ export type ConflictAnswer =
   | { action: 'reidentify'; side: 'a' | 'b' }
   | { action: 'abort' };
 
+export type ConflictAction = ConflictAnswer['action'];
+
+/**
+ * What may be answered to a given reason — `docs/conflicts.yaml` in code.
+ *
+ * It exists because a consumer building a dialog needs exactly this table, and
+ * the only other copy is a YAML file no program can read. Without it every UI
+ * re-derives the contract by hand, wrongly and quietly, the way every one of
+ * them would have re-derived `readable`.
+ *
+ * `abort` is in every row: declining is always available, and returning nothing
+ * means it.
+ */
+export function legalAnswers(reason: ConflictReason): ConflictAction[] {
+  switch (reason) {
+    case 'foreign-mesh':
+      return ['adopt', 'abort'];
+    case 'peer-collision':
+      // Not `adopt`: merging two folders that claim one identity is not a
+      // decision anyone can make well. One of them has to stop claiming it.
+      return ['reidentify', 'abort'];
+    case 'version-unreconcilable':
+      // No `migrate` and no `override`. Both would mean rewriting a folder into
+      // another format and that migration does not exist — an action in a
+      // contract is a promise, and that one cannot be kept.
+      return ['abort'];
+    case 'content':
+    case 'delete-edit':
+      return ['keep', 'keep-both', 'replace', 'abort'];
+    case 'path-collision':
+    case 'kind':
+      // No `replace`: bytes cannot answer which of two files keeps a name.
+      // `keep-both` confirms rather than changes — both entries survive either
+      // way — and it is admitted so that a "never lose anything" policy has an
+      // answer here instead of a deadlock.
+      return ['keep', 'keep-both', 'abort'];
+    case 'location':
+      return ['keep', 'abort'];
+  }
+}
+
+/**
+ * An answer that names an action its reason does not admit.
+ *
+ * A caller's mistake rather than a conflict, so it is thrown where it happens
+ * instead of leaving the conflict outstanding. Silence was the first design and
+ * it was wrong in a way only the intended shape shows: a consumer loops —
+ * answer, sync again, answer what comes back — and an answer the engine quietly
+ * declines to apply means the same conflict returns forever.
+ */
+export class AnswerError extends Error {
+  readonly reason: ConflictReason;
+  readonly action: ConflictAction;
+  readonly allowed: ConflictAction[];
+
+  constructor(reason: ConflictReason, action: ConflictAction, id: string) {
+    const allowed = legalAnswers(reason);
+    super(`'${action}' is not an answer to '${reason}' (${id}) — try ${allowed.join(', ')}`);
+    this.name = 'AnswerError';
+    this.reason = reason;
+    this.action = action;
+    this.allowed = allowed;
+  }
+}
+
 /**
  * An answer handed back as data, for a UI that went away and came back.
  *
@@ -209,11 +274,6 @@ export interface SyncOptions {
    */
   dryRun?: boolean;
   /**
-   * Called after planning and before any cross-peer writes. Return `false` to
-   * abort this sync pass.
-   */
-  approveMerge?: (preview: SyncResult) => Promise<boolean> | boolean;
-  /**
    * Authorises merging two folders the pairing guard stopped, by naming one of
    * the two `syncId`s the {@link ConflictError} reported.
    *
@@ -234,12 +294,15 @@ export interface SyncOptions {
  * computation stopped at the seam.
  */
 export interface SyncResult {
-  /** False when nothing was written: a dry run, or an approval that said no. */
+  /**
+   * False when nothing was written: a dry run, or a conflict somebody declined.
+   *
+   * The only reason this field survives at all — a pass that returns has applied,
+   * because anything a person had to settle throws instead.
+   */
   applied: boolean;
   /** False when both folders were already identical. */
   changed: boolean;
-  /** False when an approval hook vetoed the merge before writes. */
-  approved?: boolean;
   /** Whether the `text` config converged in this pass. */
   configChanged: boolean;
   conflicts: ConflictReport[];
@@ -369,10 +432,6 @@ export async function sync(a: VFSNode, b: VFSNode, options: SyncOptions = {}): P
     );
   }
 
-  const approve = options.approveMerge;
-  if (!plan.quiet && approve && !(await approve(preview))) {
-    return { ...preview, changed: false, approved: false, transferred: { toA: 0, toB: 0 }, state: null };
-  }
 
   return applyPlan(a, b, plan);
 }
@@ -705,7 +764,6 @@ async function applyPlan(a: VFSNode, b: VFSNode, plan: SyncPlan): Promise<SyncRe
     // the plan's own prediction of `changed` says about the visible outcome.
     ...report(plan, transferred, true),
     changed: true,
-    approved: true,
   };
 }
 
@@ -950,6 +1008,9 @@ async function settlePairing(
     const answer = given ?? (options.decide ? await options.decide(paired.refusal) : null);
     if (!answer || answer.action === 'abort') {
       return { ...paired, answered: !!answer || (!given && !!options.decide) };
+    }
+    if (!legalAnswers(paired.refusal.reason).includes(answer.action)) {
+      throw new AnswerError(paired.refusal.reason, answer.action, paired.refusal.id);
     }
 
     const side = 'side' in answer ? answer.side : 'a';
@@ -1432,6 +1493,9 @@ async function collectAnswers(
       if (answer || options.decide) declined = true;
       continue;
     }
+    if (!legalAnswers(report.kind).includes(answer.action)) {
+      throw new AnswerError(report.kind, answer.action, report.uuid);
+    }
     answers.set(key, answer);
   }
   return declined;
@@ -1492,22 +1556,15 @@ async function applyAnswers(
     // A name is not a version. Which entry keeps the path was carried out by the
     // merge — the other one is at its aside name with its subtree, nothing was
     // overwritten to get there, and there is no shared identity to mint a
-    // version of.
-    //
-    // `keep-both` counts as an answer here even though the contract does not
-    // offer it: both entries *do* survive a name collision, so a caller whose
-    // policy is "never lose anything" is describing this outcome correctly, and
-    // refusing them would deadlock a mesh over a question already answered.
-    // `replace` is the one that is left outstanding — bytes cannot answer which
-    // of two files keeps a name.
+    // version of. Both answers this reason admits say the same thing about the
+    // tree, so both are simply confirmations.
     if (isPathConflict(report)) {
-      if (answer.action === 'keep' || answer.action === 'keep-both') settled.add(key);
+      settled.add(key);
       continue;
     }
-    if (answer.action !== 'keep' && answer.action !== 'replace' && answer.action !== 'keep-both') {
-      // `adopt` and `reidentify` answer a pairing refusal, not a file.
-      continue;
-    }
+    // Nothing else can arrive: `collectAnswers` rejected every action this
+    // reason does not admit before any of them got here.
+    if (answer.action === 'adopt' || answer.action === 'reidentify' || answer.action === 'abort') continue;
 
     const entry = merge.entries.find((item) => item.uuid === report.uuid);
     if (!entry) continue;

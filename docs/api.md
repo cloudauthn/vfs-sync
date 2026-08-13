@@ -9,6 +9,7 @@ Everything is exported from `@cloudauthn/vfs-sync`, except `NodeFsAdapter`, whic
 - [syncMesh / syncUntilStable](#syncmesh--syncuntilstable)
 - [Pairing](#pairing)
 - [ConflictError](#conflicterror)
+  - [legalAnswers](#legalanswers)
 - [mergeEntries](#mergeentries)
 - [History](#history)
 - [diff3](#diff3)
@@ -346,19 +347,17 @@ try {
 | `autoMerge` | `true` | Set `false` to skip the three-way merge of text. |
 | `resolveText` | none | Hook for interactive text resolution; return `null` for the headless path. |
 | `dryRun` | `false` | Plan and report without writing either folder. |
-| `approveMerge` | none | Hook called with a preview before writes; return `false` to abort. |
 | `now` | `Date.now` | Clock for the sync's own bookkeeping. |
 
 Returns:
 
 | Field | Type | Meaning |
 | --- | --- | --- |
-| `applied` | `boolean` | `false` when nothing was written: a dry run, or a veto. |
+| `applied` | `boolean` | `false` when nothing was written: a dry run, or a conflict somebody declined. |
 | `changed` | `boolean` | `false` when the two were already identical. |
-| `approved` | `boolean \| undefined` | `false` when approval vetoed the merge; `true` when approved. |
 | `configChanged` | `boolean` | `true` when the `text` config converged in this pass. |
 | `conflicts` | `ConflictReport[]` | Everything that diverged. See [conflicts.md](./conflicts.md#reading-the-report). |
-| `pending` | `ConflictReport[]` | The subset needing a person. Non-empty means **nothing was written**. |
+| `pending` | `ConflictPayload[]` | The subset needing a person, in the shape `decide` and `ConflictError` use. Non-empty means **nothing was written**. |
 | `transferred` | `{ toA: number; toB: number }` | Files copied in each direction — predicted on a dry run. |
 | `merged` | `number` | Text conflicts settled by a three-way merge instead of a copy. |
 | `mergedPaths` | `string[]` | Which paths those were. |
@@ -372,20 +371,20 @@ if (!changed) console.log('nothing to do');
 console.log(`moved ${transferred.toA + transferred.toB} file(s), auto-merged ${merged}`);
 ```
 
-With confirmation:
+With confirmation — look first, then call the one that writes:
 
 ```ts
-const result = await sync(local, remote, {
-  async approveMerge(preview) {
-    showPreviewToUser(preview.actions, preview.conflicts);
-    return userAccepted();
-  },
-});
-
-if (result.approved === false) {
-  console.log('sync cancelled');
-}
+const preview = await sync(local, remote, { dryRun: true });
+showPreviewToUser(preview.actions, preview.conflicts);
+if (await userAccepted()) await sync(local, remote);
 ```
+
+There was an `approveMerge` hook here and it is gone. Its only vocabulary was "no", which is the one
+thing a caller can always do for itself, and it could not express the question that actually comes
+up — *which version?* — which is what `decide` and `decisions` are for. What the hook did buy is
+worth knowing: it previewed and applied inside **one** pass, where the two calls above are two, and
+the folders are free to move between them. The next pass heals what lands in that window; if you
+need it not to exist, do not show a preview at all.
 
 `sync` reconciles both sides for you; calling `commit()` first is not required.
 
@@ -613,6 +612,36 @@ type ConflictAnswer =
 takes one, which is why it is not called `wins`: for `reidentify` the side named is the one that does
 *not* change. `'a'` and `'b'` mean `ctxA` and `ctxB` of that payload — never the arguments of
 `sync(a, b)`.
+
+### legalAnswers
+
+Not every action answers every reason, and the table is exported rather than left in a YAML file no
+program can read:
+
+```ts
+legalAnswers('content');         // ['keep', 'keep-both', 'replace', 'abort']
+legalAnswers('path-collision');  // ['keep', 'keep-both', 'abort']  — bytes cannot answer a name
+legalAnswers('peer-collision');  // ['reidentify', 'abort']
+```
+
+Build a dialog from it and it cannot drift from what the engine accepts. **An answer a reason does
+not admit throws `AnswerError`** (`reason`, `action`, `allowed`) at the call that supplied it. That
+is a caller's mistake rather than a conflict, and it fails loudly for a reason: the shape every
+consumer ends up writing is a loop —
+
+```ts
+async function settle(a, b, decisions = []) {
+  try {
+    return await sync(a, b, { decisions });
+  } catch (error) {
+    if (!(error instanceof ConflictError)) throw error;
+    const answers = await askTheUser(error.conflicts);   // one answer per conflict
+    return settle(a, b, answers);
+  }
+}
+```
+
+— and an answer the engine quietly declined to apply would come back as the same conflict, forever.
 
 ---
 

@@ -95,10 +95,11 @@ export type {
   TextMergeReason,
 } from './merge.js';
 
-export { ConflictError, sync, syncMesh, syncUntilStable } from './sync.js';
+export { AnswerError, ConflictError, legalAnswers, sync, syncMesh, syncUntilStable } from './sync.js';
 export type {
   MeshEdge,
   MeshResult,
+  ConflictAction,
   ConflictAnswer,
   ConflictPayload,
   ConflictReason,

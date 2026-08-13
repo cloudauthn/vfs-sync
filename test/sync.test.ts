@@ -237,23 +237,22 @@ describe('sync', () => {
     expect(dry.merged).toBe(applied.merged);
   });
 
-  it('can veto the merge before writes with approveMerge', async () => {
+  /**
+   * What replaced `approveMerge`. The hook could only say no, and saying no is
+   * the one thing a caller can always do for itself: look first, then decide
+   * whether to call the thing that writes.
+   */
+  it('shows what a pass would write, and writing is still the caller calling it', async () => {
     const a = await peer('device-a');
     const b = await peer('device-b');
     await put(a, 'notes.md', 'hello from A');
 
-    let called = 0;
-    const result = await sync(a.node, b.node, {
-      approveMerge: async (preview) => {
-        called++;
-        expect(preview.changed).toBe(true);
-        expect(preview.actions.toB.some((action) => action.path === 'notes.md')).toBe(true);
-        return false;
-      },
-    });
+    const preview = await sync(a.node, b.node, { dryRun: true });
 
-    expect(called).toBe(1);
-    expect(result.approved).toBe(false);
+    expect(preview.changed).toBe(true);
+    expect(preview.applied).toBe(false);
+    expect(preview.actions.toB.some((action) => action.path === 'notes.md')).toBe(true);
+    // The caller looked and did not proceed: nothing moved.
     expect(files(b)).toEqual({});
   });
 

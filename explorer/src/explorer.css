@@ -1093,6 +1093,90 @@
   gap: 8px;
 }
 
+.vfs-explorer .vfs-modal-actions button[disabled] {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+/* ------------------------------------------------- one conflict, one row */
+
+.vfs-explorer .vfs-decide {
+  overflow: auto;
+  max-height: min(52vh, 480px);
+  padding-right: 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.vfs-explorer .vfs-decide-row {
+  border: 1px solid var(--vfs-line);
+  border-radius: 7px;
+  background: var(--vfs-panel-2);
+  padding: 8px 9px;
+}
+
+.vfs-explorer .vfs-decide-row h4 {
+  margin: 0 0 4px;
+  font-size: 12px;
+  color: var(--vfs-text);
+  font-family: var(--vfs-mono);
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.vfs-explorer .vfs-decide-reason {
+  font-family: inherit;
+  font-size: 10.5px;
+  color: var(--vfs-muted);
+  border: 1px solid var(--vfs-line);
+  border-radius: 999px;
+  padding: 1px 7px;
+  flex: none;
+}
+
+.vfs-explorer .vfs-decide-sides {
+  margin: 6px 0 8px;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.vfs-explorer .vfs-decide-sides dt {
+  font-size: 11.5px;
+  color: var(--vfs-text);
+  font-family: var(--vfs-mono);
+}
+
+.vfs-explorer .vfs-decide-sides dd {
+  margin: 1px 0 0;
+  font-size: 11.5px;
+  color: var(--vfs-muted);
+}
+
+.vfs-explorer .vfs-decide-blocked {
+  color: var(--vfs-warn);
+}
+
+.vfs-explorer .vfs-decide-choices {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.vfs-explorer .vfs-decide-choices button {
+  font-size: 11.5px;
+  padding: 4px 9px;
+}
+
+@media (max-width: 720px) {
+  .vfs-explorer .vfs-decide-sides {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
 /* --------------------------------------------------------------- narrow */
 
 @media (max-width: 720px) {

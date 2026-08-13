@@ -6,10 +6,18 @@ export function Modal({ model }: { model: ExplorerModel }): JSX.Element | null {
   if (!dialog) return null;
 
   const isPrompt = dialog.kind === 'prompt';
+  const isDecide = dialog.kind === 'decide';
   const okClass = dialog.danger ? 'vfs-danger' : 'vfs-primary';
 
   return (
-    <div class="vfs-modal-backdrop" role="presentation" onClick={() => model.cancelDialog()}>
+    // A decide dialog does not close on a stray backdrop click: answering five
+    // rows and losing them to a misclick is a worse outcome than an extra press
+    // of "Not now", which is right there and means the same thing.
+    <div
+      class="vfs-modal-backdrop"
+      role="presentation"
+      onClick={() => !isDecide && model.cancelDialog()}
+    >
       <div
         class="vfs-modal"
         role="dialog"
@@ -37,6 +45,43 @@ export function Modal({ model }: { model: ExplorerModel }): JSX.Element | null {
             ))}
           </div>
         )}
+        {isDecide && (
+          <div class="vfs-decide">
+            {(dialog.conflicts ?? []).map((conflict) => (
+              <section class="vfs-decide-row" key={conflict.id}>
+                <h4>
+                  {conflict.path ?? conflict.reason}
+                  <span class="vfs-decide-reason">{conflict.reason}</span>
+                </h4>
+                {conflict.note && <p class="vfs-hint">{conflict.note}</p>}
+                <dl class="vfs-decide-sides">
+                  {conflict.sides.map((side) => (
+                    <div key={side.label}>
+                      <dt>{side.label}</dt>
+                      <dd>
+                        {side.detail}
+                        {side.blocked && <span class="vfs-decide-blocked"> — {side.blocked}</span>}
+                      </dd>
+                    </div>
+                  ))}
+                </dl>
+                <div class="vfs-decide-choices">
+                  {conflict.choices.map((choice, index) => (
+                    <button
+                      key={choice.label}
+                      class={conflict.picked === index ? 'vfs-primary' : 'vfs-ghost'}
+                      title={choice.blocked ?? ''}
+                      onClick={() => model.setDecision(conflict.id, index)}
+                    >
+                      {choice.label}
+                      {choice.blocked && ' ⚠'}
+                    </button>
+                  ))}
+                </div>
+              </section>
+            ))}
+          </div>
+        )}
         {isPrompt && (
           <input
             class="vfs-modal-input"
@@ -59,7 +104,11 @@ export function Modal({ model }: { model: ExplorerModel }): JSX.Element | null {
           <button class="vfs-ghost" onClick={() => model.cancelDialog()}>
             {dialog.cancelText ?? 'Cancel'}
           </button>
-          <button class={okClass} onClick={() => model.acceptDialog()}>
+          <button
+            class={okClass}
+            disabled={isDecide && !model.decisionsComplete}
+            onClick={() => model.acceptDialog()}
+          >
             {dialog.okText ?? 'OK'}
           </button>
         </div>

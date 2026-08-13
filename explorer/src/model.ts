@@ -1,5 +1,6 @@
 import {
   CONTROL_DIR,
+  ConflictError,
   HEADER_PROBE,
   FSAAdapter,
   GDriveAdapter,
@@ -11,6 +12,7 @@ import {
   dirname,
   isOPFSAvailable,
   joinPath,
+  legalAnswers,
   normalizePath,
   parseHeader,
   readRange,
@@ -27,12 +29,17 @@ import {
   hasCachedGoogleToken,
 } from './gis';
 import type {
+  ConflictAction,
+  ConflictPayload,
   ConflictReport,
+  FolderContext,
   Hash,
   MeshEdge,
   PeerMark,
   PendingConflict,
+  SyncDecision,
   SyncResult,
+  VersionContext,
   VFSEntry,
   VFSAdapter,
   VFSListEntry,
@@ -265,7 +272,7 @@ export interface LogEntry {
 }
 
 export interface ExplorerDialog {
-  kind: 'confirm' | 'prompt';
+  kind: 'confirm' | 'prompt' | 'decide';
   title: string;
   message: string;
   sections?: Array<{ title: string; items: string[] }>;
@@ -274,6 +281,42 @@ export interface ExplorerDialog {
   okText?: string;
   cancelText?: string;
   danger?: boolean;
+  /** `decide` only: one row per conflict, with the choice made so far. */
+  conflicts?: DecidableConflict[];
+}
+
+/** One conflict as a row of buttons: what it is, and what may be answered. */
+export interface DecidableConflict {
+  id: string;
+  reason: ConflictPayload['reason'];
+  /** Absent on a pairing refusal, which is about the two folders. */
+  path?: string;
+  /** Why this stopped the pass, in the user's terms rather than the engine's. */
+  note?: string;
+  sides: [DecidableSide, DecidableSide];
+  choices: DecidableChoice[];
+  /** Index into `choices`, or `null` while the row is unanswered. */
+  picked: number | null;
+}
+
+export interface DecidableSide {
+  label: string;
+  /** "2.4 kB · 4 minutes ago", or "deleted 4 minutes ago". */
+  detail: string;
+  /**
+   * Why picking this side cannot work: its bytes live on a peer that is not
+   * here. The engine throws rather than pretend, so the dialog says so first —
+   * the same rule `resolveConflict` already applies to a parked copy.
+   */
+  blocked?: string;
+}
+
+export interface DecidableChoice {
+  label: string;
+  action: ConflictAction;
+  side?: 'a' | 'b';
+  /** Set when this choice names a side whose bytes are not here. */
+  blocked?: string;
 }
 
 /** One folder's cached children, plus the `.vfs` probe that rides along. */
@@ -292,6 +335,64 @@ interface Peek {
 
 function uniqueSorted(items: string[]): string[] {
   return [...new Set(items)].sort((a, b) => a.localeCompare(b));
+}
+
+/** The sentence under a decide row: why this stopped, in the user's terms. */
+function decisionNote(conflict: ConflictPayload): string | undefined {
+  switch (conflict.reason) {
+    case 'content': {
+      const why: Record<string, string> = {
+        block: 'Both sides changed the same lines.',
+        eol: 'The line endings differ — normalise them and this merges itself.',
+        size: 'Too large for an automatic merge, so none was attempted.',
+        'no-base': 'Nobody kept the version they both came from.',
+        unreadable: 'The other version is not on this device yet.',
+      };
+      return why[conflict.textReason ?? ''] ?? 'Two versions, and neither one came from the other.';
+    }
+    case 'delete-edit':
+      return 'One side deleted it, the other changed it.';
+    case 'path-collision':
+      return 'Two different files want this name. Whichever yields keeps its content under another name.';
+    case 'kind': {
+      const subtree = Math.max(
+        (conflict.ctxA as VersionContext).subtree ?? 0,
+        (conflict.ctxB as VersionContext).subtree ?? 0,
+      );
+      return subtree > 0
+        ? `A file and a folder want this name, and the folder takes ${subtree} item(s) with it.`
+        : 'A file and a folder want this name.';
+    }
+    case 'foreign-mesh':
+      return 'These two folders have never been part of the same group.';
+    case 'peer-collision':
+      return 'Both folders claim the same identity — one is a copy of the other.';
+    case 'version-unreconcilable':
+      return `This build writes format v${conflict.engine ?? '?'} and cannot migrate what is there.`;
+    default:
+      return undefined;
+  }
+}
+
+function versionSide(side: VersionContext): DecidableSide {
+  if (side.deleted) return { label: side.peerId, detail: `deleted ${formatAgo(side.updated)}` };
+  return {
+    label: side.peerId,
+    detail: `${formatBytes(side.size)} · ${formatAgo(side.updated)}`,
+    // The engine throws rather than resolve with bytes it cannot fetch, which is
+    // the same rule `resolveConflict` states for a parked copy.
+    ...(side.readable ? {} : { blocked: 'those bytes are on another peer — sync with it first' }),
+  };
+}
+
+function folderSide(side: FolderContext): DecidableSide {
+  return {
+    label: side.peerId,
+    detail:
+      `${side.entries} item(s) · ` +
+      (side.everSynced ? 'has synced before' : 'has never synced') +
+      (side.formatReadable ? '' : ' · unreadable format'),
+  };
 }
 
 /**
@@ -395,6 +496,10 @@ export class ExplorerModel {
   /** The one Drive source's token provider, reused so a refresh reaches its adapter. */
   private gdriveToken: (() => Promise<string>) | null = null;
   private dialogResolve: ((answer: boolean | string | null) => void) | null = null;
+  /** The decide dialog's rows, kept so they survive the close by one step. */
+  private decided: DecidableConflict[] | null = null;
+  /** Per edge, the last set of conflicts reported by a pass nobody watched. */
+  private readonly lastStopped = new Map<string, string>();
 
   constructor(options: ExplorerOptions = {}) {
     this.options = options;
@@ -1684,17 +1789,29 @@ export class ExplorerModel {
 
   /** Syncs the open root against the footer's target — or the whole chain. */
   async syncTarget(): Promise<void> {
-    return this.syncTargetCommon(false);
+    return this.syncTargetCommon({ confirm: false, ask: true });
   }
 
-  /** Same target flow, but asks for approval before applying a pair merge. */
+  /** Same target flow, but shows the plan first and waits for a yes. */
   async syncTargetWithConfirm(): Promise<void> {
-    return this.syncTargetCommon(true);
+    return this.syncTargetCommon({ confirm: true, ask: true });
   }
 
-  private async syncTargetCommon(confirmMerge: boolean): Promise<void> {
+  /**
+   * The auto-sync timer's pass, and the one that **never opens a dialog**.
+   *
+   * A modal appearing every few seconds because two devices disagree about one
+   * file is not a feature. This is the edge with nobody on it: it reports what
+   * stopped it — once, not on every tick — and waits for a person to press Sync
+   * and answer.
+   */
+  private async syncTargetQuietly(): Promise<void> {
+    return this.syncTargetCommon({ confirm: false, ask: false });
+  }
+
+  private async syncTargetCommon({ confirm, ask }: { confirm: boolean; ask: boolean }): Promise<void> {
     if (this.syncTargetKey === ALL_ROOTS || this.syncTargetKey === this.active) {
-      if (confirmMerge) {
+      if (confirm) {
         const ok = await this.askConfirm({
           title: 'Sync all roots',
           message:
@@ -1707,103 +1824,29 @@ export class ExplorerModel {
           return;
         }
       }
-      return this.syncAll();
+      return this.syncAll(ask);
     }
     const a = this.activePeer();
     const b = this.peerOf(this.syncTargetKey);
     if (!a || !b || this.syncing) return;
 
-    const approveMerge = confirmMerge
-      ? async (preview: SyncResult) => {
-          if (!preview.changed) return true;
-
-          const changes = uniqueSorted([
-            ...preview.actions.toA
-              .filter((action) => action.type === 'write' && !action.created)
-              .map((action) => `→ ${a.label}: ${action.path}`),
-            ...preview.actions.toB
-              .filter((action) => action.type === 'write' && !action.created)
-              .map((action) => `→ ${b.label}: ${action.path}`),
-            ...preview.actions.toA
-              .filter((action) => action.type === 'rename')
-              .map((action) => `→ ${a.label}: ${action.from ?? action.path} -> ${action.to ?? action.path}`),
-            ...preview.actions.toB
-              .filter((action) => action.type === 'rename')
-              .map((action) => `→ ${b.label}: ${action.from ?? action.path} -> ${action.to ?? action.path}`),
-          ]);
-
-          const creates = uniqueSorted([
-            ...preview.actions.toA
-              .filter((action) => action.type === 'write' && action.created)
-              .map((action) => `→ ${a.label}: ${action.path}`),
-            ...preview.actions.toB
-              .filter((action) => action.type === 'write' && action.created)
-              .map((action) => `→ ${b.label}: ${action.path}`),
-            ...preview.actions.toA
-              .filter((action) => action.type === 'mkdir')
-              .map((action) => `→ ${a.label}: ${action.path}/`),
-            ...preview.actions.toB
-              .filter((action) => action.type === 'mkdir')
-              .map((action) => `→ ${b.label}: ${action.path}/`),
-          ]);
-
-          const mergedText = uniqueSorted(preview.mergedPaths);
-
-          const deletes = uniqueSorted([
-            ...preview.actions.toA
-              .filter((action) => action.type === 'delete')
-              .map((action) => `→ ${a.label}: ${action.path}`),
-            ...preview.actions.toB
-              .filter((action) => action.type === 'delete')
-              .map((action) => `→ ${b.label}: ${action.path}`),
-          ]);
-
-          const conflicts = uniqueSorted(
-            preview.conflicts.map((conflict) =>
-              conflict.copy
-                ? `${conflict.path} (${conflict.kind}) -> copy: ${conflict.copy.path}`
-                : `${conflict.path} (${conflict.kind})`,
-            ),
-          );
-
-          const lines = [
-            `${a.label} ⇄ ${b.label}`,
-            '',
-            `to ${a.label}: ${preview.actions.toA.length} action(s)`,
-            `to ${b.label}: ${preview.actions.toB.length} action(s)`,
-            `estimated transfers: ${preview.transferred.toA + preview.transferred.toB}`,
-            `text merges: ${preview.merged}`,
-            `conflicts: ${preview.conflicts.length}`,
-            '',
-            'Apply this sync?',
-          ];
-          return this.askConfirm({
-            title: 'Confirm sync',
-            message: lines.join('\n'),
-            sections: [
-              { title: 'Files that change', items: changes },
-              { title: 'Files that are created', items: creates },
-              { title: 'Files updated via text merge', items: mergedText },
-              { title: 'Files that are deleted', items: deletes },
-              { title: 'Conflicts', items: conflicts },
-            ],
-            okText: 'Apply',
-          });
-        }
-      : undefined;
-
     this.syncing = true;
     this.emit();
     try {
-      const result = await sync(a.node, b.node, {
-        ...(approveMerge ? { approveMerge } : {}),
-      });
-      if (result.approved === false) {
-        this.log(`${a.label} ⇄ ${b.label}: sync cancelled`);
-        return;
+      if (confirm) {
+        // What `approveMerge` used to do, through the door every caller has:
+        // look with `dryRun`, then decide whether to call the one that writes.
+        const preview = await sync(a.node, b.node, { dryRun: true });
+        if (preview.changed && !(await this.confirmPreview(preview, a, b))) {
+          this.log(`${a.label} ⇄ ${b.label}: sync cancelled`);
+          return;
+        }
       }
+      const result = await this.syncAnswering(a, b, ask);
+      if (!result) return;
       const moved = result.transferred.toA + result.transferred.toB;
-      if (!result.changed) this.log(`${a.label} ⇄ ${b.label}: already in sync`);
+      if (!result.applied) this.log(`${a.label} ⇄ ${b.label}: nothing written`);
+      else if (!result.changed) this.log(`${a.label} ⇄ ${b.label}: already in sync`);
       else this.log(`${a.label} ⇄ ${b.label}: merged, ${moved} blob(s) moved`, 'ok');
       for (const conflict of result.conflicts) this.logConflict(conflict);
       this.lastSyncAt = Date.now();
@@ -1815,20 +1858,184 @@ export class ExplorerModel {
     }
   }
 
-  async syncAll(): Promise<void> {
+  /**
+   * One edge, answering whatever stops it.
+   *
+   * The loop is what any consumer ends up writing: sync; if it stopped, put the
+   * conflicts to somebody; sync again with their answers. It repeats rather than
+   * trying exactly twice because an answer can surface a conflict that was not
+   * there before, and the folders are free to move while the dialog is open. The
+   * cap is there because this drives a modal, and a dialog that can reopen
+   * forever is worse than one that gives up and says so.
+   */
+  private async syncAnswering(a: Peer, b: Peer, ask: boolean): Promise<SyncResult | null> {
+    let decisions: SyncDecision[] = [];
+    for (let round = 0; round < 8; round++) {
+      try {
+        return await sync(a.node, b.node, decisions.length > 0 ? { decisions } : {});
+      } catch (error) {
+        if (!(error instanceof ConflictError)) throw error;
+        if (!ask) {
+          this.reportStopped(`${a.key}:${b.key}`, error);
+          return null;
+        }
+        const answers = await this.askDecision(error.conflicts);
+        if (!answers) {
+          this.log(`${a.label} ⇄ ${b.label}: left for later, nothing written`);
+          return null;
+        }
+        decisions = answers;
+      }
+    }
+    this.log(`${a.label} ⇄ ${b.label}: still unsettled after 8 rounds`, 'warn');
+    return null;
+  }
+
+  /**
+   * What stopped an edge nobody is watching — said once per distinct set.
+   *
+   * The timer runs every few seconds; without this, one disputed file writes a
+   * line into the activity log on every tick until somebody notices.
+   */
+  private reportStopped(edge: string, error: ConflictError): void {
+    const signature = error.conflicts
+      .map((conflict) => `${conflict.reason}:${conflict.id}`)
+      .sort()
+      .join('|');
+    if (this.lastStopped.get(edge) === signature) return;
+    this.lastStopped.set(edge, signature);
+    for (const conflict of error.conflicts) {
+      this.log(
+        `${conflict.path ?? conflict.reason} needs a decision (${conflict.reason}) — press Sync to answer`,
+        'conflict',
+      );
+    }
+  }
+
+  /** The plan a confirmed sync is about to run, as the old hook described it. */
+  private async confirmPreview(preview: SyncResult, a: Peer, b: Peer): Promise<boolean> {
+    const changes = uniqueSorted([
+      ...preview.actions.toA
+        .filter((action) => action.type === 'write' && !action.created)
+        .map((action) => `→ ${a.label}: ${action.path}`),
+      ...preview.actions.toB
+        .filter((action) => action.type === 'write' && !action.created)
+        .map((action) => `→ ${b.label}: ${action.path}`),
+      ...preview.actions.toA
+        .filter((action) => action.type === 'rename')
+        .map((action) => `→ ${a.label}: ${action.from ?? action.path} -> ${action.to ?? action.path}`),
+      ...preview.actions.toB
+        .filter((action) => action.type === 'rename')
+        .map((action) => `→ ${b.label}: ${action.from ?? action.path} -> ${action.to ?? action.path}`),
+    ]);
+
+    const creates = uniqueSorted([
+      ...preview.actions.toA
+        .filter((action) => action.type === 'write' && action.created)
+        .map((action) => `→ ${a.label}: ${action.path}`),
+      ...preview.actions.toB
+        .filter((action) => action.type === 'write' && action.created)
+        .map((action) => `→ ${b.label}: ${action.path}`),
+      ...preview.actions.toA
+        .filter((action) => action.type === 'mkdir')
+        .map((action) => `→ ${a.label}: ${action.path}/`),
+      ...preview.actions.toB
+        .filter((action) => action.type === 'mkdir')
+        .map((action) => `→ ${b.label}: ${action.path}/`),
+    ]);
+
+    const mergedText = uniqueSorted(preview.mergedPaths);
+
+    const deletes = uniqueSorted([
+      ...preview.actions.toA
+        .filter((action) => action.type === 'delete')
+        .map((action) => `→ ${a.label}: ${action.path}`),
+      ...preview.actions.toB
+        .filter((action) => action.type === 'delete')
+        .map((action) => `→ ${b.label}: ${action.path}`),
+    ]);
+
+    const conflicts = uniqueSorted(
+      preview.conflicts.map((conflict) =>
+        conflict.copy
+          ? `${conflict.path} (${conflict.kind}) -> copy: ${conflict.copy.path}`
+          : `${conflict.path} (${conflict.kind})`,
+      ),
+    );
+
+    const lines = [
+      `${a.label} ⇄ ${b.label}`,
+      '',
+      `to ${a.label}: ${preview.actions.toA.length} action(s)`,
+      `to ${b.label}: ${preview.actions.toB.length} action(s)`,
+      `estimated transfers: ${preview.transferred.toA + preview.transferred.toB}`,
+      `text merges: ${preview.merged}`,
+      `conflicts: ${preview.conflicts.length}`,
+      '',
+      'Apply this sync?',
+    ];
+    return this.askConfirm({
+      title: 'Confirm sync',
+      message: lines.join('\n'),
+      sections: [
+        { title: 'Files that change', items: changes },
+        { title: 'Files that are created', items: creates },
+        { title: 'Files updated via text merge', items: mergedText },
+        { title: 'Files that are deleted', items: deletes },
+        { title: 'Conflicts', items: conflicts },
+      ],
+      okText: 'Apply',
+    });
+  }
+
+  /**
+   * The whole chain, answering what stops any edge of it.
+   *
+   * `syncUntilStable` sets a stopped edge's error aside and carries on with the
+   * others, so one disputed file never holds up the rest of the mesh — what
+   * comes back is every conflict the chain could not settle, asked once and
+   * answered together. A decision naming no live conflict is ignored, which is
+   * what makes it safe to hand the whole array to every edge.
+   */
+  async syncAll(ask = true): Promise<void> {
     if (this.syncing || this.edges.length === 0) return;
     this.syncing = true;
     this.emit();
     try {
-      const rounds = await syncUntilStable(this.edges);
-      const changed = rounds.flat().filter((r) => r.result?.changed);
-      const conflicts = rounds.flat().flatMap((r) => r.result?.conflicts ?? []);
-      const failed = rounds.flat().filter((r) => r.error);
-      for (const edge of failed) this.log(`${edge.edge.a.name} <-> ${edge.edge.b.name}: ${edge.error?.message}`, 'warn');
-      if (changed.length === 0) this.log('every root already in sync');
-      else this.log(`converged in ${rounds.length} round(s), ${changed.length} edge update(s)`, 'ok');
-      for (const conflict of conflicts) this.logConflict(conflict);
-      this.lastSyncAt = Date.now();
+      let decisions: SyncDecision[] = [];
+      for (let round = 0; round < 8; round++) {
+        const rounds = await syncUntilStable(this.edges, decisions.length > 0 ? { decisions } : {});
+        const flat = rounds.flat();
+        const stopped = flat
+          .map((r) => r.error)
+          .filter((error): error is ConflictError => error instanceof ConflictError);
+
+        if (stopped.length > 0 && ask) {
+          // One row per conflict, however many edges reported it.
+          const seen = new Set<string>();
+          const unique = stopped
+            .flatMap((error) => error.conflicts)
+            .filter((conflict) => !seen.has(conflict.id) && seen.add(conflict.id));
+          const answers = await this.askDecision(unique);
+          if (answers) {
+            decisions = answers;
+            continue;
+          }
+          this.log('left for later, nothing written');
+        } else if (stopped.length > 0) {
+          for (const [index, error] of stopped.entries()) this.reportStopped(`all:${index}`, error);
+        }
+
+        const changed = flat.filter((r) => r.result?.changed);
+        for (const edge of flat.filter((r) => r.error && !(r.error instanceof ConflictError))) {
+          this.log(`${edge.edge.a.name} <-> ${edge.edge.b.name}: ${edge.error?.message}`, 'warn');
+        }
+        if (changed.length === 0) this.log('every root already in sync');
+        else this.log(`converged in ${rounds.length} round(s), ${changed.length} edge update(s)`, 'ok');
+        for (const conflict of flat.flatMap((r) => r.result?.conflicts ?? [])) this.logConflict(conflict);
+        this.lastSyncAt = Date.now();
+        break;
+      }
     } catch (error) {
       this.log(String(error), 'warn');
     } finally {
@@ -1859,7 +2066,7 @@ export class ExplorerModel {
 
   setAutoSync(on: boolean): void {
     if (this.autoTimer) clearInterval(this.autoTimer);
-    this.autoTimer = on ? setInterval(() => void this.syncTarget(), this.autoSyncMs) : undefined;
+    this.autoTimer = on ? setInterval(() => void this.syncTargetQuietly(), this.autoSyncMs) : undefined;
     this.emit();
   }
 
@@ -1912,10 +2119,108 @@ export class ExplorerModel {
       okText: 'OK',
       ...dialog,
     };
-    this.emit();
-    return new Promise<boolean>((resolve) => {
+    // Resolver first, then the emit that announces it — see `askDecision`.
+    const answered = new Promise<boolean>((resolve) => {
       this.dialogResolve = (answer) => resolve(Boolean(answer));
     });
+    this.emit();
+    return answered;
+  }
+
+  /**
+   * Puts every conflict that stopped a pass to the user, in one dialog.
+   *
+   * One dialog rather than the `decide` callback, which is asked once per
+   * conflict *inside* the pass: five disputed files would be five modals in a
+   * row with the pass held open. This shows all of them, and what comes back
+   * goes into an ordinary second `sync()`.
+   */
+  private async askDecision(conflicts: ConflictPayload[]): Promise<SyncDecision[] | null> {
+    const rows = conflicts.map((conflict) => this.decidable(conflict));
+    this.decided = rows;
+    this.closeDialog(false);
+    this.dialog = {
+      kind: 'decide',
+      title: conflicts.length === 1 ? 'One conflict needs you' : `${conflicts.length} conflicts need you`,
+      message:
+        'Nothing has been written — not these files, and not the ones travelling with them. ' +
+        'Pick one answer per row.',
+      conflicts: rows,
+      cancelText: 'Not now',
+      okText: 'Apply',
+    };
+    // The resolver is installed *before* the emit that announces the dialog: a
+    // subscriber that answers synchronously — a test, a policy, anything that is
+    // not a person with a mouse — would otherwise call `closeDialog` while
+    // `dialogResolve` is still null, and this would wait forever for an answer
+    // that has already been given.
+    const answered = new Promise<boolean>((resolve) => {
+      this.dialogResolve = (answer) => resolve(Boolean(answer));
+    });
+    this.emit();
+    if (!(await answered)) return null;
+    return (this.decided ?? []).flatMap((row) => {
+      const choice = row.picked === null ? undefined : row.choices[row.picked];
+      if (!choice) return [];
+      return [{ id: row.id, action: choice.action, ...(choice.side ? { side: choice.side } : {}) } as SyncDecision];
+    });
+  }
+
+  /** One conflict payload as a row: what it is, and what may be answered. */
+  private decidable(conflict: ConflictPayload): DecidableConflict {
+    const pairing = conflict.level === 'pairing';
+    const sides: [DecidableSide, DecidableSide] = pairing
+      ? [folderSide(conflict.ctxA as FolderContext), folderSide(conflict.ctxB as FolderContext)]
+      : [versionSide(conflict.ctxA as VersionContext), versionSide(conflict.ctxB as VersionContext)];
+
+    // The contract decides what may be offered, so this dialog cannot drift
+    // from what the engine will accept.
+    const allowed = legalAnswers(conflict.reason);
+    const choices: DecidableChoice[] = [];
+    if (allowed.includes('keep')) {
+      const verb = pairing || conflict.reason === 'content' || conflict.reason === 'delete-edit'
+        ? 'Keep'
+        : 'Give the name to';
+      choices.push(
+        {
+          label: `${verb} ${sides[0].label}`,
+          action: 'keep',
+          side: 'a',
+          ...(sides[0].blocked ? { blocked: sides[0].blocked } : {}),
+        },
+        {
+          label: `${verb} ${sides[1].label}`,
+          action: 'keep',
+          side: 'b',
+          ...(sides[1].blocked ? { blocked: sides[1].blocked } : {}),
+        },
+      );
+    }
+    if (allowed.includes('keep-both')) choices.push({ label: 'Keep both, side by side', action: 'keep-both' });
+    if (allowed.includes('adopt')) {
+      choices.push(
+        { label: `Merge them, into ${sides[0].label}'s group`, action: 'adopt', side: 'a' },
+        { label: `Merge them, into ${sides[1].label}'s group`, action: 'adopt', side: 'b' },
+      );
+    }
+    if (allowed.includes('reidentify')) {
+      choices.push(
+        { label: `${sides[0].label} keeps its identity`, action: 'reidentify', side: 'a' },
+        { label: `${sides[1].label} keeps its identity`, action: 'reidentify', side: 'b' },
+      );
+    }
+    choices.push({ label: 'Leave it for now', action: 'abort' });
+
+    const note = decisionNote(conflict);
+    return {
+      id: conflict.id,
+      reason: conflict.reason,
+      ...(conflict.path ? { path: conflict.path } : {}),
+      ...(note ? { note } : {}),
+      sides,
+      choices,
+      picked: null,
+    };
   }
 
   private async askPrompt(dialog: Omit<ExplorerDialog, 'kind'>): Promise<string | null> {
@@ -1927,10 +2232,11 @@ export class ExplorerModel {
       value: dialog.value ?? '',
       ...dialog,
     };
-    this.emit();
-    return new Promise<string | null>((resolve) => {
+    const answered = new Promise<string | null>((resolve) => {
       this.dialogResolve = (answer) => (typeof answer === 'string' ? resolve(answer) : resolve(null));
     });
+    this.emit();
+    return answered;
   }
 
   setDialogValue(value: string): void {
@@ -1939,8 +2245,28 @@ export class ExplorerModel {
     this.emit();
   }
 
+  /** Picks one answer in the decide dialog. Nothing is applied until Apply. */
+  setDecision(id: string, choice: number): void {
+    if (!this.dialog || this.dialog.kind !== 'decide' || !this.dialog.conflicts) return;
+    const conflicts = this.dialog.conflicts.map((conflict) =>
+      conflict.id === id ? { ...conflict, picked: choice } : conflict,
+    );
+    // Held apart from the dialog because closing it clears the dialog, and the
+    // answers have to outlive the close by exactly one step.
+    this.decided = conflicts;
+    this.dialog = { ...this.dialog, conflicts };
+    this.emit();
+  }
+
+  /** True once every row has an answer — Apply stays off until then. */
+  get decisionsComplete(): boolean {
+    const conflicts = this.dialog?.kind === 'decide' ? this.dialog.conflicts ?? [] : [];
+    return conflicts.length > 0 && conflicts.every((conflict) => conflict.picked !== null);
+  }
+
   acceptDialog(): void {
     if (!this.dialog) return;
+    if (this.dialog.kind === 'decide' && !this.decisionsComplete) return;
     const answer = this.dialog.kind === 'prompt' ? this.dialog.value ?? '' : true;
     this.closeDialog(answer);
   }

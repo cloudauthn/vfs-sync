@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { ConflictError } from '../src/sync.js';
+import { AnswerError, ConflictError, legalAnswers } from '../src/sync.js';
 import type { ConflictPayload } from '../src/sync.js';
 import { encoder, files, get, peer, put, settle, stabilise, sync } from './helpers.js';
 
@@ -619,6 +619,53 @@ describe('decide', () => {
     expect(asked).toBe(0);
     expect(result.merged).toBe(1);
     expect(result.applied).toBe(true);
+  });
+});
+
+/**
+ * The shape every consumer ends up writing: answer what came back, sync again,
+ * answer what comes back from *that*. It only terminates if an answer either
+ * settles its conflict or fails loudly — an answer the engine quietly declines
+ * to apply means the same conflict returns forever.
+ */
+describe('an answer the reason does not admit', () => {
+  it('throws, instead of coming back as the same conflict next round', async () => {
+    const a = await peer('device-a');
+    const b = await peer('device-b');
+    await put(a, 'one.txt', 'first');
+    await put(a, 'two.txt', 'second');
+    await sync(a.node, b.node);
+    await a.node.rename('one.txt', 'merged.txt');
+    await a.node.commit();
+    await b.node.rename('two.txt', 'merged.txt');
+
+    const collision = (await stoppedBy(a.node, b.node)).find(
+      (conflict) => conflict.reason === 'path-collision',
+    );
+
+    // Bytes cannot answer which of two files keeps a name.
+    const answered = sync(a.node, b.node, {
+      decisions: [{ id: collision?.id as string, action: 'replace', content: encoder.encode('by hand') }],
+    });
+
+    await expect(answered).rejects.toThrow(AnswerError);
+    await answered.catch((error: AnswerError) => {
+      expect(error.reason).toBe('path-collision');
+      expect(error.action).toBe('replace');
+      expect(error.allowed).toEqual(['keep', 'keep-both', 'abort']);
+    });
+  });
+
+  it('is the contract, and the contract is readable from code', async () => {
+    // What a UI switches on, so it does not re-derive `conflicts.yaml` by hand.
+    expect(legalAnswers('content')).toContain('replace');
+    expect(legalAnswers('path-collision')).not.toContain('replace');
+    expect(legalAnswers('version-unreconcilable')).toEqual(['abort']);
+    expect(legalAnswers('peer-collision')).not.toContain('adopt');
+    // Declining is always available.
+    for (const reason of ['content', 'delete-edit', 'kind', 'location', 'foreign-mesh'] as const) {
+      expect(legalAnswers(reason)).toContain('abort');
+    }
   });
 });
 
