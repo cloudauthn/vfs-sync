@@ -27,6 +27,15 @@ export interface ConflictReport {
    */
   text?: boolean;
   /**
+   * Settled without anyone being asked: the three-way merge, or a `resolveText`
+   * hook, produced content both sides adopt.
+   *
+   * The report survives so a caller can see it happened, which is exactly why
+   * this flag has to exist — otherwise "a conflict occurred" and "a conflict is
+   * waiting for a person" are the same list.
+   */
+  settled?: boolean;
+  /**
    * Why the attempt did not settle it. Absent when the merge succeeded, and
    * when none was attempted (`autoMerge: false` with no hook).
    *

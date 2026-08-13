@@ -95,15 +95,15 @@ export type {
   TextMergeReason,
 } from './merge.js';
 
-export { PairingError, sync, syncDryRun, syncMesh, syncUntilStable } from './sync.js';
+export { PairingError, sync, syncMesh, syncUntilStable } from './sync.js';
 export type {
   MeshEdge,
   MeshResult,
   PairingCode,
   PairingSide,
-  SyncDryRunAction,
-  SyncDryRunActionType,
-  SyncDryRunResult,
+  SyncAction,
+  SyncActionType,
+  SyncDecision,
   SyncOptions,
   SyncResult,
   TextConflictInfo,

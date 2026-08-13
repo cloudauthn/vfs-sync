@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { MemoryAdapter } from '../src/adapters/memory.js';
 import { encodeRows, makeRow, parseRows } from '../src/log.js';
-import { sync, syncDryRun, syncMesh, syncUntilStable, PairingError } from '../src/sync.js';
+import { sync, syncMesh, syncUntilStable, PairingError } from '../src/sync.js';
 import { CURRENT_VERSION, decodeVFSFile, encodeVFSFile, migrateFile } from '../src/vfs-file.js';
 import { VFSNode } from '../src/vfs-node.js';
 import type { LogRow } from '../src/types.js';
@@ -86,7 +86,7 @@ describe('syncId', () => {
     const b = await peer('b');
     await put(a, 'x.txt', 'x');
 
-    await syncDryRun(a.node, b.node);
+    await sync(a.node, b.node, { dryRun: true });
 
     expect((await a.node.file()).syncId).toBeNull();
     expect((await b.node.file()).syncId).toBeNull();
@@ -185,7 +185,7 @@ describe('the pairing guard', () => {
     const groupB = (await b.node.file()).syncId;
 
     // Ask first, do not rescue afterwards.
-    await expect(syncDryRun(b.node, c.node)).rejects.toThrow(PairingError);
+    await expect(sync(b.node, c.node, { dryRun: true })).rejects.toThrow(PairingError);
     expect((await b.node.file()).syncId).toBe(groupB);
     expect(files(b)).not.toHaveProperty('y.txt');
   });

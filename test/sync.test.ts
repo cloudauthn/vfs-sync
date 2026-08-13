@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { sync, syncDryRun, syncUntilStable } from '../src/sync.js';
-import { entryAt, files, get, peer, put } from './helpers.js';
+import { sync, syncUntilStable } from '../src/sync.js';
+import { entryAt, files, get, peer, put, settle, stabilise } from './helpers.js';
 
 describe('sync', () => {
   it('copies files both ways on a first encounter', async () => {
@@ -109,6 +109,12 @@ describe('sync', () => {
 
     expect(result.conflicts).toHaveLength(1);
     expect(result.conflicts[0]?.winner).toBe('b');
+    // Reported, and nothing written: the copy below exists because the user
+    // answered "keep both", not because the engine decided for them.
+    expect(result.applied).toBe(false);
+    expect(files(a)).toEqual({ 'notes.bin': 'from A' });
+
+    await settle(a.node, b.node);
     expect(await get(a, 'notes.bin')).toBe('from B');
 
     const copies = Object.entries(files(a)).filter(([path]) => path.includes('conflict'));
@@ -205,7 +211,7 @@ describe('sync', () => {
     const b = await peer('device-b');
     await put(a, 'notes.md', 'hello from A');
 
-    const dry = await syncDryRun(a.node, b.node);
+    const dry = await sync(a.node, b.node, { dryRun: true });
 
     expect(dry.changed).toBe(true);
     expect(dry.actions.toA).toEqual([]);
@@ -225,7 +231,7 @@ describe('sync', () => {
     await put(a, 'from-a.md', 'A');
     await put(b, 'from-b.md', 'B');
 
-    const dry = await syncDryRun(a.node, b.node);
+    const dry = await sync(a.node, b.node, { dryRun: true });
     const applied = await sync(a.node, b.node);
 
     expect(dry.transferred).toEqual(applied.transferred);
@@ -360,14 +366,14 @@ describe('chains', () => {
     ];
 
     await put(a, 'notes.bin', 'base');
-    await syncUntilStable(edges);
+    await stabilise(edges);
 
     await put(a, 'notes.bin', 'edited on A');
     await a.node.commit();
     await put(c, 'notes.bin', 'edited on C');
     await c.node.commit();
 
-    await syncUntilStable(edges);
+    await stabilise(edges);
 
     expect(await get(a, 'notes.bin')).toBe('edited on C');
     expect(files(a)).toEqual(files(b));
@@ -391,14 +397,15 @@ describe('chains', () => {
     ];
 
     await put(a, 'notes.bin', 'base');
-    await syncUntilStable(edges);
+    await stabilise(edges);
     await put(a, 'notes.bin', 'from A');
     await a.node.commit();
     await put(c, 'notes.bin', 'from C');
-    await syncUntilStable(edges);
+    await stabilise(edges);
 
-    const again = await syncUntilStable(edges, { maxRounds: 3 });
-    expect(again.flat().flatMap((item) => item.result?.conflicts ?? [])).toHaveLength(0);
+    // Settled once, and the mesh stays quiet: no pass raises it again.
+    await stabilise(edges, { rounds: 3 });
+    for (const edge of edges) expect((await sync(edge.a, edge.b)).conflicts).toHaveLength(0);
   });
 
   it('follows a rename chain a lagging peer never saw', async () => {

@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
-import { sync, syncUntilStable } from '../src/sync.js';
+import { sync } from '../src/sync.js';
 import { VFSNode } from '../src/vfs-node.js';
-import { files, get, peer, put, tick } from './helpers.js';
+import { files, get, peer, put, settle, stabilise, tick } from './helpers.js';
 import type { Peer } from './helpers.js';
 
 /**
@@ -21,7 +21,9 @@ async function diverged() {
   await put(a, 'notes.bin', 'from A');
   await a.node.commit();
   await put(b, 'notes.bin', 'from B');
-  await sync(a.node, b.node);
+  // Nothing is written while a decision is outstanding, so the parked copy this
+  // suite is about only exists because someone asked to keep both versions.
+  await settle(a.node, b.node);
   return { a, b };
 }
 
@@ -81,7 +83,7 @@ describe('pending conflicts', () => {
     const [pending] = await a.node.conflicts();
 
     await a.node.resolve(pending?.uuid as string, new TextEncoder().encode('merged by hand'));
-    await syncUntilStable([{ a: a.node, b: b.node }]);
+    await stabilise([{ a: a.node, b: b.node }]);
 
     expect(await get(a, 'notes.bin')).toBe('merged by hand');
     expect(files(b)).toEqual(files(a));
@@ -128,20 +130,21 @@ describe('text conflicts', () => {
     ];
 
     await put(a, 'gamelist.xml', '<one/>\n<two/>\n<three/>\n');
-    await syncUntilStable(edges);
+    await stabilise(edges);
 
     await put(a, 'gamelist.xml', '<ONE/>\n<two/>\n<three/>\n');
     await a.node.commit();
     await put(c, 'gamelist.xml', '<one/>\n<two/>\n<THREE/>\n');
     await c.node.commit();
-    await syncUntilStable(edges);
+    await stabilise(edges);
 
     const merged = (await a.node.live()).find((entry) => entry.path === 'gamelist.xml');
     expect(merged?.prev2).toBeTypeOf('string');
     expect(files(a)).toEqual(files(c));
 
-    const again = await syncUntilStable(edges, { maxRounds: 3 });
-    expect(again.flat().flatMap((item) => item.result?.conflicts ?? [])).toHaveLength(0);
+    // Another pass raises nothing: the two parents are what stop it.
+    await stabilise(edges, { rounds: 3 });
+    for (const edge of edges) expect((await sync(edge.a, edge.b)).conflicts).toHaveLength(0);
   });
 
   it('fall back to a copy when the edits collide', async () => {
@@ -157,6 +160,11 @@ describe('text conflicts', () => {
 
     expect(result.merged).toBe(0);
     expect(result.conflicts).toHaveLength(1);
+    // The merge could not settle it, so it is the user's to answer.
+    expect(result.pending).toHaveLength(1);
+    expect(result.applied).toBe(false);
+
+    await settle(a.node, b.node);
     const [pending] = await a.node.conflicts();
     expect(pending?.reason).toBe('binary');
     // Whatever happens, no merge markers reach a working file.
@@ -198,6 +206,9 @@ describe('text conflicts', () => {
 
     const result = await sync(a.node, b.node, { resolveText: async () => null });
     expect(result.merged).toBe(0);
+    expect(result.pending).toHaveLength(1);
+
+    await settle(a.node, b.node);
     expect(await a.node.conflicts()).toHaveLength(1);
   });
 
@@ -255,6 +266,8 @@ describe('text selection by path', () => {
 
     expect(result.merged).toBe(0);
     expect(result.conflicts[0]?.text).toBeUndefined();
+
+    await settle(a.node, b.node);
     expect(await a.node.conflicts()).toHaveLength(1);
   });
 
@@ -419,7 +432,7 @@ describe('conflict copies that are too big to travel', () => {
     await put(a, 'game.bin', 'a re-dump from A');
     await a.node.commit();
     await put(b, 'game.bin', 'a re-dump from B');
-    await sync(a.node, b.node, { heldAt: 8 });
+    await settle(a.node, b.node, 'both', { heldAt: 8 });
 
     const [pending] = await b.node.conflicts();
     expect(pending?.held).toBe('device-a');

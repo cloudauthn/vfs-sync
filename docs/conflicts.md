@@ -276,14 +276,73 @@ await sync(a, b, { conflictCopies: 'always' });
 
 ---
 
+## Deciding, before anything is written
+
+**A pass writes nothing while a conflict is waiting for a person.** Not the disputed file, and not
+the nine hundred files travelling alongside it that have nothing to do with the dispute. The plan is
+complete before the first byte, so stopping costs two scans and leaves both folders exactly as they
+were.
+
+```ts
+const result = await sync(laptop, phone);
+
+if (result.pending.length > 0) {
+  // Nothing was written. This is the list the UI shows.
+  const decisions = await askTheUser(result.pending);
+  await sync(laptop, phone, { decisions });
+}
+```
+
+A decision names a conflict and a side:
+
+```ts
+type SyncDecision = {
+  uuid: string;
+  choice: 'a' | 'b' | 'both' | Uint8Array;
+  a?: Hash | null;   // the two versions it was made about
+  b?: Hash | null;
+};
+```
+
+- **`'a'` / `'b'`** — a side of *this pass*, not an owner. `sync(a, b)` belongs to neither peer, so
+  "mine" and "theirs" would only mean something from one end of it.
+- **`'both'`** — keep the winner where it is and park the loser beside it. This is the answer for
+  "these are two different files" and equally for "not now": what it leaves behind is a
+  [pending conflict](#pending-conflicts) to resolve later.
+- **bytes** — content the caller composed, from a three-column view or anywhere else.
+
+Passing `a` and `b` is worth the two lines: a decision that names a dispute which **moved on** while
+the user was looking at it is ignored and reported again, rather than being applied to a version they
+never saw.
+
+An incomplete decision list is ordinary — the user answers two of five and gets on with their day.
+What is left keeps the pass from writing and comes back in `pending`.
+
+### What counts as needing a person
+
+`conflicts` is everything that diverged. `pending` is the subset nobody but a person can settle:
+
+| | In `pending`? |
+| --- | --- |
+| a text conflict the three-way merge settled | no — it is resolved; the report survives so you can see it happened |
+| `location`, the same file renamed differently on each side | no — one path wins deterministically and no content is at risk |
+| `content`, two different versions | **yes** |
+| `delete-edit`, one deleted and one edited | **yes** |
+| `kind`, a file against a directory | **yes** |
+
+### The consequence, stated plainly
+
+An edge with nobody on it does not get past a conflict. A phone syncing at 4am reports the same
+pending decision every night, and the unrelated files wait with it, until something answers. That is
+the deliberate trade: the folder a person is looking at never changes under them without an answer.
+
+---
+
 ## Pending conflicts
 
-Sync runs in the background, in chains, and often with no UI in front of it. If an entry waited for
-an answer the whole edge would stop, and with it everything that peer relays. So the two things are
-separated: **the bytes converge always**, and what stays pending is the **decision**.
-
-That pending state is not a new record — **it is the conflict copy**, which is already a real entry
-with a real path and converges through the mesh on its own. Three fields formalise it:
+A conflict answered with `'both'` leaves a durable record. That record is not a new kind of thing —
+**it is the conflict copy**, a real entry with a real path that converges through the mesh on its
+own. Three fields formalise it:
 
 ```jsonc
 {
@@ -324,6 +383,11 @@ await node.resolve(item.uuid, bytes);     // or write something else entirely
 
 So a resolution propagates like any write, and two people resolving on different peers at once is an
 ordinary write conflict decided by the ordinary rules. There is no state machine.
+
+`node.resolve()` is the *after the fact* path, for a copy that already exists on disk — deciding
+before anything is written is [`decisions`](#deciding-before-anything-is-written), and it is the one
+to reach for first: nothing is parked, nothing is named `(conflict …)`, and the user never sees a
+file appear that they did not ask for.
 
 An interactive path exists for the moment the merge happens, too:
 

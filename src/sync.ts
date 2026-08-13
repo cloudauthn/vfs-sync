@@ -26,7 +26,38 @@ export interface TextConflictInfo {
   peerB: string;
 }
 
+/**
+ * How a reported conflict is settled, handed back into the next `sync()`.
+ *
+ * `'a'`/`'b'` name a **side of this pass**, not an owner — `sync(a, b)` belongs
+ * to neither peer, so `'mine'`/`'theirs'` would only mean something from one of
+ * the two ends. `'both'` keeps the winner in place and parks the loser beside
+ * it, which is the answer for "not now" as much as for "these are two different
+ * files". Bytes settle it outright with content the caller composed.
+ */
+export interface SyncDecision {
+  uuid: string;
+  choice: 'a' | 'b' | 'both' | Uint8Array;
+  /**
+   * The two versions this decision was made about, as the report gave them.
+   *
+   * Optional, and worth passing: a decision that names a dispute which has moved
+   * on since the user looked at it is **ignored**, and the conflict is reported
+   * again rather than settled on their behalf with something they never saw.
+   */
+  a?: Hash | null;
+  b?: Hash | null;
+}
+
 export interface SyncOptions {
+  /**
+   * Settles conflicts a previous pass reported in {@link SyncResult.pending}.
+   *
+   * A decision that names no live conflict is ignored, so a stale list costs
+   * nothing, and a partial one is ordinary: whatever is left undecided keeps the
+   * pass from writing, and comes back in `pending`.
+   */
+  decisions?: SyncDecision[];
   conflictCopies?: ConflictCopyPolicy;
   conflictName?: (info: ConflictNameInfo) => string;
   now?: () => number;
@@ -48,10 +79,18 @@ export interface SyncOptions {
    */
   resolveText?: (info: TextConflictInfo) => Promise<string | null>;
   /**
+   * Plans the pass and reports it without writing anything to either folder.
+   *
+   * The same code path as a real sync up to the point where it would start
+   * writing — one implementation, so a preview cannot describe a sync that would
+   * not happen.
+   */
+  dryRun?: boolean;
+  /**
    * Called after planning and before any cross-peer writes. Return `false` to
    * abort this sync pass.
    */
-  approveMerge?: (preview: SyncDryRunResult) => Promise<boolean> | boolean;
+  approveMerge?: (preview: SyncResult) => Promise<boolean> | boolean;
   /**
    * Authorises merging two folders the pairing guard stopped, by naming one of
    * the two `syncId`s the {@link PairingError} reported.
@@ -65,24 +104,47 @@ export interface SyncOptions {
   adopt?: { syncId: string };
 }
 
+/**
+ * What a pass did, or — with `dryRun` — what it would have done.
+ *
+ * One type for both, because they are one computation: everything here is
+ * decided before the first byte is written, and a dry run is that same
+ * computation stopped at the seam.
+ */
 export interface SyncResult {
+  /** False when nothing was written: a dry run, or an approval that said no. */
+  applied: boolean;
   /** False when both folders were already identical. */
   changed: boolean;
   /** False when an approval hook vetoed the merge before writes. */
   approved?: boolean;
+  /** Whether the `text` config converged in this pass. */
+  configChanged: boolean;
   conflicts: ConflictReport[];
-  /** Content copies performed in each direction. */
+  /**
+   * The subset of `conflicts` a person has to settle: everything that did not
+   * settle itself, minus the ones where nothing is at risk.
+   *
+   * This is the list a UI shows, and — until it is empty or answered with
+   * `decisions` — the reason a pass writes nothing at all.
+   */
+  pending: ConflictReport[];
+  /** Content copies, performed or predicted, in each direction. */
   transferred: { toA: number; toB: number };
   /** Text conflicts settled by a three-way merge instead of a copy. */
   merged: number;
+  /** Paths settled by the text auto-merge. */
+  mergedPaths: string[];
+  /** File-system actions, performed or predicted, per peer. */
+  actions: { toA: SyncAction[]; toB: SyncAction[] };
   /** The digest both peers end on, or `null` when the pair is empty. */
   state: Hash | null;
 }
 
-export type SyncDryRunActionType = 'write' | 'delete' | 'rename' | 'mkdir';
+export type SyncActionType = 'write' | 'delete' | 'rename' | 'mkdir';
 
-export interface SyncDryRunAction {
-  type: SyncDryRunActionType;
+export interface SyncAction {
+  type: SyncActionType;
   uuid: string;
   kind: EntryKind;
   path: string;
@@ -92,22 +154,37 @@ export interface SyncDryRunAction {
   to?: string;
 }
 
-export interface SyncDryRunResult {
-  /** False when the final `sync()` call would be a no-op. */
-  changed: boolean;
-  /** Whether `sync()` would first converge the `text` config. */
+/**
+ * Everything a pass decided before it was allowed to write anything.
+ *
+ * This is the seam. `sync()` builds one of these and then either reports it
+ * (`dryRun`) or carries it out — so the two can never describe different syncs,
+ * which is what two implementations of this computation could not promise.
+ */
+interface SyncPlan {
+  /** Both sides already agree: there is nothing to merge, transfer or write. */
+  quiet: boolean;
+  fileA: VFSFile;
+  fileB: VFSFile;
+  syncId: string;
+  at: number;
   configChanged: boolean;
   conflicts: ConflictReport[];
-  /** Predicted content copies performed in each direction. */
+  pending: ConflictReport[];
+  /** The entry list both peers adopt. */
+  target: VFSEntry[];
+  /** Content minted during planning (auto-merged text), by hash. */
+  overlay: Map<Hash, Uint8Array>;
+  /** Log rows for the versions planning itself minted. */
+  extra: Array<Omit<LogRow, 'op'>>;
+  rowsA: LogRow[];
+  rowsB: LogRow[];
+  actions: { toA: SyncAction[]; toB: SyncAction[] };
   transferred: { toA: number; toB: number };
-  /** Text conflicts that would settle via three-way merge. */
   merged: number;
-  /** Paths that would be settled by text auto-merge. */
   mergedPaths: string[];
-  /** Predicted file-system actions `sync()` would perform. */
-  actions: { toA: SyncDryRunAction[]; toB: SyncDryRunAction[] };
-  /** The digest both peers would end on after `sync()`. */
   state: Hash | null;
+  changed: boolean;
 }
 
 /**
@@ -121,57 +198,169 @@ export interface SyncDryRunResult {
  * C, and both sides decide conflicts from the same information.
  */
 export async function sync(a: VFSNode, b: VFSNode, options: SyncOptions = {}): Promise<SyncResult> {
-  const now = options.now ?? (() => Date.now());
-  const nothing: SyncResult['transferred'] = { toA: 0, toB: 0 };
+  const dry = options.dryRun === true;
 
-  // The mirror is only as good as its last reconciliation, and a scan is
-  // obligatory here anyway: it is what turns disk state into entries.
-  await a.commit();
-  await b.commit();
   if (a === b) {
-    return { changed: false, conflicts: [], transferred: nothing, merged: 0, state: await a.state() };
+    // A node against itself still reconciles its own disk — that is what a sync
+    // does first — and there is nothing else to decide.
+    if (!dry) await a.commit();
+    return {
+      applied: !dry,
+      changed: false,
+      configChanged: false,
+      conflicts: [],
+      pending: [],
+      transferred: { toA: 0, toB: 0 },
+      merged: 0,
+      mergedPaths: [],
+      actions: { toA: [], toB: [] },
+      state: await a.state(),
+    };
   }
 
+  const plan = await planSync(a, b, options, dry);
+  const preview = report(plan, plan.transferred, false);
+  if (dry) return preview;
+
+  // Nothing is written while a conflict is waiting for a person. The whole plan
+  // is known by now — including the 900 files that have nothing to do with the
+  // dispute — and none of it lands, so the folder the user is looking at does
+  // not change under them while they decide.
+  if (plan.pending.length > 0) return preview;
+
+  const approve = options.approveMerge;
+  if (!plan.quiet && approve && !(await approve(preview))) {
+    return { ...preview, changed: false, approved: false, transferred: { toA: 0, toB: 0 }, state: null };
+  }
+
+  return applyPlan(a, b, plan);
+}
+
+/**
+ * Whether this conflict is one a person has to settle.
+ *
+ * Two kinds are excluded, and neither is a shortcut:
+ *
+ * - **settled** — the three-way merge (or a `resolveText` hook) already produced
+ *   content both sides adopt. The report survives so the caller can see it
+ *   happened, not because anything is outstanding.
+ * - **`location`** — the same file renamed differently on each side. One path
+ *   wins, deterministically, and no content is at risk: nobody has to choose
+ *   between two versions, because there is only one.
+ *
+ * What is left is `content`, `delete-edit` and `kind`: two versions, and no way
+ * for the engine to know which one a person meant to keep.
+ */
+function needsDeciding(report: ConflictReport): boolean {
+  return !report.settled && report.kind !== 'location';
+}
+
+/** A plan turned into the shape callers see. */
+function report(plan: SyncPlan, transferred: SyncResult['transferred'], applied: boolean): SyncResult {
+  return {
+    applied,
+    changed: plan.changed,
+    configChanged: plan.configChanged,
+    conflicts: plan.conflicts,
+    pending: plan.pending,
+    transferred,
+    merged: plan.merged,
+    mergedPaths: plan.mergedPaths,
+    actions: plan.actions,
+    state: plan.state,
+  };
+}
+
+/**
+ * Everything a pass can decide without writing: what the two folders hold, which
+ * of them may merge at all, the tree they will agree on, and the exact actions
+ * that would follow.
+ *
+ * `dry` changes one thing only — whether the scan is persisted — and that
+ * asymmetry is the reason it exists as a parameter instead of a second function:
+ * a preview computed by different code than the sync it previews is a preview of
+ * nothing in particular.
+ */
+async function planSync(
+  a: VFSNode,
+  b: VFSNode,
+  options: SyncOptions,
+  dry: boolean,
+): Promise<SyncPlan> {
+  const now = options.now ?? (() => Date.now());
+
+  // Disk has to become entries either way. A pass that is going to write
+  // persists that — which is all `commit()` is — and a dry run must not, so it
+  // scans and carries the rows a commit *would* have appended into the history
+  // below, where they answer the same questions.
+  const scanned = dry ? await Promise.all([a.scan(), b.scan()]) : null;
+  if (!scanned) {
+    await a.commit();
+    await b.commit();
+  }
   const fileA = await a.file();
   const fileB = await b.file();
+  const entriesA = scanned ? scanned[0].entries : fileA.entries;
+  const entriesB = scanned ? scanned[1].entries : fileB.entries;
 
   // ---- 2. may these two folders merge at all? Nothing of the merge has been
   //         written yet, which is the property that makes throwing safe here.
   const syncId = pair(fileA, fileB, options.adopt);
 
-  // ---- 3. config converges: `text` by union
+  // ---- 3. config converges: `text` by union. Computed always; written onto the
+  //         two files only by a pass that is going to write anything at all.
   const config = convergeConfig(fileA, fileB);
-  const configChanged = config.changed;
-  applyConfig(fileA, fileB, config);
+  if (!scanned) applyConfig(fileA, fileB, config);
 
-  // ---- 4. one comparison decides whether there is anything to do at all
+  // ---- 4. one comparison decides whether there is anything to do at all.
+  //         A dry run cannot use it: `state` is what the *last* write recorded,
+  //         and the scan this run just did was deliberately not written.
   const at = now();
   if (
+    !scanned &&
     fileA.state === fileB.state &&
     fileA.log.digest === fileB.log.digest &&
     !refillable(a, fileA, fileB) &&
     !refillable(b, fileB, fileA)
   ) {
-    await close(a, b, fileA, fileB, [], [], at, syncId);
     return {
-      changed: configChanged,
+      quiet: true,
+      fileA,
+      fileB,
+      syncId,
+      at,
+      configChanged: config.changed,
       conflicts: [],
-      transferred: nothing,
+      pending: [],
+      target: [],
+      overlay: new Map(),
+      extra: [],
+      rowsA: [],
+      rowsB: [],
+      actions: { toA: [], toB: [] },
+      transferred: { toA: 0, toB: 0 },
       merged: 0,
+      mergedPaths: [],
       state: fileA.state,
+      changed: config.changed,
     };
   }
 
   // ---- 5/6. entries, and the log only where the entries cannot answer alone
-  const sources: Array<Iterable<LogRow> | Iterable<VFSEntry>> = [fileA.entries, fileB.entries];
+  const sources: Array<Iterable<LogRow> | Iterable<VFSEntry>> = [entriesA, entriesB];
   let rowsA: LogRow[] = [];
   let rowsB: LogRow[] = [];
   // Each side's *own* knowledge, which is what the path fallback turns on: the
   // shared history below is the union of both and would vouch for everything.
-  const ownA = History.from([fileA.entries]);
-  const ownB = History.from([fileB.entries]);
+  const ownA = History.from([entriesA]);
+  const ownB = History.from([entriesB]);
+  if (scanned) {
+    ownA.add(scanned[0].rows);
+    ownB.add(scanned[1].rows);
+    sources.push(scanned[0].rows, scanned[1].rows);
+  }
 
-  if (needsLog(fileA.entries, fileB.entries)) {
+  if (needsLog(entriesA, entriesB)) {
     rowsA = await a.store.logRows();
     rowsB = await readPeerLog(b, fileA.peers[b.peerId]);
     const snapA = await a.store.readSnapshot(fileA);
@@ -182,8 +371,8 @@ export async function sync(a: VFSNode, b: VFSNode, options: SyncOptions = {}): P
   }
   const history = History.from(sources);
 
-  const sides = { peerId: a.peerId, entries: fileA.entries, knows: (uuid: string) => ownA.knows(uuid) };
-  const other = { peerId: b.peerId, entries: fileB.entries, knows: (uuid: string) => ownB.knows(uuid) };
+  const sides = { peerId: a.peerId, entries: entriesA, knows: (uuid: string) => ownA.knows(uuid) };
+  const other = { peerId: b.peerId, entries: entriesB, knows: (uuid: string) => ownB.knows(uuid) };
 
   // ---- merge
   const mergeOptions: MergeOptions = {
@@ -225,52 +414,70 @@ export async function sync(a: VFSNode, b: VFSNode, options: SyncOptions = {}): P
     enabled: options.autoMerge !== false,
     ...(options.resolveText ? { resolveText: options.resolveText } : {}),
   });
-  const mergedCount = merged.count;
-  const mergedPaths = merged.paths;
+
+  // ---- decisions: what a person settled, after the engine settled what it could
+  const decided = await applyDecisions(a, merge, options.decisions ?? [], {
+    overlay,
+    rows: extra,
+    batch,
+    at,
+  });
 
   const target = merge.entries;
+  const planA = planChanges(entriesA, target, a);
+  const planB = planChanges(entriesB, target, b);
 
-  const planA = planChanges(fileA.entries, target, a);
-  const planB = planChanges(fileB.entries, target, b);
   const overlayHashes = new Set(overlay.keys());
-  const remoteFromB = new Set(fileHashes(fileB.entries, b));
-  const remoteForB = new Set([...fileHashes(target, a), ...fileHashes(fileA.entries, a)]);
-  const previewTransferred = {
-    toA: countTransfers(planA.writes, planA.localHashes, overlayHashes, remoteFromB),
-    toB: countTransfers(planB.writes, planB.localHashes, overlayHashes, remoteForB),
-  };
-  const previewState = await stateDigest(target);
+  const remoteFromB = new Set(fileHashes(entriesB, b));
+  const remoteForB = new Set([...fileHashes(target, a), ...fileHashes(entriesA, a)]);
 
-  const approve = options.approveMerge;
-  if (approve) {
-    const approved = await approve({
-      changed:
-        configChanged ||
-        merge.conflicts.length > 0 ||
-        mergedCount > 0 ||
-        planA.actions.length > 0 ||
-        planB.actions.length > 0,
-      configChanged,
-      conflicts: merge.conflicts,
-      transferred: previewTransferred,
-      merged: mergedCount,
-      mergedPaths,
-      actions: { toA: planA.actions, toB: planB.actions },
-      state: previewState,
-    });
-    if (!approved) {
-      return {
-        changed: false,
-        approved: false,
-        conflicts: merge.conflicts,
-        transferred: { toA: 0, toB: 0 },
-        merged: mergedCount,
-        state: null,
-      };
-    }
+  return {
+    quiet: false,
+    fileA,
+    fileB,
+    syncId,
+    at,
+    configChanged: config.changed,
+    conflicts: merge.conflicts,
+    pending: merge.conflicts.filter((report) => needsDeciding(report) && !decided.has(report.uuid)),
+    target,
+    overlay,
+    extra,
+    rowsA,
+    rowsB,
+    actions: { toA: planA.actions, toB: planB.actions },
+    transferred: {
+      toA: countTransfers(planA.writes, planA.localHashes, overlayHashes, remoteFromB),
+      toB: countTransfers(planB.writes, planB.localHashes, overlayHashes, remoteForB),
+    },
+    merged: merged.count,
+    mergedPaths: merged.paths,
+    state: await stateDigest(target),
+    changed:
+      config.changed ||
+      merge.conflicts.length > 0 ||
+      merged.count > 0 ||
+      planA.actions.length > 0 ||
+      planB.actions.length > 0,
+  };
+}
+
+/**
+ * Carries out a plan: content first, then the logs, then the two headers.
+ *
+ * The order is not a preference. Content is on disk before anything claims it
+ * is, and the headers land last because they are what makes the rest official —
+ * an interruption anywhere leaves a state the next pass can still reconcile.
+ */
+async function applyPlan(a: VFSNode, b: VFSNode, plan: SyncPlan): Promise<SyncResult> {
+  const { fileA, fileB, target, overlay } = plan;
+
+  if (plan.quiet) {
+    await close(a, b, fileA, fileB, [], [], plan.at, plan.syncId);
+    return report(plan, { toA: 0, toB: 0 }, true);
   }
 
-  // ---- 6. content moves, verified on arrival
+  // ---- content moves, verified on arrival
   const transferred = { toA: 0, toB: 0 };
   const beforeB = fileB.entries;
   await a.apply(target, chain(overlay, [{ node: b, entries: beforeB }], () => transferred.toA++));
@@ -286,159 +493,29 @@ export async function sync(a: VFSNode, b: VFSNode, options: SyncOptions = {}): P
     ),
   );
 
-  // ---- 7. close: content is on disk, then the logs, then the two headers
-  const rowsForA = [...(await Promise.all(extra.map(makeRow)))];
+  // ---- close: content is on disk, then the logs, then the two headers
+  const rowsForA = [...(await Promise.all(plan.extra.map(makeRow)))];
   const rowsForB = [...rowsForA];
-  if (rowsA.length > 0 || rowsB.length > 0) {
-    rowsForA.push(...missingRows(rowsA, rowsB));
-    rowsForB.push(...missingRows(rowsB, rowsA));
+  if (plan.rowsA.length > 0 || plan.rowsB.length > 0) {
+    rowsForA.push(...missingRows(plan.rowsA, plan.rowsB));
+    rowsForB.push(...missingRows(plan.rowsB, plan.rowsA));
   }
 
   await a.adopt(target, fileA);
   await b.adopt(target, fileB);
-  await close(a, b, fileA, fileB, rowsForA, rowsForB, at, syncId);
+  await close(a, b, fileA, fileB, rowsForA, rowsForB, plan.at, plan.syncId);
 
   return {
+    // A pass that got past the quiet check had something to reconcile, whatever
+    // the plan's own prediction of `changed` says about the visible outcome.
+    ...report(plan, transferred, true),
     changed: true,
     approved: true,
-    conflicts: merge.conflicts,
-    transferred,
-    merged: mergedCount,
-    state: previewState,
-  };
-}
-
-/**
- * Computes what `sync(a, b)` would do, without writing either folder.
- *
- * It still scans both sides (like `sync` does through `commit`) so the preview
- * includes pending local edits, but it appends no log rows and performs no
- * content writes.
- */
-export async function syncDryRun(
-  a: VFSNode,
-  b: VFSNode,
-  options: SyncOptions = {},
-): Promise<SyncDryRunResult> {
-  if (a === b) {
-    return {
-      changed: false,
-      configChanged: false,
-      conflicts: [],
-      transferred: { toA: 0, toB: 0 },
-      merged: 0,
-      mergedPaths: [],
-      actions: { toA: [], toB: [] },
-      state: await a.state(),
-    };
-  }
-
-  const now = options.now ?? (() => Date.now());
-  const at = now();
-  const [scanA, scanB] = await Promise.all([a.scan(), b.scan()]);
-  const fileA = await a.file();
-  const fileB = await b.file();
-
-  // The guard runs here too, and this is the healthy order: ask first, do not
-  // rescue afterwards. Nothing has been written, so a caller can discover a
-  // `foreign-mesh` without either folder having been touched.
-  pair(fileA, fileB, options.adopt);
-
-  const entriesA = scanA.entries;
-  const entriesB = scanB.entries;
-
-  // Computed, never applied: a dry run must leave both folders untouched.
-  const { text, changed: configChanged } = convergeConfig(fileA, fileB);
-
-  const sources: Array<Iterable<LogRow> | Iterable<VFSEntry>> = [entriesA, entriesB, scanA.rows, scanB.rows];
-  let rowsA: LogRow[] = [];
-  let rowsB: LogRow[] = [];
-  const ownA = History.from([entriesA, scanA.rows]);
-  const ownB = History.from([entriesB, scanB.rows]);
-
-  if (needsLog(entriesA, entriesB)) {
-    rowsA = await a.store.logRows();
-    rowsB = await readPeerLog(b, fileA.peers[b.peerId]);
-    const snapA = await a.store.readSnapshot(fileA);
-    const snapB = await b.store.readSnapshot(fileB);
-    ownA.add(rowsA).add(snapA);
-    ownB.add(rowsB).add(snapB);
-    sources.push(rowsA, rowsB, snapA, snapB);
-  }
-  const history = History.from(sources);
-
-  const sides = { peerId: a.peerId, entries: entriesA, knows: (uuid: string) => ownA.knows(uuid) };
-  const other = { peerId: b.peerId, entries: entriesB, knows: (uuid: string) => ownB.knows(uuid) };
-
-  const mergeOptions: MergeOptions = {
-    history,
-    heldAt: options.heldAt ?? HELD_AT,
-    text: textPredicate(a, b, text),
-    ...(options.conflictCopies !== undefined ? { conflictCopies: options.conflictCopies } : {}),
-    ...(options.conflictName ? { conflictName: options.conflictName } : {}),
-  };
-  let merge = mergeEntries(sides, other, mergeOptions);
-
-  if (options.archives !== false) {
-    const oldest = coldest(merge.conflicts);
-    if (oldest !== null) {
-      const rows = [
-        ...(await readArchives(a, fileA, oldest)),
-        ...(await readArchives(b, fileB, oldest)),
-      ];
-      if (rows.length > 0) {
-        history.add(rows);
-        merge = mergeEntries(sides, other, mergeOptions);
-      }
-    }
-  }
-
-  const overlay = new Map<Hash, Uint8Array>();
-  const merged = await autoMergeText(a, b, merge, history, {
-    overlay,
-    rows: [],
-    batch: randomId(),
-    at,
-    enabled: options.autoMerge !== false,
-    ...(options.resolveText ? { resolveText: options.resolveText } : {}),
-  });
-  const mergedCount = merged.count;
-  const mergedPaths = merged.paths;
-
-  const target = merge.entries;
-  const planA = planChanges(entriesA, target, a);
-  const planB = planChanges(entriesB, target, b);
-
-  const overlayHashes = new Set(overlay.keys());
-  const remoteFromB = new Set(fileHashes(entriesB, b));
-  const remoteForB = new Set([...fileHashes(target, a), ...fileHashes(entriesA, a)]);
-
-  const transferred = {
-    toA: countTransfers(planA.writes, planA.localHashes, overlayHashes, remoteFromB),
-    toB: countTransfers(planB.writes, planB.localHashes, overlayHashes, remoteForB),
-  };
-
-  const changed =
-    configChanged ||
-    merge.conflicts.length > 0 ||
-    mergedCount > 0 ||
-    planA.actions.length > 0 ||
-    planB.actions.length > 0;
-
-  return {
-    changed,
-    configChanged,
-    conflicts: merge.conflicts,
-    transferred,
-    merged: mergedCount,
-    mergedPaths,
-    actions: { toA: planA.actions, toB: planB.actions },
-    state: await stateDigest(target),
   };
 }
 
 interface PlannedChanges {
-  actions: SyncDryRunAction[];
+  actions: SyncAction[];
   writes: VFSEntry[];
   localHashes: Set<Hash>;
 }
@@ -449,7 +526,7 @@ function planChanges(currentEntries: VFSEntry[], target: VFSEntry[], node: VFSNo
   const currentLive = currentEntries.filter((entry) => !entry.deleted);
   const targetByUuid = new Set(target.map((entry) => entry.uuid));
 
-  const actions: SyncDryRunAction[] = [];
+  const actions: SyncAction[] = [];
   const writes: VFSEntry[] = [];
 
   for (const entry of target) {
@@ -762,7 +839,7 @@ function countTransfers(
   return count;
 }
 
-function sortActions(actions: SyncDryRunAction[]): SyncDryRunAction[] {
+function sortActions(actions: SyncAction[]): SyncAction[] {
   return [...actions].sort(
     (x, y) =>
       (x.path < y.path ? -1 : x.path > y.path ? 1 : 0) ||
@@ -978,6 +1055,7 @@ async function autoMergeText(
       delete report.copy;
     }
     report.text = true;
+    report.settled = true;
     context.rows.push({
       batch: context.batch,
       at: entry.updated,
@@ -995,6 +1073,97 @@ async function autoMergeText(
     paths.push(report.path);
   }
   return { count, paths };
+}
+
+/**
+ * Settles the conflicts a person answered, and reports which ones those were.
+ *
+ * **A decision mints a new version.** Adopting the chosen side's entry as it
+ * stands would not survive: the loser carries the older `updated`, so the next
+ * peer to meet this mesh redoes the same arithmetic the engine did, reaches the
+ * same answer, and puts the other version back. The decision would quietly undo
+ * itself, days later, on a machine nobody was looking at.
+ *
+ * So the new version carries **two parents** — the winner's hash and the
+ * loser's — which is exactly what the automatic text merge records, and for
+ * exactly the same reason. A decision is a merge performed by a person and has
+ * to leave the same trace as one performed by `diff3`.
+ */
+async function applyDecisions(
+  a: VFSNode,
+  merge: { entries: VFSEntry[]; conflicts: ConflictReport[] },
+  decisions: SyncDecision[],
+  context: { overlay: Map<Hash, Uint8Array>; rows: Array<Omit<LogRow, 'op'>>; batch: string; at: number },
+): Promise<Set<string>> {
+  const settled = new Set<string>();
+  if (decisions.length === 0) return settled;
+  const byUuid = new Map(merge.conflicts.map((report) => [report.uuid, report]));
+
+  for (const decision of decisions) {
+    const report = byUuid.get(decision.uuid);
+    if (!report || !report.a || !report.b) continue;
+    // Made about a dispute that has moved on: report it again rather than settle
+    // it on the user's behalf with a version they never saw.
+    if (decision.a !== undefined && decision.a !== (report.a.hash ?? null)) continue;
+    if (decision.b !== undefined && decision.b !== (report.b.hash ?? null)) continue;
+
+    // "Keep both" is the outcome the engine would have reached on its own, so
+    // there is nothing to mint — the answer was that the parked copy is right.
+    if (decision.choice === 'both') {
+      settled.add(report.uuid);
+      continue;
+    }
+
+    const entry = merge.entries.find((item) => item.uuid === report.uuid);
+    if (!entry) continue;
+    const winner = report.winner === 'a' ? report.a : report.b;
+    const loser = report.winner === 'a' ? report.b : report.a;
+    const at = Math.max(context.at, report.a.updated, report.b.updated) + 1;
+
+    let chosen: VFSEntry;
+    if (decision.choice instanceof Uint8Array) {
+      const data = decision.choice;
+      const hash = await sha256(data);
+      context.overlay.set(hash, data);
+      chosen = { ...winner, hash, size: data.byteLength, path: entry.path };
+      delete chosen.deleted;
+    } else {
+      chosen = decision.choice === 'a' ? report.a : report.b;
+    }
+
+    entry.kind = chosen.kind;
+    entry.hash = chosen.hash;
+    entry.size = chosen.size;
+    entry.updated = at;
+    entry.peerId = a.peerId;
+    entry.prev = winner.hash;
+    if (loser.hash) entry.prev2 = loser.hash;
+    if (chosen.deleted) entry.deleted = true;
+    else delete entry.deleted;
+
+    // The copy existed only to hold the pending decision. It has been made.
+    if (report.copy) {
+      const at = merge.entries.indexOf(report.copy);
+      if (at >= 0) merge.entries.splice(at, 1);
+      delete report.copy;
+    }
+
+    context.rows.push({
+      batch: context.batch,
+      at: entry.updated,
+      peerId: a.peerId,
+      uuid: entry.uuid,
+      type: entry.deleted ? 'delete' : 'write',
+      kind: entry.kind,
+      path: entry.path,
+      hash: entry.hash,
+      size: entry.size,
+      prev: winner.hash ?? null,
+      ...(loser.hash ? { prev2: loser.hash } : {}),
+    });
+    settled.add(report.uuid);
+  }
+  return settled;
 }
 
 async function readAt(node: VFSNode, path: string): Promise<Uint8Array | null> {

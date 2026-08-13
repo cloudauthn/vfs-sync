@@ -5,7 +5,7 @@ import { sync } from '../src/sync.js';
 import { VFSNode } from '../src/vfs-node.js';
 import type { VFSEntry } from '../src/types.js';
 import type { Peer } from './helpers.js';
-import { encoder, files, peer, put, tick } from './helpers.js';
+import { encoder, files, peer, put, settle, tick } from './helpers.js';
 
 /**
  * Phase 2: selective materialisation.
@@ -176,7 +176,7 @@ describe('selective materialisation', () => {
     await put(a, 'game.bin', 'a re-dump from A');
     await a.node.commit();
     await put(b, 'game.bin', 'a re-dump from B');
-    await sync(a.node, b.node);
+    await settle(a.node, b.node);
 
     // The copy is an ordinary entry — not `held`, nobody kept it back. B simply
     // declined the bytes. Removing a file that is not there proves nothing, so

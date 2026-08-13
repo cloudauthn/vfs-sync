@@ -32,7 +32,7 @@ import type {
   MeshEdge,
   PeerMark,
   PendingConflict,
-  SyncDryRunResult,
+  SyncResult,
   VFSEntry,
   VFSAdapter,
   VFSListEntry,
@@ -1714,7 +1714,7 @@ export class ExplorerModel {
     if (!a || !b || this.syncing) return;
 
     const approveMerge = confirmMerge
-      ? async (preview: SyncDryRunResult) => {
+      ? async (preview: SyncResult) => {
           if (!preview.changed) return true;
 
           const changes = uniqueSorted([

@@ -34,25 +34,28 @@ const phone = await VFSNode.open(await OPFSAdapter.open({ path: 'backup' }));
 await laptop.write('notes.md', new TextEncoder().encode('# Notes'));
 
 const result = await sync(laptop, phone);
-// { changed: true, conflicts: [], transferred: { toA: 0, toB: 1 }, merged: 0, state: '4a28fc…' }
+// { applied: true, changed: true, pending: [], transferred: { toA: 0, toB: 1 }, state: '4a28fc…' }
 ```
 
-Ask for confirmation inside `sync`:
+**A sync writes nothing while a conflict is waiting for a person** — not the disputed file, and not
+the files travelling alongside it. It reports, you decide, you sync again:
 
 ```ts
-import { sync } from '@cloudauthn/vfs-sync';
+const result = await sync(laptop, phone);
 
-const result = await sync(laptop, phone, {
-  async approveMerge(preview) {
-    // preview.actions.toA / preview.actions.toB
-    // preview.conflicts
-    return userConfirmed(preview);
-  },
-});
-
-if (!result.approved) {
-  console.log('sync cancelled by user');
+if (result.pending.length > 0) {
+  // Nothing was written. Both folders are exactly as they were.
+  const decisions = await askTheUser(result.pending);   // 'a' | 'b' | 'both' | bytes
+  await sync(laptop, phone, { decisions });
 }
+```
+
+To see the whole plan without touching either folder — same code path, stopped before the first
+write:
+
+```ts
+const preview = await sync(laptop, phone, { dryRun: true });
+// preview.actions.toA / preview.actions.toB / preview.pending / preview.transferred
 ```
 
 Both folders now hold the same files and the same `state` digest. `sync` reconciles both sides for

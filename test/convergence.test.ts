@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { MemoryAdapter } from '../src/adapters/memory.js';
-import { syncUntilStable } from '../src/sync.js';
+import { stabilise } from './helpers.js';
 import { VFSNode, materialised } from '../src/vfs-node.js';
 import type { MeshEdge } from '../src/sync.js';
 
@@ -124,9 +124,9 @@ describe('convergence', () => {
         const operations = 1 + Math.floor(next() * 3);
         for (let i = 0; i < operations; i++) await step(peers, next, round);
         // Sometimes sync in between, sometimes let divergence pile up.
-        if (next() < 0.6) await syncUntilStable(edges, { maxRounds: 6 });
+        if (next() < 0.6) await stabilise(edges, { rounds: 6 });
       }
-      await syncUntilStable(edges, { maxRounds: 12 });
+      await stabilise(edges, { rounds: 12 });
 
       const states = await Promise.all(peers.map((peer) => peer.node.state()));
       expect(new Set(states).size, `states: ${states.join(' ')}`).toBe(1);
@@ -151,9 +151,9 @@ describe('convergence', () => {
 
       for (let round = 0; round < 14; round++) {
         for (let i = 0; i < 1 + Math.floor(next() * 3); i++) await step(peers, next, round);
-        if (next() < 0.6) await syncUntilStable(edges, { maxRounds: 6 });
+        if (next() < 0.6) await stabilise(edges, { rounds: 6 });
       }
-      await syncUntilStable(edges, { maxRounds: 12 });
+      await stabilise(edges, { rounds: 12 });
 
       const states = await Promise.all(peers.map((peer) => peer.node.state()));
       expect(new Set(states).size, `states: ${states.join(' ')}`).toBe(1);
@@ -172,10 +172,8 @@ describe('convergence', () => {
       await step(peers, next, round);
       await step(peers, next, round);
     }
-    await syncUntilStable(edges, { maxRounds: 12 });
-    await syncUntilStable([{ a: edges[0]?.b as VFSNode, b: edges[0]?.a as VFSNode }], {
-      maxRounds: 4,
-    });
+    await stabilise(edges, { rounds: 12 });
+    await stabilise([{ a: edges[0]?.b as VFSNode, b: edges[0]?.a as VFSNode }], { rounds: 4 });
 
     expect(peers[1]?.fs.snapshot()).toEqual(peers[0]?.fs.snapshot());
     expect(await peers[1]?.node.state()).toBe(await peers[0]?.node.state());

@@ -1,5 +1,7 @@
 import { MemoryAdapter } from '../src/adapters/memory.js';
 import { VFSNode } from '../src/vfs-node.js';
+import { sync } from '../src/sync.js';
+import type { SyncDecision, SyncOptions, SyncResult } from '../src/sync.js';
 import type { ByteRange, VFSAdapter, VFSEntry } from '../src/types.js';
 
 const encoder = new TextEncoder();
@@ -125,6 +127,49 @@ export async function tracked(p: Peer): Promise<Record<string, string | null>> {
 
 export async function entryAt(p: Peer, path: string): Promise<VFSEntry | undefined> {
   return (await p.node.live()).find((entry) => entry.path === path);
+}
+
+/**
+ * One sync, answering whatever it reports as needing a person.
+ *
+ * `sync()` writes nothing at all while a conflict is waiting for a decision, so
+ * any test that wants the far side of a conflict has to answer it first. This is
+ * the shape the API now has — look, decide, sync again — with `'both'` standing
+ * in for the user who keeps the two versions.
+ */
+export async function settle(
+  a: VFSNode,
+  b: VFSNode,
+  choice: SyncDecision['choice'] = 'both',
+  options: SyncOptions = {},
+): Promise<SyncResult> {
+  const first = await sync(a, b, options);
+  if (first.pending.length === 0) return first;
+  const decisions = first.pending.map((report) => ({ uuid: report.uuid, choice }));
+  return sync(a, b, { ...options, decisions });
+}
+
+/**
+ * Drives a mesh to a standstill, answering conflicts as they come up.
+ *
+ * `syncUntilStable` cannot do this on its own any more, and deliberately so: an
+ * edge with a pending decision writes nothing, so a mesh left to itself stops at
+ * the first conflict. Something has to decide, and in a test that something is
+ * `choice`.
+ */
+export async function stabilise(
+  edges: Array<{ a: VFSNode; b: VFSNode }>,
+  options: { rounds?: number; choice?: SyncDecision['choice'] } = {},
+): Promise<void> {
+  const rounds = options.rounds ?? 12;
+  for (let round = 0; round < rounds; round++) {
+    let moved = false;
+    for (const edge of edges) {
+      const result = await settle(edge.a, edge.b, options.choice ?? 'both');
+      if (result.changed && result.applied) moved = true;
+    }
+    if (!moved) break;
+  }
 }
 
 export { decoder, encoder };

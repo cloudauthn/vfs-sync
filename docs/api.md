@@ -6,7 +6,6 @@ Everything is exported from `@cloudauthn/vfs-sync`, except `NodeFsAdapter`, whic
 - [VFSNode](#vfsnode)
 - [Conflicts](#conflicts)
 - [sync](#sync)
-- [syncDryRun](#syncdryrun)
 - [syncMesh / syncUntilStable](#syncmesh--syncuntilstable)
 - [Pairing](#pairing)
 - [mergeEntries](#mergeentries)
@@ -311,13 +310,28 @@ const result = await sync(a, b, options?);
 
 Syncs one edge. Both peers end up with identical content and the same `state` digest.
 
+**A pass writes nothing while a conflict is waiting for a person.** Whatever `pending` reports has to
+be answered with `decisions` before anything lands — including the files that were not in dispute.
+See [deciding, before anything is written](./conflicts.md#deciding-before-anything-is-written).
+
+```ts
+const result = await sync(laptop, phone);
+
+if (result.pending.length > 0) {
+  const decisions = result.pending.map((report) => ({ uuid: report.uuid, choice: 'both' as const }));
+  await sync(laptop, phone, { decisions });
+}
+```
+
 | Option | Default | Meaning |
 | --- | --- | --- |
+| `decisions` | none | Settles conflicts a previous pass reported. `{ uuid, choice: 'a' \| 'b' \| 'both' \| Uint8Array }`. |
 | `conflictCopies` | `'edits'` | `'edits'`, `'always'` or `false`. See [conflicts.md](./conflicts.md#policy). |
 | `conflictName` | `defaultConflictName` | Names conflict copies. |
 | `heldAt` | 64 MB | Size from which a conflict copy stays on the peer that made it. |
 | `autoMerge` | `true` | Set `false` to skip the three-way merge of text. |
 | `resolveText` | none | Hook for interactive text resolution; return `null` for the headless path. |
+| `dryRun` | `false` | Plan and report without writing either folder. |
 | `approveMerge` | none | Hook called with a preview before writes; return `false` to abort. |
 | `now` | `Date.now` | Clock for the sync's own bookkeeping. |
 
@@ -325,11 +339,16 @@ Returns:
 
 | Field | Type | Meaning |
 | --- | --- | --- |
+| `applied` | `boolean` | `false` when nothing was written: a dry run, or a veto. |
 | `changed` | `boolean` | `false` when the two were already identical. |
 | `approved` | `boolean \| undefined` | `false` when approval vetoed the merge; `true` when approved. |
-| `conflicts` | `ConflictReport[]` | See [conflicts.md](./conflicts.md#reading-the-report). |
-| `transferred` | `{ toA: number; toB: number }` | Files copied in each direction. |
+| `configChanged` | `boolean` | `true` when the `text` config converged in this pass. |
+| `conflicts` | `ConflictReport[]` | Everything that diverged. See [conflicts.md](./conflicts.md#reading-the-report). |
+| `pending` | `ConflictReport[]` | The subset needing a person. Non-empty means **nothing was written**. |
+| `transferred` | `{ toA: number; toB: number }` | Files copied in each direction — predicted on a dry run. |
 | `merged` | `number` | Text conflicts settled by a three-way merge instead of a copy. |
+| `mergedPaths` | `string[]` | Which paths those were. |
+| `actions` | `{ toA: SyncAction[]; toB: SyncAction[] }` | Filesystem actions per peer, performed or predicted. |
 | `state` | `Hash \| null` | The digest both peers end on. |
 
 ```ts
@@ -364,52 +383,41 @@ not opening as a node.
 
 ---
 
-## syncDryRun
+### Planning without writing
 
 ```ts
-const preview = await syncDryRun(a, b, options?);
+const preview = await sync(a, b, { dryRun: true });
 ```
 
 Computes what `sync(a, b)` would do **without writing either side**. It still scans both peers, so
-pending local edits are included in the preview.
+pending local edits are included; it appends no log rows, moves no content and writes no header.
 
-Use this when the preview must be decoupled from `sync` (for example, preview now and apply later).
-
-Returns:
-
-| Field | Type | Meaning |
-| --- | --- | --- |
-| `changed` | `boolean` | `true` when a final `sync()` call would do work. |
-| `configChanged` | `boolean` | `true` when `text` convergence would happen. |
-| `conflicts` | `ConflictReport[]` | Conflicts the sync would produce. |
-| `transferred` | `{ toA: number; toB: number }` | Predicted file copies per direction. |
-| `merged` | `number` | Text conflicts that would auto-merge. |
-| `actions` | `{ toA: SyncDryRunAction[]; toB: SyncDryRunAction[] }` | Planned filesystem actions per peer. |
-| `state` | `Hash \| null` | Predicted converged state digest. |
-
-`SyncDryRunAction`:
+It is the same code path as a real sync, stopped where the first write would happen. That is the
+point: a preview computed by different code than the sync it previews is a preview of nothing in
+particular.
 
 ```ts
-type SyncDryRunActionType = 'write' | 'delete' | 'rename' | 'mkdir';
-
-interface SyncDryRunAction {
-  type: SyncDryRunActionType;
-  uuid: string;
-  kind: 'file' | 'directory';
-  path: string;
-  from?: string; // for rename
-  to?: string;   // for rename
-}
-```
-
-Typical confirm flow:
-
-```ts
-const preview = await syncDryRun(local, remote);
+const preview = await sync(local, remote, { dryRun: true });
 showPreviewToUser(preview.actions, preview.conflicts);
 
 if (userAccepted()) {
   await sync(local, remote);
+}
+```
+
+`SyncAction`:
+
+```ts
+type SyncActionType = 'write' | 'delete' | 'rename' | 'mkdir';
+
+interface SyncAction {
+  type: SyncActionType;
+  uuid: string;
+  kind: 'file' | 'directory';
+  path: string;
+  created?: boolean; // on a write that creates the file on that side
+  from?: string;     // for rename
+  to?: string;       // for rename
 }
 ```
 

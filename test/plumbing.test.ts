@@ -9,7 +9,7 @@ import { VFSNode } from '../src/vfs-node.js';
 import { sync } from '../src/sync.js';
 import { collect } from '../src/stream.js';
 import { FakeDirectoryHandle } from './fake-handle.js';
-import { decoder, encoder, peer, put } from './helpers.js';
+import { decoder, encoder, peer, put, settle } from './helpers.js';
 import type { LogRow, VFSAdapter, VFSChangeFeed } from '../src/types.js';
 
 /** The facts of one log row, minus the id `makeRow` derives from them. */
@@ -141,9 +141,14 @@ describe('cold archives', () => {
     const { a, b } = await laggingChain();
     const result = await sync(a.node, b.node, { archives: false });
 
-    // The state is the same either way; the cost is a copy nobody needed.
-    expect(decoder.decode(await b.node.read('notes.bin'))).toBe('v4');
+    // Without the cold read the ancestry cannot be proved, so what would have
+    // been a quiet propagation is a decision for the user instead.
     expect(result.conflicts).toHaveLength(1);
+    expect(result.pending).toHaveLength(1);
+
+    // The state is the same either way; the cost is a copy nobody needed.
+    await settle(a.node, b.node, 'both', { archives: false });
+    expect(decoder.decode(await b.node.read('notes.bin'))).toBe('v4');
   });
 });
 
