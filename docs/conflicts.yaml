@@ -7,7 +7,8 @@
 # ## Status
 #
 # The catalogue is complete — derived from every place the engine raises a
-# conflict, with the audit in `_completeness` at the end. The delivery is nearly:
+# conflict, with the audit in `_completeness` at the end — and so is the
+# delivery:
 #
 #   - **Level 2 is built.** `decide` is asked once per conflict; without it the
 #     pass throws `ConflictError` carrying all of them, and the same answers go
@@ -18,6 +19,12 @@
 #     thing as answering `{ action: adopt }`.
 #   - `# +` marks the one thing still missing: an answer for
 #     `version-unreconcilable` other than giving up.
+#   - `legalAnswers(reason)` is this file in code, and the engine throws
+#     `AnswerError` on anything a reason does not admit — so a catalogue that
+#     drifts from the implementation fails a test rather than a user.
+#
+# The one thing this file still describes and does not decide is `location`,
+# which is never asked. That is deliberate and explained where it is listed.
 #
 # ## One rule about the two dimensions
 #
@@ -262,11 +269,16 @@ durable_reason:
     What a parked copy records in vfs.json, read back by node.conflicts() long
     after the pass that made it. Only `keep-both` produces one.
   values: [binary, block, delete-edit, kind]
-  known_gap: >
-    'block' is declared, documented and never written: the merge only ever
-    produces binary, delete-edit and kind. A copy parked after a failed text
-    merge is labelled 'binary', which is false — it was text, it was attempted,
-    and the lines collided.
+  note: >
+    The merge labels the copy before it has read a byte, so it can only tell
+    delete-edit and kind apart and calls everything else 'binary'. The text
+    merge runs afterwards and upgrades that to 'block' when diff3 declined
+    because the lines collided — the one value the ephemeral `textReason` and
+    this durable one share. 'eol' and 'size' stay ephemeral: giving them a
+    durable value would widen a type that travels to every peer.
+  not_in_the_digest: >
+    `reason` is not a DIGEST_FIELD, so a peer that reaches the same copy without
+    attempting a merge (autoMerge: false) writes 'binary' and still converges.
 
 _completeness:
   audited: 2026-08-13, against every site that raises a conflict

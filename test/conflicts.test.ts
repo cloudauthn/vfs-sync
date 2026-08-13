@@ -163,8 +163,14 @@ describe('text conflicts', () => {
     expect(result.pending).toHaveLength(1);
 
     await settle(a.node, b.node);
+    // `block`, not `binary`. The copy is labelled by a merge that has not read a
+    // byte, so it calls every text conflict binary — and `binary` is what tells
+    // a resolver months later to offer "keep mine / keep theirs" instead of the
+    // three-way view this one deserves.
     const [pending] = await a.node.conflicts();
-    expect(pending?.reason).toBe('binary');
+    expect(pending?.reason).toBe('block');
+    // And it travelled: the copy converges, so both peers say the same thing.
+    expect((await b.node.conflicts())[0]?.reason).toBe('block');
     // Whatever happens, no merge markers reach a working file.
     for (const content of Object.values(files(a))) expect(content).not.toContain('<<<');
   });
@@ -367,6 +373,21 @@ describe('why a text merge did not happen', () => {
     const result = await sync(a.node, b.node, { dryRun: true });
 
     expect(result.conflicts[0]?.textReason).toBe('block');
+  });
+
+  /** The label still has to mean something, so binary stays binary. */
+  it('still says binary when the bytes were never mergeable', async () => {
+    const a = await peer('device-a');
+    const b = await peer('device-b');
+    await put(a, 'notes.rom', 'one\ntwo\n');
+    await sync(a.node, b.node);
+
+    await put(a, 'notes.rom', 'LEFT\ntwo\n');
+    await a.node.commit();
+    await put(b, 'notes.rom', 'RIGHT\ntwo\n');
+    await settle(a.node, b.node, { action: 'keep-both' });
+
+    expect((await a.node.conflicts())[0]?.reason).toBe('binary');
   });
 
   /** A peer holding the entry and not the bytes has nothing to merge from. */

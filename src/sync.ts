@@ -1343,6 +1343,16 @@ async function autoMergeText(
     }
     if (text === null) {
       if (refused) report.textReason = refused;
+      // The copy was labelled by a merge that had not read a byte, so anything
+      // not a delete or a kind collision was called `binary`. By here the bytes
+      // have been read and diff3 has had its turn, and `binary` would be false
+      // three ways: it was text, a merge was attempted, and the lines collided.
+      // That distinction is what a resolver reads months later to decide between
+      // offering "keep mine / keep theirs" and offering a three-way view.
+      //
+      // Only `block` crosses over. `eol` and `size` have no durable value, and
+      // giving them one would widen a type that travels to every peer.
+      if (refused === 'block' && report.copy) report.copy.reason = 'block';
       continue;
     }
 

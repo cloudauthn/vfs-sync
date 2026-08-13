@@ -414,6 +414,13 @@ for (const item of pending) {
 | `delete-edit` | One deleted, the other edited | recover / confirm the delete |
 | `kind` | A file against a directory on one path | choose who keeps the path |
 
+The merge labels a copy before it has read a byte, so it can only tell `delete-edit` and `kind` apart
+and calls everything else `binary`. The text merge runs after and upgrades that to `block` when
+`diff3` declined because the lines collided — which is why the two rows above lead to different
+offers. `eol` and `size` never become durable: they are `textReason` on the pass that saw them (see
+[Text: merged, not parked](#text-merged-not-parked)), and giving them a durable value would widen a
+type that travels to every peer.
+
 **Resolving is writing the winner and deleting the copy** — two operations the engine already knows
 how to do, in one batch:
 
