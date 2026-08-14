@@ -320,6 +320,10 @@ so and is pumped instead, and the resulting tree, hashes and digest are identica
 - **`location` is never asked.** The same file renamed differently on each side settles
   deterministically and nothing is at risk, so it stays out of `pending`. It is in the catalogue in
   case a consumer wants to opt in; nobody has.
+- **`eol` and `size` do not survive as reasons.** A text merge that declines because the two sides
+  disagree on line terminators parks the copy as `binary` — true, it could not be merged, but it
+  hides a fix that would settle every file in the folder. Widening `CopyReason` is safe whenever
+  somebody wants it: `reason` is not in the digest, so peers that do not know a value still converge.
 - **Resumable uploads to Drive** — uploads buffer whole, so streaming bounds memory, not bytes moved.
 - **Delta transfer** — a changed file still travels in full.
 - **Historical content and deduplication** — both given up with the object store, listed so the
