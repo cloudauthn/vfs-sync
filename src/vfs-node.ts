@@ -90,6 +90,16 @@ export interface ContentHandle {
   size: number;
   read(): Promise<Uint8Array>;
   stream(): Promise<ReadableStream<Uint8Array>>;
+  /**
+   * Where the bytes actually are, when the holder is willing to vouch for them.
+   *
+   * This is a claim, not a coordinate. Present means *"the file is where the
+   * tree says, and nothing has touched it since the scan recorded it"* — which
+   * is the promise a caller needs before it copies natively and skips the hash
+   * check. A holder that cannot make that promise omits it and the caller pumps
+   * the bytes, which always works and always verifies.
+   */
+  origin?: { adapter: VFSAdapter; path: string };
 }
 
 /** Where `apply()` gets content it does not already have on disk. */
@@ -132,11 +142,19 @@ export async function holds(
     const stat = await node.stat(entry.path);
     if (!stat || stat.kind !== 'file') continue;
     const path = entry.path;
-    return {
+    const handle: ContentHandle = {
       size: stat.size,
       read: () => node.read(path),
       stream: () => node.readStream(path),
     };
+    // The only place holding both the recorded entry and a fresh stat of the
+    // file, so the only place that can vouch for the bytes. `mtime` is the
+    // *source's* — the merged entry that reaches `fetchContent()` carries this
+    // node's, which is a different clock and would compare meaninglessly.
+    if (stat.size === entry.size && entry.mtime !== undefined && stat.mtime === entry.mtime) {
+      handle.origin = { adapter: node.adapter, path };
+    }
+    return handle;
   }
   return null;
 }
@@ -1002,6 +1020,7 @@ export class VFSNode {
     const hash = entry.hash as Hash;
     const handle = await source.open(hash, entry);
     if (!handle) return false;
+    if (await this.copyNative(handle.origin, entry.path, entry.size)) return true;
     if (this.streams(handle.size)) {
       const hasher = new Sha256();
       await pump(await handle.stream(), await writeStream(this.adapter, entry.path), (chunk) =>
@@ -1020,7 +1039,50 @@ export class VFSNode {
     return true;
   }
 
+  /**
+   * Lets the backend copy its own object, when the bytes are already inside it.
+   * False means it did not happen and the caller must pump — which is always
+   * correct, only slower.
+   *
+   * `origin` is the holder's promise that the source file still matches what
+   * the tree recorded ({@link ContentHandle.origin}); this adds the other half,
+   * that the size which landed is the size expected. Together they are what
+   * stands in for the hash check the fast path skips: a copy that disagrees is
+   * deleted and pumped instead, and the pump then re-hashes and throws exactly
+   * as it does today.
+   */
+  private async copyNative(
+    origin: ContentHandle['origin'],
+    to: string,
+    size: number,
+  ): Promise<boolean> {
+    if (!origin) return false;
+    const source = origin.adapter;
+    if (!this.adapter.copyFrom || !this.adapter.backendId || !source.backendId) return false;
+    const [mine, theirs] = await Promise.all([this.adapter.backendId(), source.backendId()]);
+    if (mine === null || mine !== theirs) return false;
+    const written = await this.adapter.copyFrom(source, origin.path, to);
+    if (written === null) return false;
+    if (written !== size) {
+      await this.adapter.delete(to).catch(() => undefined);
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * Copies within this node's own folder, staging a conflict copy.
+   *
+   * Intra-adapter by construction, so it asks no identity question — and it
+   * gives up no verification either, because it never did any: the fast path
+   * here is strictly more checked than the pump it replaces.
+   */
   private async copy(from: string, to: string, size: number): Promise<void> {
+    const written = await this.adapter.copyFrom?.(this.adapter, from, to);
+    if (written !== null && written !== undefined) {
+      if (written === size) return;
+      await this.adapter.delete(to).catch(() => undefined);
+    }
     if (this.streams(size)) {
       await pump(await readStream(this.adapter, from), await writeStream(this.adapter, to));
       return;

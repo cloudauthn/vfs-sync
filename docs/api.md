@@ -269,8 +269,19 @@ interface ContentHandle {
   size: number;
   read(): Promise<Uint8Array>;
   stream(): Promise<ReadableStream<Uint8Array>>;
+  /** Where the bytes are — set only when the holder vouches for them. */
+  origin?: { adapter: VFSAdapter; path: string };
 }
 ```
+
+`origin` is a claim, not a coordinate. Present means *"the file is where the tree says, and nothing
+has touched it since the scan recorded it"* — the promise a caller needs before it copies natively
+and skips re-hashing. `holds()` sets it after re-statting the file and finding `mtime` and `size`
+still matching the entry; the in-memory handle for an auto-merged text version never sets it, because
+those bytes exist nowhere but in this process. A handle without `origin` is pumped and verified.
+
+See [adapters.md](./adapters.md#copying-inside-one-backend) for what a backend has to implement for
+this to be used at all.
 
 ### `node.store`
 

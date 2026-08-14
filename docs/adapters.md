@@ -338,9 +338,13 @@ const notes = await VFSNode.open(new ScopedAdapter(host, 'projects/notes'));
 ```
 
 The wrapper only advertises the optional methods (`mkdir`, `fileId`, streaming, `append`,
-`writeIf`, `changes`) that its base implements, so capability checks like `canStream()` keep telling
-the truth. A forwarded change feed is filtered to the scope and its paths re-rooted, since the feed
-is account-wide on every backend that has one.
+`writeIf`, `changes`, `backendId`, `copyFrom`) that its base implements, so capability checks like
+`canStream()` keep telling the truth. A forwarded change feed is filtered to the scope and its paths
+re-rooted, since the feed is account-wide on every backend that has one.
+
+**A view is not a backend.** `backendId` is forwarded unchanged, so two scopes over one base report
+one backend and files move between them without leaving it — which is the topology
+[the fast path](#copying-inside-one-backend) exists for.
 
 ---
 
@@ -398,6 +402,13 @@ export class MyAdapter implements VFSAdapter {
   async writeIf?(path: string, data: Uint8Array, tag: string | null): Promise<string | null> { /* … */ }
   /** Changes since `token`; pass `null` for a starting token. Without it, the engine walks. */
   async changes?(token: string | null): Promise<VFSChangeFeed> { /* … */ }
+
+  // Optional pair, for copying inside one backend without the bytes leaving it.
+
+  /** Identity of the backend *instance*. `null` when you cannot tell. */
+  async backendId?(): Promise<string | null> { /* … */ }
+  /** Copies within this backend. Returns the size that landed, or `null` when it cannot. */
+  async copyFrom?(source: VFSAdapter, from: string, to: string): Promise<number | null> { /* … */ }
 }
 ```
 
@@ -409,6 +420,78 @@ export class MyAdapter implements VFSAdapter {
 | `changes?(token)` | Drive `changes.list` | none: without it, the engine walks |
 | `writeIf?(path, data, tag)` | Drive ETag + `If-Match` | none: compare `size`/`rows` and accept the race |
 | `mkdir?(path)` | every filesystem-shaped backend | none: the folder appears when its first file lands |
+| `backendId?()` / `copyFrom?(…)` | node `copyFile`; Drive `files.copy` | none: the engine pumps the bytes through this process |
+
+### Copying inside one backend
+
+Two folders **in the same backend** — two `ScopedAdapter`s over one Drive, a server reconciling two
+roots on one filesystem — otherwise move every byte out of the backend, through the process, and
+straight back in. This pair lets the backend copy its own object instead.
+
+The case it exists for is not "laptop syncing with Drive": those are two backends and none of this
+applies.
+
+```ts
+async backendId(): Promise<string | null>
+async copyFrom(source: VFSAdapter, from: string, to: string): Promise<number | null>
+```
+
+**`backendId` identifies the backend *instance* — the account, the filesystem, the store — not the
+kind of backend.** Equal and non-null is the engine's licence to copy natively, so the burden of
+proof is on equality and an adapter that is unsure answers `null`. The two errors are not
+symmetric:
+
+| | Cost |
+| --- | --- |
+| Same backend, reported different | one ordinary transfer — exactly the old behaviour |
+| Different backends, reported the same | a copy from the wrong account, or one that fails mid-sync |
+
+What the built-ins answer:
+
+| Adapter | `backendId()` | Native copy |
+| --- | --- | --- |
+| `node-fs` | a constant | `fs.copyFile` |
+| `gdrive` | `${space}:${resolved root fileId}` | `files.copy` |
+| `scoped` | the base adapter's answer | delegates to the base, re-rooted |
+| `memory` | per instance | a map write |
+| `opfs`, `fsa`, `handle` | undefined | none — the API has no copy |
+
+**`node-fs` answering a constant looks like it breaks the rule and does not.** Two `NodeFsAdapter`s
+in one process reach the same `fs` module by construction, so `copyFile` works between them across
+devices and mounts alike, and still keeps the bytes out of the process. "Different accounts" is a
+Drive problem, not a filesystem one.
+
+**Drive is the one that has to be careful.** The identity is the account, and the cheapest thing
+that names it without extra scopes is the *resolved* root fileId — globally unique, and already
+needed by everything the adapter does. An explicit `rootFolderId` answers directly; `'root'` costs
+one request, cached forever after, and `null` if that request is refused. Two Drive adapters on one
+account but different root folders disagree and lose the fast path, which is a free false negative.
+
+**Implementing `copyFrom` is a statement about your backend.** The engine does not re-read the
+destination to verify the content — only that the size it reports matches the entry. A backend that
+"copies" by proxying bytes through anything lossy must leave it undefined. What the engine does
+check, on every native copy:
+
+1. The holder stats the source immediately beforehand and only offers it when `mtime` and `size`
+   still match what the tree recorded. This is the same evidence the scan trusts everywhere else.
+2. The size `copyFrom` reports must equal the entry's. A mismatch deletes the copy and falls back to
+   pumping — which re-hashes and fails loudly, exactly as it did before.
+
+Neither piece is required. Omit both and the engine pumps, which always works, and the outcome is
+identical either way: same tree, same hashes, same digest, whether the fast path fired or not.
+
+`copyFrom` is called on the **destination**, and `source` may be a view rather than a concrete
+adapter. Unwrap it before assuming a type:
+
+```ts
+import { unscope } from '@cloudauthn/vfs-sync';
+
+async copyFrom(source: VFSAdapter, from: string, to: string): Promise<number | null> {
+  const held = unscope(source, from);
+  if (!(held.adapter instanceof MyAdapter)) return null; // not mine — let the engine pump
+  return this.nativeCopy(held.path, to);
+}
+```
 
 `append` is what keeps extending the commit log cheap. Where it is missing the engine reads,
 concatenates and writes — which on Drive is a full re-upload of the active segment, and is the reason

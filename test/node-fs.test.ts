@@ -2,7 +2,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { sync } from './helpers.js';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { NodeFsAdapter } from '../src/adapters/node-fs.js';
 import { VFSNode } from '../src/vfs-node.js';
 
@@ -58,6 +58,33 @@ describe('NodeFsAdapter', () => {
 
     expect(decoder.decode(await b.read('notes.md'))).toBe('from A');
     expect(decoder.decode(await a.read('todo.md'))).toBe('from B');
+    expect(await a.state()).toBe(await b.state());
+  });
+
+  /**
+   * Two `NodeFsAdapter`s are always one backend: they reach the same `fs` module
+   * by construction, so `copyFile` between them works even across devices — and
+   * it keeps the bytes out of this process either way. "Different accounts" is a
+   * Drive problem, not a filesystem one.
+   */
+  it('moves a file between two real folders with copyFile, not through memory', async () => {
+    // The concrete adapters, not `node.adapter`: spying needs the type that
+    // declares the optional methods, and `copyFrom` is one of them.
+    const source = await NodeFsAdapter.open(join(workspace, 'device-a'), 'device-a');
+    const a = await VFSNode.open(source, { id: 'device-a' });
+    const b = await node('device-b');
+    const rom = new Uint8Array([0, 1, 2, 250, 251, 252]);
+    await a.write('roms/game.bin', rom);
+    await a.commit();
+
+    const reads = vi.spyOn(source, 'read');
+    const streams = vi.spyOn(source, 'readStream');
+    await sync(a, b);
+
+    const payload = (path: string) => !path.includes('.vfs');
+    expect(reads.mock.calls.filter(([path]) => payload(path))).toEqual([]);
+    expect(streams.mock.calls.filter(([path]) => payload(path))).toEqual([]);
+    expect(new Uint8Array(await b.read('roms/game.bin'))).toEqual(rom);
     expect(await a.state()).toBe(await b.state());
   });
 

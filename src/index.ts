@@ -121,4 +121,4 @@ export type { OPFSAdapterOptions } from './adapters/opfs.js';
 export { FSAAdapter, isFSAAvailable } from './adapters/fsa.js';
 export { GDriveAdapter } from './adapters/gdrive.js';
 export type { GDriveAdapterOptions, GDriveSpace, GDriveTokenProvider } from './adapters/gdrive.js';
-export { ScopedAdapter } from './adapters/scoped.js';
+export { ScopedAdapter, unscope } from './adapters/scoped.js';

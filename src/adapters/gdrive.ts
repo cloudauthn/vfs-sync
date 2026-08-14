@@ -1,5 +1,6 @@
 import { basename, dirname, normalizePath } from '../path.js';
 import { chunked } from '../stream.js';
+import { unscope } from './scoped.js';
 import type {
   ByteRange,
   VFSAdapter,
@@ -124,6 +125,8 @@ export class GDriveAdapter implements VFSAdapter {
    * every create/discovery clears the entry, so it never suppresses a real file.
    */
   private readonly absent = new Set<string>();
+  /** Cached {@link backendId}. `undefined` is "not asked yet", `null` is "cannot tell". */
+  private identity?: string | null;
 
   constructor(options: GDriveAdapterOptions) {
     this.token = options.token;
@@ -426,6 +429,59 @@ export class GDriveAdapter implements VFSAdapter {
   /** The stable native id, which is what makes renames heuristic-free. */
   async fileId(path: string): Promise<string | null> {
     return this.resolve(path);
+  }
+
+  // -------------------------------------------------------- native transfer
+
+  /**
+   * The account, identified by the *resolved* root fileId: globally unique, and
+   * already needed by everything else this adapter does. An explicit
+   * `rootFolderId` answers directly; `'root'`/`'appDataFolder'` costs one
+   * request, cached forever after, and `null` if that request is refused.
+   *
+   * Two adapters on one account but different root folders disagree and lose the
+   * fast path. That is a false negative, which costs one ordinary transfer.
+   */
+  async backendId(): Promise<string | null> {
+    if (this.identity !== undefined) return this.identity;
+    if (this.rootId !== 'root' && this.rootId !== 'appDataFolder') {
+      this.identity = `${this.space}:${this.rootId}`;
+      return this.identity;
+    }
+    try {
+      const { id } = await this.json<DriveFile>(`/drive/v3/files/${this.rootId}?fields=id`);
+      this.identity = `${this.space}:${id}`;
+    } catch {
+      this.identity = null; // cannot tell, so no fast path
+    }
+    return this.identity;
+  }
+
+  /** `files.copy` — Drive duplicates its own object, no bytes over the wire. */
+  async copyFrom(source: VFSAdapter, from: string, to: string): Promise<number | null> {
+    const held = unscope(source, from);
+    if (!(held.adapter instanceof GDriveAdapter)) return null;
+    const originId = await held.adapter.resolve(held.path);
+    if (!originId) return null;
+    const target = normalizePath(to);
+    const parentId = await this.ensureFolder(dirname(target));
+    // A copy cannot land on an existing file, so clear the way first — the
+    // engine only ever copies onto a path it means to replace.
+    const existing = this.absent.has(target) ? null : await this.resolve(target);
+    if (existing) await this.delete(target);
+    const created = await this.json<DriveFile>(
+      `/drive/v3/files/${originId}/copy?fields=id,size`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: basename(target), parents: [parentId] }),
+      },
+    );
+    this.ids.set(target, created.id);
+    this.absent.delete(target);
+    // The response the call already makes carries the size, so the engine's
+    // check costs nothing here.
+    return created.size === undefined ? null : Number(created.size);
   }
 
   // ----------------------------------------------------------- conditional

@@ -308,15 +308,18 @@ extension says so, not because the bytes look textual — otherwise one peer mer
 It never resolves with bytes it cannot fetch, never writes content whose hash does not match what the
 tree declares, and never dematerialises the last copy of a file no peer can serve. Those throw.
 
+**Bytes do not leave the backend they were already in.** Two folders in one backend — two
+`ScopedAdapter`s over one Drive, two roots on one filesystem — copy through `files.copy` or
+`copyFile` rather than out through the process and back. An adapter opts in by identifying its
+backend and implementing the copy; both are optional, an adapter that is unsure of its identity says
+so and is pumped instead, and the resulting tree, hashes and digest are identical either way. See
+[docs/adapters.md](./docs/adapters.md#copying-inside-one-backend).
+
 ## Todos
 
 - **`location` is never asked.** The same file renamed differently on each side settles
   deterministically and nothing is at risk, so it stays out of `pending`. It is in the catalogue in
   case a consumer wants to opt in; nobody has.
-- **The native transfer fast path** — two folders inside one backend still move every byte out
-  through the process and back. Planned in
-  [`SESSIONS/2026-08-12_12h49`](./SESSIONS/2026-08-12_12h49.phase-5-native-fast-path.session.md),
-  invisible to a consumer, blocking nothing.
 - **Resumable uploads to Drive** — uploads buffer whole, so streaming bounds memory, not bytes moved.
 - **Delta transfer** — a changed file still travels in full.
 - **Historical content and deduplication** — both given up with the object store, listed so the

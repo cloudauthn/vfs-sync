@@ -412,6 +412,35 @@ Range reads (`readRange`) are separate: they go straight to a `Blob.slice()` or 
 `read()` — enough to parse a header out of a file far too large to load, and what the header of
 `vfs.json` and the tail of the log are read with.
 
+## Bytes that never leave the backend
+
+Both places the engine moves content check first whether it has to move it at all.
+
+- **Between two nodes** (`fetchContent`): when the holder vouches for the bytes and both adapters
+  report the same non-null `backendId`, the destination's `copyFrom` has the backend duplicate its
+  own object. Two `ScopedAdapter`s over one Drive, or two roots on one filesystem, are the case.
+- **Within one node** (`copy`, staging a conflict copy): intra-adapter by construction, so it asks no
+  identity question at all.
+
+The re-hash the first path skips was buying two different things, and only one of them is given up:
+*copy fidelity* — the destination gets what the source has — is guaranteed by construction when the
+backend copies its own object; *tree fidelity* — what the source has is what `vfs.json` says — is
+what the hash was really checking. Two bounds replace it: the holder re-stats the source immediately
+before copying and withholds the offer unless `mtime` and `size` still match the entry, and the size
+reported by `copyFrom` must match too, or the copy is deleted and the bytes are pumped and re-hashed
+as before.
+
+That leaves one gap, deliberately: a file rewritten to the same size with its mtime restored — a
+`cp -p`, an `rsync -t`, a tar with timestamps — passes both checks. It also passes the scan, which
+reuses a recorded hash on the same evidence, so this is the engine's standing trade reaching one
+place further rather than a new one. Closing it costs a full re-read of every byte copied, which is
+the entire saving.
+
+Nothing here is written to `.vfs`. `backendId` is asked of the live adapter during a pass; it is not
+persisted, does not travel and takes no part in the digest — so a `.vfs` folder copied to another
+backend keeps working, and the outcome is the same tree, the same hashes and the same digest whether
+the fast path fired or not.
+
 ---
 
 ## Not implemented

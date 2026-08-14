@@ -39,8 +39,18 @@ export interface FakeDrive {
   expireToken(): void;
 }
 
+/** Distinguishes one fake drive from another, the way two accounts differ. */
+let drives = 0;
+
 export function makeFakeDrive(): FakeDrive {
   const nodes = new Map<string, Node>();
+  // Real Drive resolves the `root`/`appDataFolder` aliases to a concrete folder
+  // id, which is what identifies the account. Unique per fake, so two of them
+  // are two accounts and never compare equal.
+  const aliasIds: Record<string, string> = {
+    root: `drive-root-${++drives}`,
+    appDataFolder: `appdata-root-${drives}`,
+  };
   let counter = 0;
   let clock = Date.now();
   const nextId = () => `f${++counter}`;
@@ -118,8 +128,36 @@ export function makeFakeDrive(): FakeDrive {
       });
     }
 
+    // ---- copy: POST /drive/v3/files/{id}/copy
+    const copyMatch = rest.match(/^\/drive\/v3\/files\/([^/]+)\/copy$/);
+    if (!upload && copyMatch && method === 'POST') {
+      const origin = nodes.get(copyMatch[1]!);
+      if (!origin) return error(404, 'File not found');
+      const meta = JSON.parse(new TextDecoder().decode(await bodyBytes(init.body))) as {
+        name?: string;
+        parents?: string[];
+      };
+      const node: Node = {
+        id: nextId(),
+        name: meta.name ?? origin.name,
+        mimeType: origin.mimeType,
+        parents: meta.parents ?? ['root'],
+        // The whole point: Drive duplicates the object server-side.
+        content: origin.content.slice(),
+        modifiedTime: nextTime(),
+        version: 1,
+      };
+      nodes.set(node.id, node);
+      record(node.id);
+      return json(project(node));
+    }
+
     // ---- metadata read: GET /drive/v3/files/{id}?fields=...
     if (!upload && idMatch && method === 'GET') {
+      // The aliases are not files; asking for one is how a client learns the
+      // concrete id of the folder they stand for.
+      const alias = aliasIds[idMatch[1]!];
+      if (alias) return json({ id: alias, name: idMatch[1], mimeType: FOLDER_MIME });
       const node = nodes.get(idMatch[1]!);
       if (!node) return error(404, 'File not found');
       return new Response(JSON.stringify(project(node)), {

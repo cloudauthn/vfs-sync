@@ -1,6 +1,7 @@
 import { isInside, normalizePath } from '../path.js';
 import { chunked, concat } from '../stream.js';
 import type { ByteRange, VFSAdapter, VFSListEntry, VFSStat } from '../types.js';
+import { unscope } from './scoped.js';
 
 export interface MemoryAdapterOptions {
   /**
@@ -15,6 +16,9 @@ export interface MemoryAdapterOptions {
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 
+/** Distinguishes instances: the `name` is a label and two may share one. */
+let instances = 0;
+
 /** In-memory backend — the reference implementation, and what tests run on. */
 export class MemoryAdapter implements VFSAdapter {
   readonly name: string;
@@ -23,6 +27,7 @@ export class MemoryAdapter implements VFSAdapter {
   /** Directories created empty via mkdir(); implicit parents are not tracked. */
   private readonly dirs = new Set<string>();
   private readonly clock: () => number;
+  private readonly id = `memory:${(instances++).toString(36)}`;
   private last = 0;
 
   constructor(name = 'memory', options: MemoryAdapterOptions = {}) {
@@ -159,6 +164,23 @@ export class MemoryAdapter implements VFSAdapter {
     }
     if (this.dirs.has(target)) return { kind: 'directory', size: 0, mtime: 0 };
     return target === '' ? { kind: 'directory', size: 0, mtime: 0 } : null;
+  }
+
+  // -------------------------------------------------------- native transfer
+
+  /** Per instance: two `MemoryAdapter`s share nothing, so they are two backends. */
+  async backendId(): Promise<string | null> {
+    return this.id;
+  }
+
+  /** A map write. Refuses anything that is not this same map. */
+  async copyFrom(source: VFSAdapter, from: string, to: string): Promise<number | null> {
+    const held = unscope(source, from);
+    if (held.adapter !== this) return null;
+    const entry = this.entries.get(held.path);
+    if (!entry) return null;
+    this.entries.set(normalizePath(to), { data: entry.data.slice(), mtime: this.clock() });
+    return entry.data.byteLength;
   }
 
   // ------------------------------------------------------------- test aids

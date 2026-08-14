@@ -8,6 +8,28 @@ import type {
 } from '../types.js';
 
 /**
+ * Follows a chain of views down to the adapter that really holds the bytes,
+ * carrying the path down with it.
+ *
+ * `copyFrom` receives whatever adapter the engine was handed, and the topology
+ * the native fast path exists for has a view on *both* sides — two scoped
+ * folders in one Drive. A concrete adapter cannot resolve a path it is given
+ * through a wrapper, so every implementation opens by unscoping its source.
+ */
+export function unscope(
+  adapter: VFSAdapter,
+  path: string,
+): { adapter: VFSAdapter; path: string } {
+  let held = adapter;
+  let at = normalizePath(path);
+  while (held instanceof ScopedAdapter) {
+    at = joinPath(held.root, at);
+    held = held.base;
+  }
+  return { adapter: held, path: at };
+}
+
+/**
  * A view of another adapter rooted at one of its subfolders, so any folder of
  * any backend can host its own `.vfs` store. The handle-based backends can
  * re-root natively; this wrapper gives every other backend the same ability.
@@ -29,6 +51,8 @@ export class ScopedAdapter implements VFSAdapter {
   writeIf?: (path: string, data: Uint8Array, tag: string | null) => Promise<string | null>;
   tag?: (path: string) => Promise<string | null>;
   changes?: (token: string | null) => Promise<VFSChangeFeed>;
+  backendId?: () => Promise<string | null>;
+  copyFrom?: (source: VFSAdapter, from: string, to: string) => Promise<number | null>;
 
   constructor(base: VFSAdapter, root: string, name?: string) {
     this.base = base;
@@ -51,6 +75,13 @@ export class ScopedAdapter implements VFSAdapter {
     if (writeIf) this.writeIf = (path, data, tag) => writeIf(this.at(path), data, tag);
     const tag = base.tag?.bind(base);
     if (tag) this.tag = (path) => tag(this.at(path));
+    // A view is not a backend: two scopes over one Drive are one Drive, which is
+    // the whole point of the fast path. Only the destination is re-rooted here —
+    // the base unscopes the source itself, and nested views recurse.
+    const backendId = base.backendId?.bind(base);
+    if (backendId) this.backendId = () => backendId();
+    const copyFrom = base.copyFrom?.bind(base);
+    if (copyFrom) this.copyFrom = (source, from, to) => copyFrom(source, from, this.at(to));
     // The change feed is account-wide on every backend that has one, so it is
     // forwarded whole and filtered by the caller against the paths it knows.
     const changes = base.changes?.bind(base);

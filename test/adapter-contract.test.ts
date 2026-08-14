@@ -237,6 +237,42 @@ describe.each(backends)('$name', ({ make }) => {
     expect(decoder.decode(await adapter.read('after.txt'))).toBe('still working');
   });
 
+  /**
+   * The optional pair, held to the same contract as everything else — including
+   * on the backends that leave them undefined, where the point is that nothing
+   * blows up and the engine simply pumps.
+   */
+  it('copies within itself, or says it cannot', async () => {
+    const adapter = await make();
+    const rom = new Uint8Array([0, 1, 2, 250, 251, 252]);
+    await adapter.write('src/rom.bin', rom);
+
+    // Leaving it undefined is a legitimate answer — the API has no copy on
+    // OPFS or FSA — and the engine pumps, which the sync tests above cover.
+    if (!adapter.copyFrom) return;
+    const written = await adapter.copyFrom(adapter, 'src/rom.bin', 'dst/rom.bin');
+
+    // The size it reports is the size the engine checks the entry against, so a
+    // backend that miscounts here would silently disable its own fast path.
+    expect(written).toBe(rom.byteLength);
+    expect(new Uint8Array(await adapter.read('dst/rom.bin'))).toEqual(rom);
+    // Intermediate directories, exactly as `write` creates them.
+    expect((await adapter.stat('dst'))?.kind).toBe('directory');
+    // And the source is still there — this is a copy, not a move.
+    expect(new Uint8Array(await adapter.read('src/rom.bin'))).toEqual(rom);
+  });
+
+  it('identifies itself consistently, or admits it cannot', async () => {
+    const adapter = await make();
+    if (!adapter.backendId) return;
+
+    const first = await adapter.backendId();
+    // Asked twice in one pass, and on every pass after: the answer cannot drift
+    // or the engine's licence to copy would come and go.
+    expect(await adapter.backendId()).toBe(first);
+    if (first !== null) expect(typeof first).toBe('string');
+  });
+
   it('drives a full sync as both sides of an edge', async () => {
     const local = await VFSNode.open(await make(), { id: 'local' });
     const remote = await VFSNode.open(new MemoryAdapter('peer'), { id: 'peer' });

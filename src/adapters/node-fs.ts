@@ -4,6 +4,7 @@ import { Readable, Writable } from 'node:stream';
 import { dirname, normalizePath } from '../path.js';
 import { chunked } from '../stream.js';
 import type { ByteRange, VFSAdapter, VFSListEntry, VFSStat } from '../types.js';
+import { unscope } from './scoped.js';
 
 /**
  * Node.js filesystem backend. Useful for CLI tooling and server-side peers,
@@ -112,6 +113,31 @@ export class NodeFsAdapter implements VFSAdapter {
     const target = normalizePath(newPath);
     await fs.mkdir(this.resolve(dirname(target)), { recursive: true });
     await fs.rename(this.resolve(oldPath), this.resolve(target));
+  }
+
+  // -------------------------------------------------------- native transfer
+
+  /**
+   * A constant, which looks like it breaks the identity rule and does not: two
+   * `NodeFsAdapter`s in one process reach the same `fs` module by construction,
+   * so `copyFile` between them always works — across devices and mounts too. It
+   * still keeps the bytes out of the process. "Different accounts" is a Drive
+   * problem, not a filesystem one.
+   */
+  async backendId(): Promise<string | null> {
+    return 'node-fs';
+  }
+
+  async copyFrom(source: VFSAdapter, from: string, to: string): Promise<number | null> {
+    const held = unscope(source, from);
+    if (!(held.adapter instanceof NodeFsAdapter)) return null;
+    const target = this.resolve(to);
+    await fs.mkdir(nodePath.dirname(target), { recursive: true });
+    // Resolved against the *source's* root, which is why the concrete type is
+    // needed and a wrapper has to be unscoped first.
+    const origin = held.adapter.resolve(held.path);
+    await fs.copyFile(origin, target);
+    return (await fs.stat(target)).size;
   }
 
   async stat(path: string): Promise<VFSStat | null> {

@@ -134,6 +134,44 @@ export interface VFSAdapter {
    * enumerating anything. Without it the engine falls back to walking.
    */
   changes?(token: string | null): Promise<VFSChangeFeed>;
+
+  // ------------------------------------------------------ native transfers
+  //
+  // Two folders inside one backend — two `ScopedAdapter`s over a single Drive,
+  // a server reconciling two roots on one filesystem — otherwise move every
+  // byte out of the backend, through this process, and straight back in. These
+  // two let the backend copy its own object instead. Both optional, and the
+  // engine falls back to pumping the bytes whenever either is missing.
+
+  /**
+   * Identity of the *backend instance* — the account, the filesystem, the
+   * store — not the kind of backend. `null` when the adapter cannot tell.
+   *
+   * Equal and non-null is the engine's licence to copy natively, so the burden
+   * of proof is on equality and an adapter that is unsure answers `null`. The
+   * two errors are not symmetric: reporting two halves of one backend as
+   * different costs one ordinary transfer, while reporting two backends as the
+   * same is a copy from the wrong account, or one that fails mid-sync.
+   *
+   * Async because Drive needs a request to answer; cache it, because the engine
+   * asks on every pass.
+   */
+  backendId?(): Promise<string | null>;
+  /**
+   * Copies `from` (in `source`) to `to` (in this adapter) without the bytes
+   * leaving the backend. Returns the size that landed, or `null` when it cannot
+   * — the caller then pumps the bytes, which always works.
+   *
+   * Only ever called when both sides answered {@link VFSAdapter.backendId} with
+   * the same non-null string, so `source` is this backend. It may still be a
+   * view over it: pass it through `unscope()` before assuming a concrete type.
+   *
+   * **Implementing this is a statement about the backend**: the engine does not
+   * re-read the destination to verify the content, only that the size is the
+   * one it expected. A backend that "copies" by proxying bytes through anything
+   * lossy must leave this undefined.
+   */
+  copyFrom?(source: VFSAdapter, from: string, to: string): Promise<number | null>;
 }
 
 // ---------------------------------------------------------------- entries
