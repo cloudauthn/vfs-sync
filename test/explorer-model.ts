@@ -1,0 +1,199 @@
+import { ExplorerModel } from '../explorer/src/model';
+import type { DecidableConflict, ExplorerOptions, Peer } from '../explorer/src/model';
+import type { ConflictAction } from '../src/index';
+
+/**
+ * The explorer, driven headlessly.
+ *
+ * The model needs no DOM: it is plain TypeScript over adapters, its `sources`
+ * are plain data, and a subscriber standing in for a user is exactly what the
+ * components are. What lives here is the setup every explorer test needs — two
+ * roots that agree, a way to make them disagree, and a stand-in for the person
+ * at the dialog — so that the answering boilerplate is written once. Four
+ * copies of a re-entrancy guard is how one of them ends up subtly different and
+ * green for the wrong reason.
+ */
+
+export const encoder = new TextEncoder();
+
+/**
+ * N vFS roots on MemFS, agreeing on one file. Chained left ⇄ right ⇄ …
+ *
+ * The file is written to the **first** root only and reaches the others by
+ * syncing, which is both how a person gets a second device in step and the only
+ * way to start from one identity. Writing it into each folder first mints one
+ * uuid per root, and three peers reconciling three independently-created files
+ * on one path can end up asking which of two identical files keeps the name —
+ * see §9 of `SESSIONS/2026-08-14_12h49.explorer-sync-surface.session.md`.
+ */
+export async function roots(
+  names: string[],
+  options: ExplorerOptions = {},
+): Promise<ExplorerModel> {
+  const model = new ExplorerModel({ seed: null, localFolder: false, ...options });
+  await model.boot();
+  const mem = model.sources.find((source) => source.key === 'mem');
+  if (!mem?.adapter) throw new Error('no memory source');
+  await mem.adapter.write(`${names[0] as string}/notes.txt`, encoder.encode('shared\n'));
+  for (const name of names) await model.openVfsTab(mem, name, true);
+  const unexpected = refusingToAnswer(model, 'setup');
+  try {
+    await model.syncAll();
+  } finally {
+    unexpected();
+  }
+  return model;
+}
+
+/**
+ * Nobody at the dialog, loudly.
+ *
+ * A pass that opens one with no subscriber to answer does not fail — it waits
+ * forever, and a test that hung looks like a test that is slow. Anywhere the
+ * expectation is "this cannot need a person", say so and get a message naming
+ * what was asked.
+ */
+export function refusingToAnswer(model: ExplorerModel, what: string): () => void {
+  return model.subscribe(() => {
+    if (!model.dialog) return;
+    const rows = model.dialog.conflicts?.map((row) => asked(row));
+    throw new Error(`${what} asked a question: ${model.dialog.kind} ${JSON.stringify(rows ?? [])}`);
+  });
+}
+
+/** Two vFS roots on MemFS, already agreeing on one file. */
+export function twoRoots(options: ExplorerOptions = {}): Promise<ExplorerModel> {
+  return roots(['left', 'right'], options);
+}
+
+/** Both roots edit the same file, so the next pass has to stop. */
+export async function disagree(model: ExplorerModel, path = 'notes.txt'): Promise<void> {
+  const [left, right] = model.peers;
+  if (!left || !right) throw new Error('expected two peers');
+  await write(left, path, 'from the left\n');
+  await write(right, path, 'from the right\n');
+}
+
+/** An edit committed straight through the node, as an outside editor would. */
+export async function write(peer: Peer, path: string, text: string): Promise<void> {
+  await peer.node.write(path, encoder.encode(text));
+  await peer.node.commit();
+}
+
+/** The live paths of a root, sorted — what a person would see in the tree. */
+export async function live(peer: Peer): Promise<string[]> {
+  return (await peer.node.live()).map((entry) => entry.path).sort();
+}
+
+/** What one row of a decide dialog was asked, in one string. */
+export const asked = (row: DecidableConflict): string => `${row.reason}:${row.path ?? row.id}`;
+
+/** How a stand-in person answers one row. `null` closes the dialog with "Not now". */
+export type Answer = ConflictAction | null;
+
+export interface Answering {
+  /** `reason:path` per row, in the order the rows were put to the person. */
+  seen: string[];
+  /** Conflict ids, one entry per time a row was shown — duplicates included. */
+  ids: string[];
+  /** Decide dialogs opened. */
+  dialogs: number;
+  stop: () => void;
+}
+
+/**
+ * A person at the decide dialog.
+ *
+ * Answering *inside* the emit is the hard case, and the only one worth
+ * simulating: a subscriber that replies before the dialog's own promise exists
+ * used to wait for it forever. The `busy` flag is for re-entry — picking an
+ * answer emits, like any other change.
+ */
+export function answering(
+  model: ExplorerModel,
+  pick: (row: DecidableConflict) => Answer | Promise<Answer>,
+): Answering {
+  const record: Answering = { seen: [], ids: [], dialogs: 0, stop: () => undefined };
+  let busy = false;
+  const stop = model.subscribe(() => {
+    const dialog = model.dialog;
+    if (dialog?.kind !== 'decide' || busy) return;
+    // Held across the whole reply, not just the reading of it: `setDecision`
+    // emits like any other change, so a guard released too early re-enters here
+    // on the model's own notification.
+    busy = true;
+    // The answer may take a while — a person reading the rows, and the folders
+    // free to move while they do. The pass is suspended on the dialog's promise
+    // either way, so replying a few microtasks later is the honest simulation
+    // and the only way a test can change the world mid-dialog.
+    void (async () => {
+      try {
+        record.dialogs++;
+        let refused = false;
+        for (const row of dialog.conflicts ?? []) {
+          record.seen.push(asked(row));
+          record.ids.push(row.id);
+          const answer = await pick(row);
+          if (answer === null) {
+            refused = true;
+            continue;
+          }
+          const index = row.choices.findIndex((choice) => choice.action === answer);
+          if (index < 0) throw new Error(`${asked(row)} cannot be answered ${answer}`);
+          model.setDecision(row.id, index);
+        }
+        if (refused) model.cancelDialog();
+        else model.acceptDialog();
+      } finally {
+        busy = false;
+      }
+    })();
+  });
+  record.stop = stop;
+  return record;
+}
+
+/** A person at a confirm or prompt dialog: what it said, and what they did. */
+export interface Prompting {
+  /** Titles of the dialogs shown, in order. */
+  titles: string[];
+  /** The last dialog put to the person, kept after it closed. */
+  last: { title: string; message: string; sections?: Array<{ title: string; items: string[] }> } | null;
+  stop: () => void;
+}
+
+/**
+ * Answers `confirm` and `prompt` dialogs. `reply` returns `true`/`false` for a
+ * confirm, a string for a prompt, or `null` to cancel either.
+ */
+export function prompting(
+  model: ExplorerModel,
+  reply: (dialog: NonNullable<ExplorerModel['dialog']>) => boolean | string | null,
+): Prompting {
+  const record: Prompting = { titles: [], last: null, stop: () => undefined };
+  let busy = false;
+  const stop = model.subscribe(() => {
+    const dialog = model.dialog;
+    if (!dialog || dialog.kind === 'decide' || busy) return;
+    busy = true;
+    try {
+      record.titles.push(dialog.title);
+      record.last = {
+        title: dialog.title,
+        message: dialog.message,
+        ...(dialog.sections ? { sections: dialog.sections } : {}),
+      };
+      const answer = reply(dialog);
+      if (answer === null || answer === false) model.cancelDialog();
+      else {
+        // `setDialogValue` emits; see the note in `answering`.
+        if (typeof answer === 'string') model.setDialogValue(answer);
+        model.acceptDialog();
+      }
+    } finally {
+      busy = false;
+    }
+  });
+  record.stop = stop;
+  return record;
+}

@@ -337,6 +337,26 @@ function uniqueSorted(items: string[]): string[] {
   return [...new Set(items)].sort((a, b) => a.localeCompare(b));
 }
 
+/**
+ * Every answer given so far, plus this round's — the later one winning where
+ * both name the same conflict.
+ *
+ * A round that carries only the latest dialog's answers loses the earlier ones,
+ * and losing them is not academic: the pass that asked wrote **nothing**, so a
+ * conflict settled two rounds ago is still outstanding on disk. It comes back
+ * pending, is put to the person a second time, and their answer to it displaces
+ * the one before — two conflicts and a slow hand are enough to trade dialogs
+ * until the round cap gives up with nothing written.
+ *
+ * Carrying them all is safe by the engine's own rule: a decision naming no live
+ * conflict is ignored.
+ */
+function withAnswers(previous: SyncDecision[], answers: SyncDecision[]): SyncDecision[] {
+  const byId = new Map(previous.map((decision) => [decision.id, decision]));
+  for (const answer of answers) byId.set(answer.id, answer);
+  return [...byId.values()];
+}
+
 /** The sentence under a decide row: why this stopped, in the user's terms. */
 function decisionNote(conflict: ConflictPayload): string | undefined {
   switch (conflict.reason) {
@@ -1884,7 +1904,7 @@ export class ExplorerModel {
           this.log(`${a.label} ⇄ ${b.label}: left for later, nothing written`);
           return null;
         }
-        decisions = answers;
+        decisions = withAnswers(decisions, answers);
       }
     }
     this.log(`${a.label} ⇄ ${b.label}: still unsettled after 8 rounds`, 'warn');
@@ -2018,7 +2038,7 @@ export class ExplorerModel {
             .filter((conflict) => !seen.has(conflict.id) && seen.add(conflict.id));
           const answers = await this.askDecision(unique);
           if (answers) {
-            decisions = answers;
+            decisions = withAnswers(decisions, answers);
             continue;
           }
           this.log('left for later, nothing written');
