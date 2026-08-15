@@ -1,6 +1,11 @@
 import { ExplorerModel } from '../explorer/src/model';
-import type { DecidableConflict, ExplorerOptions, Peer } from '../explorer/src/model';
+import type { BrowseSource, DecidableConflict, ExplorerOptions, Peer } from '../explorer/src/model';
+import { MemoryAdapter } from '../src/adapters/memory.js';
+import { ScopedAdapter } from '../src/adapters/scoped.js';
+import { VFSNode } from '../src/vfs-node.js';
 import type { ConflictAction } from '../src/index';
+import { counting } from './helpers.js';
+import type { Calls } from './helpers.js';
 
 /**
  * The explorer, driven headlessly.
@@ -59,6 +64,47 @@ export function refusingToAnswer(model: ExplorerModel, what: string): () => void
     const rows = model.dialog.conflicts?.map((row) => asked(row));
     throw new Error(`${what} asked a question: ${model.dialog.kind} ${JSON.stringify(rows ?? [])}`);
   });
+}
+
+export interface Browsing {
+  model: ExplorerModel;
+  source: BrowseSource;
+  calls: Calls;
+  /** The filesystem under the counted adapter — what actually holds the bytes. */
+  base: MemoryAdapter;
+}
+
+/**
+ * A booted model browsing one counted filesystem that already holds two vFS
+ * roots. `sources` is public and its entries are plain data, so a test can hand
+ * the model a filesystem of its own without a browser API in sight.
+ *
+ * `roots` names the folders to lay down; the default two are what the caching
+ * tests were written against. Names that share a prefix (`one`, `one-b`) are how
+ * the lifecycle tests check that a delete takes the subtree and not the sibling.
+ */
+export async function browsing(roots = ['one', 'two']): Promise<Browsing> {
+  const base = new MemoryAdapter('base');
+  for (const root of roots) {
+    await base.write(`${root}/notes.md`, encoder.encode(`# ${root}\n`));
+    await VFSNode.open(new ScopedAdapter(base, root), { id: root });
+  }
+  const { adapter, calls } = counting(base);
+  const model = new ExplorerModel({ seed: null, localFolder: false });
+  await model.boot();
+  const source: BrowseSource = {
+    key: 'test',
+    label: 'Counted',
+    icon: '🧪',
+    backend: 'memory',
+    adapter,
+    expanded: new Set(),
+  };
+  model.sources.push(source);
+  model.activeSource = source.key;
+  await model.activateNewTab();
+  calls.reset();
+  return { model, source, calls, base };
 }
 
 /** Two vFS roots on MemFS, already agreeing on one file. */

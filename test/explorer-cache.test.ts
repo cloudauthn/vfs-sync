@@ -1,46 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
-import { MemoryAdapter } from '../src/adapters/memory.js';
-import { ScopedAdapter } from '../src/adapters/scoped.js';
-import { VFSNode } from '../src/vfs-node.js';
-import { ExplorerModel } from '../explorer/src/model';
-import type { BrowseSource } from '../explorer/src/model';
-import { counting } from './helpers.js';
+import { browsing } from './explorer-model.js';
 import type { Calls } from './helpers.js';
-
-const encoder = new TextEncoder();
-
-/**
- * A booted model browsing one counted filesystem that already holds two vFS
- * roots. `sources` is public and its entries are plain data, so a test can hand
- * the model a filesystem of its own without a browser API in sight.
- */
-async function browsing(): Promise<{
-  model: ExplorerModel;
-  source: BrowseSource;
-  calls: Calls;
-}> {
-  const base = new MemoryAdapter('base');
-  for (const root of ['one', 'two']) {
-    await base.write(`${root}/notes.md`, encoder.encode(`# ${root}\n`));
-    await VFSNode.open(new ScopedAdapter(base, root), { id: root });
-  }
-  const { adapter, calls } = counting(base);
-  const model = new ExplorerModel({ seed: null, localFolder: false });
-  await model.boot();
-  const source: BrowseSource = {
-    key: 'test',
-    label: 'Counted',
-    icon: '🧪',
-    backend: 'memory',
-    adapter,
-    expanded: new Set(),
-  };
-  model.sources.push(source);
-  model.activeSource = source.key;
-  await model.activateNewTab();
-  calls.reset();
-  return { model, source, calls };
-}
 
 /**
  * Probes of a folder's store. In v2 that is a range read of the header of

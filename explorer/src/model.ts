@@ -1191,14 +1191,31 @@ export class ExplorerModel {
     }
   }
 
-  async deleteBrowseEntry(source: BrowseSource, path: string): Promise<void> {
+  /**
+   * Deletes a browsed entry straight from the backend — no store, no tombstone.
+   *
+   * `kind` is required rather than defaulted: the tree's row button can only
+   * ever hand this a folder, but the details pane's Delete deletes whatever is
+   * selected, and a confirm that promises to take "everything inside it" is a
+   * lie about a file. That sentence is the last thing a person reads before
+   * losing something, so the compiler asks every caller which one it has.
+   */
+  async deleteBrowseEntry(
+    source: BrowseSource,
+    path: string,
+    kind: 'file' | 'directory',
+  ): Promise<void> {
     if (!source.adapter) return;
-    const ok = await this.askConfirm({
-      title: 'Delete folder',
-      message: `Delete ${path} and everything inside it?`,
-      okText: 'Delete',
-      danger: true,
-    });
+    const ok = await this.askConfirm(
+      kind === 'directory'
+        ? {
+            title: 'Delete folder',
+            message: `Delete ${path} and everything inside it?`,
+            okText: 'Delete',
+            danger: true,
+          }
+        : { title: 'Delete file', message: `Delete ${path}?`, okText: 'Delete', danger: true },
+    );
     if (!ok) return;
     try {
       // a tab open on this folder (or inside it) would be left dangling

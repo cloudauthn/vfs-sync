@@ -3,6 +3,7 @@
 /demo/dist
 /explorer/dist
 /coverage
+/.tmp
 /npm-debug.log
 .DS_Store
 *.tsbuildinfo

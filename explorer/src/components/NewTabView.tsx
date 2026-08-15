@@ -196,7 +196,7 @@ function BrowseRowItem({
             class="vfs-rowbtn vfs-danger"
             title={`Delete ${row.path}`}
             aria-label={`Delete ${row.path}`}
-            onClick={() => void model.deleteBrowseEntry(source, row.path)}
+            onClick={() => void model.deleteBrowseEntry(source, row.path, 'directory')}
           >
             ×
           </button>
@@ -295,7 +295,7 @@ function BrowseDetails({
         <div class="vfs-details-actions">
           <button
             class="vfs-ghost vfs-danger"
-            onClick={() => void model.deleteBrowseEntry(source, data.path)}
+            onClick={() => void model.deleteBrowseEntry(source, data.path, data.kind)}
           >
             Delete
           </button>

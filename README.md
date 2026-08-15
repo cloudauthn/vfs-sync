@@ -340,6 +340,11 @@ so and is pumped instead, and the resulting tree, hashes and digest are identica
   disagree on line terminators parks the copy as `binary` — true, it could not be merged, but it
   hides a fix that would settle every file in the folder. Widening `CopyReason` is safe whenever
   somebody wants it: `reason` is not in the digest, so peers that do not know a value still converge.
+- **A group that was taken in is remembered for ever.** `absorbed` gains one `syncId` per group ever
+  absorbed and is never pruned, and the winner keeps a peer mark for the identity the losing folder
+  gave up. Both are a few dozen bytes outside the digest, and both stay because *"every straggler has
+  arrived"* is not a question a mesh can answer — dropping either one buys back a header field and
+  risks asking somebody a question they already answered.
 - **Resumable uploads to Drive** — uploads buffer whole, so streaming bounds memory, not bytes moved.
 - **Delta transfer** — a changed file still travels in full.
 - **Historical content and deduplication** — both given up with the object store, listed so the
