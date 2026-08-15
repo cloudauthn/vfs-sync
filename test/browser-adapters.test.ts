@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { FSAAdapter, isFSAAvailable } from '../src/adapters/fsa.js';
 import { OPFSAdapter, isOPFSAvailable } from '../src/adapters/opfs.js';
 import { VFSNode } from '../src/vfs-node.js';
+import { stub, unstub } from './browser-globals.js';
 import { FakeDirectoryHandle } from './fake-handle.js';
 
 const decoder = new TextDecoder();
@@ -11,15 +12,9 @@ const encoder = new TextEncoder();
  * The two browser adapters are thin: they resolve a root handle and hand it to
  * HandleAdapter. Stubbing the globals lets us test that resolution — and the
  * FSA permission dance — without a browser. Behaviour of real OPFS itself is
- * the browser's business, not ours.
+ * the browser's business, not ours. `stub` lives in `browser-globals.ts`
+ * because the explorer's pickers need the same globals.
  */
-function stub(name: 'navigator' | 'window', value: unknown): void {
-  Object.defineProperty(globalThis, name, { value, configurable: true, writable: true });
-}
-
-function unstub(name: 'navigator' | 'window'): void {
-  Reflect.deleteProperty(globalThis, name);
-}
 
 describe('OPFSAdapter', () => {
   afterEach(() => unstub('navigator'));
