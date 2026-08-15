@@ -299,6 +299,13 @@ conflict about one file — reach the caller in one shape, are answered through 
 array, and are catalogued in [`docs/conflicts.yaml`](./docs/conflicts.yaml). `legalAnswers(reason)`
 is that catalogue in code; an answer a reason does not admit throws rather than being ignored.
 
+**An identity is minted once and never rewritten.** A file's uuid survives renames, and inside a mesh
+no pass ever changes it — a peer that was not in the room could not learn that it had. So one name is
+not enough to make two entries one file: paths are matched only where the answer cannot be wrong (a
+folder that has never synced takes the mesh's identities, two directories are their path, two files
+with the same bytes are one file). Anything else is two files claiming one name, and a person
+decides.
+
 **A decision leaves the trace a merge leaves.** Answering mints a new version carrying *both*
 parents — otherwise the next peer to do the arithmetic reaches the engine's original answer and
 quietly undoes the person's.
@@ -317,6 +324,10 @@ so and is pumped instead, and the resulting tree, hashes and digest are identica
 
 ## Todos
 
+- **Two established meshes merging ask once per file.** Answering `foreign-mesh` authorises the
+  merge; it does not make the losing folder rejoin as a newcomer, so files each mesh created
+  independently collide by name and are put to a person. Adding a *device* is the common case and
+  costs nothing: a folder that has never synced takes the mesh's identities by path.
 - **`location` is never asked.** The same file renamed differently on each side settles
   deterministically and nothing is at risk, so it stays out of `pending`. It is in the catalogue in
   case a consumer wants to opt in; nobody has.

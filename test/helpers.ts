@@ -6,7 +6,15 @@ import {
   syncMesh as engineSyncMesh,
   syncUntilStable as engineSyncUntilStable,
 } from '../src/sync.js';
-import type { ConflictAnswer, MeshEdge, MeshResult, SyncOptions, SyncResult } from '../src/sync.js';
+import type {
+  ConflictAnswer,
+  ConflictPayload,
+  MeshEdge,
+  MeshResult,
+  SyncOptions,
+  SyncResult,
+  VersionContext,
+} from '../src/sync.js';
 import type { ByteRange, VFSAdapter, VFSEntry } from '../src/types.js';
 
 const encoder = new TextEncoder();
@@ -180,9 +188,36 @@ export async function settle(
     return await sync(a, b, options);
   } catch (error) {
     if (!(error instanceof ConflictError)) throw error;
+    for (const conflict of error.conflicts) unanswerable(conflict);
     const decisions = error.conflicts.map((conflict) => ({ id: conflict.id, ...answer }));
     return sync(a, b, { ...options, decisions });
   }
+}
+
+/**
+ * Refuses a question nobody can answer.
+ *
+ * **Two sides carrying the same hash is one the engine should have settled
+ * itself**: both answers produce the same bytes, so whichever a person picks,
+ * the folder ends up identical. Asking is at best noise; answering it
+ * automatically — which is what this helper does, and what every suite using it
+ * has been doing — turns it into a duplicate file nobody asked for.
+ *
+ * It lives here rather than in one test because the value is in the reach: every
+ * suite that settles a conflict inherits it, including the property test, which
+ * had been driving one of these over a hundred random histories without anyone
+ * being able to see it.
+ */
+function unanswerable(conflict: ConflictPayload): void {
+  if (conflict.level !== 'entry') return;
+  const a = conflict.ctxA as VersionContext;
+  const b = conflict.ctxB as VersionContext;
+  if (!a.hash || a.hash !== b.hash) return;
+  throw new Error(
+    `${conflict.reason} on ${conflict.path ?? conflict.id}: both sides are ${a.hash.slice(0, 8)} — ` +
+      'the same bytes, so no answer changes anything. ' +
+      `a=${a.uuid} (${a.peerId}) b=${b.uuid} (${b.peerId})`,
+  );
 }
 
 /**

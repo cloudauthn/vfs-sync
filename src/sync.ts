@@ -608,8 +608,21 @@ async function planSync(
   }
   const history = History.from(sources);
 
-  const sides = { peerId: a.peerId, entries: entriesA, knows: (uuid: string) => ownA.knows(uuid) };
-  const other = { peerId: b.peerId, entries: entriesB, knows: (uuid: string) => ownB.knows(uuid) };
+  // `syncId === null` is "has never synced with anybody", and it is still the
+  // pre-pass value here: `pair()` decided what the two will share, but neither
+  // file has been written yet. A folder joining a mesh takes its identities.
+  const sides = {
+    peerId: a.peerId,
+    entries: entriesA,
+    knows: (uuid: string) => ownA.knows(uuid),
+    joining: fileA.syncId === null,
+  };
+  const other = {
+    peerId: b.peerId,
+    entries: entriesB,
+    knows: (uuid: string) => ownB.knows(uuid),
+    joining: fileB.syncId === null,
+  };
 
   // ---- merge
   const mergeOptions: MergeOptions = {

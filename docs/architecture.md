@@ -253,9 +253,24 @@ file starts a new one.
 Two peers that discovered the same file independently gave it different uuids. Matching then falls
 back to **path** — but only between live entries of the same kind whose uuid the other side has
 never heard of, by entry *or* by log. That guard is what the base tree provided in v1; without it a
-file deleted and recreated at the same path merges into the entry it replaced. The lexicographically
-smaller uuid wins and becomes canonical. The rule is deterministic, so both peers reach the same
-answer without negotiating.
+file deleted and recreated at the same path merges into the entry it replaced.
+
+**One name is not enough to make two entries one file.** Pairing rewrites one side's uuid, and inside
+a mesh that is not safe: the peer that was not in the room has no way to learn that an identity
+changed, so it turns up later still holding the old one — one path, two uuids, and, when the bytes
+happen to match, a question with no right answer and no wrong one. **A uuid inside a mesh is minted
+once and never rewritten.** The fallback therefore fires only where the answer cannot be wrong:
+
+| Case | Why it is safe |
+| --- | --- |
+| one side has **never synced** (`syncId: null`) | it has no identities to lose, so its paths take the mesh's uuids — and it is the only side that changes |
+| two **directories** | a directory is nothing but its path |
+| two files with the **same hash** | identical content proves they are one file, not two that share a name |
+
+Everything else is two files claiming one name: a `path-collision`, which stops the pass and asks.
+Where the fallback does fire, the lexicographically smaller uuid becomes canonical — except against a
+folder that has never synced, which yields whatever its uuid sorts as. Both rules are deterministic,
+so the two peers reach the same answer without negotiating.
 
 ---
 

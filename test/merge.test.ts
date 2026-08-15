@@ -67,6 +67,56 @@ describe('pairEntries', () => {
   it('leaves unrelated files as separate items', () => {
     expect(pairEntries(A(entry({ uuid: '1', path: 'a.md' })), B(entry({ uuid: '2', path: 'b.md' })))).toHaveLength(2);
   });
+
+  /**
+   * One name is not one file.
+   *
+   * Pairing these would rewrite one peer's uuid inside a mesh, and the peer that
+   * was not in the room has no way to learn that it changed: it turns up later
+   * holding an identity the others have moved on from, one path with two uuids,
+   * and — when the bytes happen to match — a question nobody can answer. Two
+   * files that want one name is a `path-collision`, which is a person's to
+   * settle.
+   */
+  it('does not pair two files on one path when their content differs', () => {
+    const items = pairEntries(
+      A(entry({ uuid: 'zzz', path: 'a.md', hash: 'x' })),
+      B(entry({ uuid: 'aaa', path: 'a.md', hash: 'y' })),
+    );
+    expect(items).toHaveLength(2);
+  });
+
+  it('pairs them when the bytes are identical, which proves they are one file', () => {
+    const items = pairEntries(
+      A(entry({ uuid: 'zzz', path: 'a.md', hash: 'same' })),
+      B(entry({ uuid: 'aaa', path: 'a.md', hash: 'same' })),
+    );
+    expect(items).toHaveLength(1);
+    expect(items[0]?.uuid).toBe('aaa');
+  });
+
+  it('pairs two directories, which are nothing but their path', () => {
+    const dir = { kind: 'directory' as const, hash: null };
+    const items = pairEntries(
+      A(entry({ uuid: 'zzz', path: 'photos', ...dir })),
+      B(entry({ uuid: 'aaa', path: 'photos', ...dir })),
+    );
+    expect(items).toHaveLength(1);
+  });
+
+  /**
+   * A folder that has never synced has no identities to lose, so its paths take
+   * the mesh's uuids — including for a file whose content differs, which is then
+   * an ordinary two-version conflict on one identity rather than two files
+   * fighting over a name.
+   */
+  it('gives the mesh identity to the side that has never synced', () => {
+    const joining = { ...A(entry({ uuid: 'aaa', path: 'a.md', hash: 'x' })), joining: true };
+    const items = pairEntries(joining, B(entry({ uuid: 'zzz', path: 'a.md', hash: 'y' })));
+    expect(items).toHaveLength(1);
+    // `zzz` sorts after `aaa` and still wins: the joiner yields whatever it is called.
+    expect(items[0]?.uuid).toBe('zzz');
+  });
 });
 
 describe('mergeEntries', () => {

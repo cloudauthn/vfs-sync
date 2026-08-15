@@ -89,6 +89,15 @@ export interface MergeSide {
    * *other* side has never seen this identity.
    */
   knows?: (uuid: string) => boolean;
+  /**
+   * This folder has never synced with anybody — `syncId === null`.
+   *
+   * It has no identities to lose, so **its paths are matched against the mesh's
+   * identities and it adopts them**. Inside a mesh the opposite holds: a uuid is
+   * minted once and never rewritten, because a peer that was not in the room
+   * when it changed has no way to learn that it did.
+   */
+  joining?: boolean;
 }
 
 export interface MergeOptions {
@@ -148,6 +157,22 @@ export interface MergeItem {
  * never heard of, by entry *or* by log. That guard is what the base tree used
  * to provide in v1: without it a delete-and-recreate at the same path merges
  * into the entry it replaced.
+ *
+ * **Matching by path is not enough to make two entries one file**, and that is
+ * the whole of {@link samePath}. A uuid inside a mesh is minted once and never
+ * rewritten: the peer that was not in the room when it changed has no way to
+ * learn that it did, and turns up later holding an identity the others have
+ * moved on from — one path, two uuids, and a question nobody can answer when the
+ * bytes match. So the fallback fires only where the answer cannot be wrong:
+ *
+ * - a folder that has **never synced** has no identities to lose, so its paths
+ *   take the mesh's uuids ({@link MergeSide.joining});
+ * - two directories, which are nothing but their path;
+ * - two files whose **content is identical**, which proves they are one file
+ *   rather than two that happen to share a name.
+ *
+ * Everything else is two files claiming one name, which is a `path-collision`
+ * and a person's to answer.
  */
 export function pairEntries(a: MergeSide, b: MergeSide): MergeItem[] {
   const items = new Map<string, MergeItem>();
@@ -176,15 +201,30 @@ export function pairEntries(a: MergeSide, b: MergeSide): MergeItem[] {
     if (!entry || candidate.b || entry.deleted || !strangerToB(entry.uuid)) continue;
     const key = `${entry.kind}:${entry.path}`;
     const other = loose.get(key);
-    if (!other) continue;
+    if (!other?.b || !samePath(entry, other.b, a, b)) continue;
     loose.delete(key);
-    const uuid = candidate.uuid < other.uuid ? candidate.uuid : other.uuid;
+    // The joining side yields its uuid whatever it sorts as: it is the one with
+    // nothing to lose, and the mesh's identity is the one other peers hold.
+    const uuid = a.joining
+      ? other.uuid
+      : b.joining
+        ? candidate.uuid
+        : candidate.uuid < other.uuid
+          ? candidate.uuid
+          : other.uuid;
     items.delete(candidate.uuid);
     items.delete(other.uuid);
     items.set(uuid, { uuid, a: candidate.a, b: other.b });
   }
 
   return [...items.values()];
+}
+
+/** Whether two live entries on one path are one file. See {@link pairEntries}. */
+function samePath(left: VFSEntry, right: VFSEntry, a: MergeSide, b: MergeSide): boolean {
+  if (a.joining || b.joining) return true;
+  if (left.kind === 'directory') return true;
+  return !!left.hash && left.hash === right.hash;
 }
 
 /**

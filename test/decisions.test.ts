@@ -489,6 +489,38 @@ describe('the payload carries what the decision needs', () => {
   });
 
   /**
+   * Inside a mesh, one name is not one file.
+   *
+   * Two peers already synced with each other create `notes.txt` on their own.
+   * Pairing them by path would have to rewrite one peer's uuid, and every peer
+   * not in the room keeps the old one — which is how a third peer ends up asking
+   * which of two byte-identical files keeps the name. So they stay two files and
+   * a person decides. Two folders that have *never* synced are the opposite case
+   * and still pair: neither has an identity to lose.
+   */
+  it('treats one name claimed by two established peers as two files', async () => {
+    const a = await peer('device-a');
+    const b = await peer('device-b');
+    await put(a, 'shared.txt', 'the mesh exists');
+    await sync(a.node, b.node); // both are now established members of one mesh
+
+    await put(a, 'notes.txt', 'written on A');
+    await a.node.commit();
+    await put(b, 'notes.txt', 'written on B');
+
+    const stopped = await stoppedBy(a.node, b.node);
+
+    expect(stopped.map((conflict) => conflict.reason)).toEqual(['path-collision']);
+    const [collision] = stopped;
+    expect(collision?.path).toBe('notes.txt');
+    // Two identities, and neither is rewritten by the answer: whichever yields
+    // keeps its content under another name.
+    expect((collision?.ctxA as { uuid: string }).uuid).not.toBe(
+      (collision?.ctxB as { uuid: string }).uuid,
+    );
+  });
+
+  /**
    * Two *different* files wanting one name is not two versions of one file, and
    * calling both `content` made a consumer look at the uuids to tell them apart.
    */
