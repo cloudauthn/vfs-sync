@@ -416,6 +416,28 @@ function folderSide(side: FolderContext): DecidableSide {
 }
 
 /**
+ * Two sides a person can tell apart.
+ *
+ * Both labels are a `peerId`, and two folders carrying one `peerId` is exactly
+ * what a `peer-collision` *is* — so on the one question where the two answers do
+ * different things, both buttons read `twin keeps its identity`. That is not a
+ * question anybody can answer.
+ *
+ * Position is what always differs, and it is already what the dialog shows: the
+ * two sides are listed above the buttons in this order, with the detail beside
+ * each saying which folder it is. A fact from the payload would read better and
+ * would not always be there — two copies of one folder can agree on every field
+ * it carries.
+ */
+function distinguish(sides: [DecidableSide, DecidableSide]): [DecidableSide, DecidableSide] {
+  if (sides[0].label !== sides[1].label) return sides;
+  return [
+    { ...sides[0], label: `${sides[0].label} (first)` },
+    { ...sides[1], label: `${sides[1].label} (second)` },
+  ];
+}
+
+/**
  * How much of a file the details pane wants back. `text` decodes because the
  * name says it is text; `sniff` decodes only if the bytes read as text (a blob
  * under `.vfs/objects/` is named after its hash, so there is nothing to go by);
@@ -2067,8 +2089,20 @@ export class ExplorerModel {
         for (const edge of flat.filter((r) => r.error && !(r.error instanceof ConflictError))) {
           this.log(`${edge.edge.a.name} <-> ${edge.edge.b.name}: ${edge.error?.message}`, 'warn');
         }
-        if (changed.length === 0) this.log('every root already in sync');
-        else this.log(`converged in ${rounds.length} round(s), ${changed.length} edge update(s)`, 'ok');
+        // An edge that stopped is not an edge that had nothing to do. Saying
+        // "already in sync" under a question somebody has just declined tells
+        // them the opposite of what happened, and this is the line the footer
+        // shows: the specific one written above it — what was left for later,
+        // or what stopped an edge nobody is watching — is what should stand.
+        if (changed.length > 0) {
+          this.log(`converged in ${rounds.length} round(s), ${changed.length} edge update(s)`, 'ok');
+        } else if (stopped.length === 0) {
+          // The vocabulary the single-edge path already uses: an edge told to
+          // leave its conflict alone wrote nothing, which is not the same thing
+          // as an edge that had nothing to write.
+          const held = flat.some((edge) => edge.result && !edge.result.applied);
+          this.log(held ? 'nothing written' : 'every root already in sync');
+        }
         for (const conflict of flat.flatMap((r) => r.result?.conflicts ?? [])) this.logConflict(conflict);
         this.lastSyncAt = Date.now();
         break;
@@ -2206,9 +2240,11 @@ export class ExplorerModel {
   /** One conflict payload as a row: what it is, and what may be answered. */
   private decidable(conflict: ConflictPayload): DecidableConflict {
     const pairing = conflict.level === 'pairing';
-    const sides: [DecidableSide, DecidableSide] = pairing
-      ? [folderSide(conflict.ctxA as FolderContext), folderSide(conflict.ctxB as FolderContext)]
-      : [versionSide(conflict.ctxA as VersionContext), versionSide(conflict.ctxB as VersionContext)];
+    const sides: [DecidableSide, DecidableSide] = distinguish(
+      pairing
+        ? [folderSide(conflict.ctxA as FolderContext), folderSide(conflict.ctxB as FolderContext)]
+        : [versionSide(conflict.ctxA as VersionContext), versionSide(conflict.ctxB as VersionContext)],
+    );
 
     // The contract decides what may be offered, so this dialog cannot drift
     // from what the engine will accept.

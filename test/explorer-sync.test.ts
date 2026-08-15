@@ -303,8 +303,20 @@ describe('the pass nobody started', () => {
     const nobody = refusingToAnswer(model, 'the timer');
     await disagree(model);
 
+    // Counted off the model, not off the log. A pass that stops on a conflict
+    // writes no summary line at all — that is the point of `reportStopped`, and
+    // it is the property this test is about — so the log cannot be the
+    // heartbeat here. `syncing` is raised by every pass whatever it ends up
+    // saying.
+    let ticks = 0;
+    let running = false;
+    const counting = model.subscribe(() => {
+      if (model.syncing && !running) ticks++;
+      running = model.syncing;
+    });
+
     model.setAutoSync(true);
-    await vi.waitFor(() => expect(passes(model)).toBeGreaterThanOrEqual(3));
+    await vi.waitFor(() => expect(ticks).toBeGreaterThanOrEqual(3));
     const reported = model.logs.filter((entry) => entry.kind === 'conflict');
     expect(reported).toHaveLength(1);
     expect(reported[0]?.message).toContain('needs a decision');
@@ -319,6 +331,7 @@ describe('the pass nobody started', () => {
     );
 
     model.setAutoSync(false);
+    counting();
     nobody();
     // Nothing was written the whole time: both roots are as their owner left them.
     expect(await read(left, 'notes.txt')).toBe('from the left\n');
