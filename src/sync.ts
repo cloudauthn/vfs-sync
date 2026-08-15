@@ -303,7 +303,7 @@ export interface SyncResult {
   applied: boolean;
   /** False when both folders were already identical. */
   changed: boolean;
-  /** Whether the `text` config converged in this pass. */
+  /** Whether the shared header config — `text`, `absorbed` — converged in this pass. */
   configChanged: boolean;
   conflicts: ConflictReport[];
   /**
@@ -325,6 +325,20 @@ export interface SyncResult {
   actions: { toA: SyncAction[]; toB: SyncAction[] };
   /** The digest both peers end on, or `null` when the pair is empty. */
   state: Hash | null;
+  /**
+   * Set when one folder gave up its store to join the other's group — the
+   * outcome of answering `foreign-mesh`, and the only destructive thing a sync
+   * does to anything but content.
+   *
+   * `side` is `'a'` or `'b'` **as passed to `sync(a, b)`**, and names the folder
+   * that lost; `syncId` is the group it gave up. Its files are all still there:
+   * what it discarded is everything it knew *about* them, which is
+   * {@link VFSNode.discard}.
+   *
+   * On a `dryRun` this is the whole report — a preview stops at the discard
+   * rather than describing a merge whose inputs it refused to create.
+   */
+  discarded?: { side: 'a' | 'b'; syncId: string };
 }
 
 export type SyncActionType = 'write' | 'delete' | 'rename' | 'mkdir';
@@ -375,6 +389,8 @@ interface SyncPlan {
   mergedPaths: string[];
   state: Hash | null;
   changed: boolean;
+  /** A folder gave up its store to join the other's group. See {@link SyncResult.discarded}. */
+  discarded?: { side: 'a' | 'b'; syncId: string };
 }
 
 /**
@@ -408,7 +424,17 @@ export async function sync(a: VFSNode, b: VFSNode, options: SyncOptions = {}): P
     };
   }
 
-  const plan = await planSync(a, b, options, dry);
+  let plan = await planSync(a, b, options, dry);
+  // A folder that just gave up its store is a different folder than the one
+  // planning started from: new identities, no tombstones, no ancestry. So the
+  // pass plans once more, against what is actually there — at most twice, and
+  // only where a person authorised a wipe. The second pass asks nobody: the
+  // loser is unaffiliated now, which is the benign case the guard lets through.
+  if (plan.discarded && !dry) {
+    const discarded = plan.discarded;
+    plan = await planSync(a, b, options, dry);
+    plan.discarded = discarded;
+  }
   const preview = report(plan, plan.transferred, false);
   if (dry) return preview;
 
@@ -477,6 +503,37 @@ function report(plan: SyncPlan, transferred: SyncResult['transferred'], applied:
     mergedPaths: plan.mergedPaths,
     actions: plan.actions,
     state: plan.state,
+    ...(plan.discarded ? { discarded: plan.discarded } : {}),
+  };
+}
+
+/**
+ * A plan that stopped before computing a merge — a refusal, or a discard that
+ * changed the folders the merge would have been computed from.
+ */
+function halted(fileA: VFSFile, fileB: VFSFile, at: number, patch: Partial<SyncPlan>): SyncPlan {
+  return {
+    quiet: false,
+    fileA,
+    fileB,
+    syncId: '',
+    at,
+    configChanged: false,
+    conflicts: [],
+    pending: [],
+    declined: false,
+    target: [],
+    overlay: new Map(),
+    extra: [],
+    rowsA: [],
+    rowsB: [],
+    actions: { toA: [], toB: [] },
+    transferred: { toA: 0, toB: 0 },
+    merged: 0,
+    mergedPaths: [],
+    state: null,
+    changed: false,
+    ...patch,
   };
 }
 
@@ -515,31 +572,28 @@ async function planSync(
   // ---- 2. may these two folders merge at all? Nothing of the merge has been
   //         computed yet, let alone written, which is what makes stopping here
   //         safe — and what makes it answerable.
-  const paired = await settlePairing(a, b, fileA, fileB, options);
+  const paired = await settlePairing(a, b, fileA, fileB, options, dry);
   if ('refusal' in paired) {
-    return {
-      quiet: false,
-      fileA,
-      fileB,
-      syncId: '',
-      at: now(),
-      configChanged: false,
-      conflicts: [],
+    return halted(fileA, fileB, now(), {
       pending: [paired.refusal],
       declined: paired.answered,
-      message: paired.message,
-      target: [],
-      overlay: new Map(),
-      extra: [],
-      rowsA: [],
-      rowsB: [],
-      actions: { toA: [], toB: [] },
-      transferred: { toA: 0, toB: 0 },
-      merged: 0,
-      mergedPaths: [],
-      state: null,
-      changed: false,
-    };
+      ...(paired.message !== undefined ? { message: paired.message } : {}),
+    });
+  }
+  if (paired.discard) {
+    // A store has just been given up — or, in a dry run, would be. Everything
+    // below this line reads entries, tombstones and log rows that no longer
+    // exist, so the pass stops here: `sync()` plans again against the folder as
+    // it now is, and the dry run reports the discard rather than modelling a
+    // merge whose inputs it refused to create.
+    return halted(fileA, fileB, now(), {
+      syncId: paired.syncId,
+      discarded: {
+        side: paired.discard,
+        syncId: (paired.discard === 'a' ? fileA : fileB).syncId as string,
+      },
+      changed: true,
+    });
   }
   const syncId = paired.syncId;
 
@@ -903,6 +957,13 @@ export class ConflictError extends Error {
 /** Enough of one side to frame the decision the library will not make alone. */
 type PairingSide = FolderContext;
 
+/** What the pairing guard settled: the group both end in, and who gave one up. */
+interface Pairing {
+  syncId: string;
+  /** The side that loses its mesh, and with it its store. See {@link SyncResult.discarded}. */
+  discard?: 'a' | 'b';
+}
+
 function sideOf(file: VFSFile): PairingSide {
   return {
     peerId: file.peerId,
@@ -934,17 +995,22 @@ function sideOf(file: VFSFile): PairingSide {
  * folders, mint one), and one set against one `null` (a folder joining a
  * group — it has no affiliation to lose, so no tiebreak is needed).
  *
- * The library detects, describes and stops. It does not ask, and it does not
- * decide: that is coherent with not interpreting content, and the question is
- * not "which folder wins" — there is no such mode. Resolution stays per file
- * and per version, with ancestry above the clock. The only thing decided here
- * is **whether to merge at all**.
+ * The library detects, describes and stops. It does not ask and it does not
+ * decide — but when somebody does decide, **the answer names the winner**, and
+ * the losing folder gives up its store and rejoins as one that has never
+ * synced. That is the one place a folder wins over another, and it is at the
+ * level of the group rather than the file: resolution stays per file and per
+ * version, with ancestry above the clock.
+ *
+ * The reason it cannot be the smaller id, deterministically, the way it was
+ * while the answer merely authorised the merge: an outcome that discards one
+ * folder's history is not one a rule nobody chose may pick.
  */
 function pair(
   fileA: VFSFile,
   fileB: VFSFile,
   adopt?: { syncId: string },
-): { syncId: string } | { refusal: ConflictPayload; message: string } {
+): Pairing | { refusal: ConflictPayload; message: string } {
   const a = sideOf(fileA);
   const b = sideOf(fileB);
 
@@ -973,6 +1039,22 @@ function pair(
   }
 
   if (a.syncId !== null && b.syncId !== null && a.syncId !== b.syncId) {
+    // Already decided, by somebody, somewhere in this mesh. A straggler that
+    // has been offline since before the merge meets whichever peer it meets,
+    // and the record travels with every one of them — so it joins without
+    // asking a question whose answer would contradict one already given.
+    const takenByA = (fileA.absorbed ?? []).includes(b.syncId);
+    const takenByB = (fileB.absorbed ?? []).includes(a.syncId);
+    if (takenByA || takenByB) {
+      // Both, when two people answered opposite ways on two edges before either
+      // record reached the other. Somebody has to lose, and *here* the smaller
+      // id is the right rule: it is deterministic and transitive, so every edge
+      // of the contradiction resolves the same way without asking again.
+      const winner =
+        takenByA && takenByB ? ([a.syncId, b.syncId].sort()[0] as string) : takenByA ? a.syncId : b.syncId;
+      return { syncId: winner, discard: winner === a.syncId ? 'b' : 'a' };
+    }
+
     // Authorisation is specific: naming one of the two ids proves the caller
     // saw *this* collision. `{ adopt: true }` would disarm the guard at this
     // call site forever, including a different collision months later. It is
@@ -983,26 +1065,24 @@ function pair(
         message: `these folders belong to different groups (${a.syncId} and ${b.syncId})`,
       };
     }
+    return { syncId: adopt.syncId, discard: adopt.syncId === a.syncId ? 'b' : 'a' };
   }
 
-  // The smaller survives — deterministic and transitive, so a whole mesh
-  // settles on one value without coordinating. Minting needs no agreement
-  // either: `sync()` has both files in front of it and hands one id to both.
-  if (a.syncId !== null && b.syncId !== null) {
-    return { syncId: [a.syncId, b.syncId].sort()[0] as string };
-  }
+  // Equal, or one against a `null`: nothing is given up either way. Minting
+  // needs no agreement either — `sync()` has both files in front of it and
+  // hands one id to both.
   return { syncId: a.syncId ?? b.syncId ?? randomId() };
 }
 
 /**
- * The pairing question, put to whoever can answer it.
+ * The pairing question, put to whoever can answer it, and carried out.
  *
  * Answering `adopt` or `reidentify` is not a merge decision — it repairs the
  * relationship between the two folders so that a merge is possible at all — so
  * it is applied here, before the merge is computed. A `reidentify` therefore
  * lands even if a file conflict stops the pass a moment later, and that is
  * correct: the identity was broken, the caller said which side fixes it, and
- * retrying the pass is free.
+ * retrying the pass is free. The same holds, more sharply, for a discard.
  */
 async function settlePairing(
   a: VFSNode,
@@ -1010,11 +1090,15 @@ async function settlePairing(
   fileA: VFSFile,
   fileB: VFSFile,
   options: SyncOptions,
-): Promise<{ syncId: string } | { refusal: ConflictPayload; message: string; answered: boolean }> {
+  dry: boolean,
+): Promise<Pairing | { refusal: ConflictPayload; message: string; answered: boolean }> {
   let adopt = options.adopt;
   for (let attempt = 0; attempt < 2; attempt++) {
     const paired = pair(fileA, fileB, adopt);
-    if ('syncId' in paired) return paired;
+    if ('syncId' in paired) {
+      if (paired.discard && !dry) await absorb(a, b, fileA, fileB, paired.discard);
+      return paired;
+    }
     if (attempt > 0) return { ...paired, answered: false };
 
     const given = (options.decisions ?? []).find((decision) => decision.id === paired.refusal.reason);
@@ -1046,6 +1130,39 @@ async function settlePairing(
   return { ...pair(fileA, fileB, adopt) } as never;
 }
 
+/**
+ * Carries out a decision that named a winner: the winner records what it took
+ * in, and then the loser gives up its store.
+ *
+ * **That order is the recovery plan.** Interrupted between the two, the loser
+ * still declares the mesh it is leaving and the winner already says it was
+ * absorbed — so the next pass discards it with no question asked. The other
+ * order leaves a folder that joins cleanly while nothing anywhere records the
+ * decision, and every straggler of the losing mesh asks again.
+ *
+ * The winner takes the loser's `absorbed` as well as its `syncId`: a mesh that
+ * had itself taken one in must not strand *that* mesh's stragglers.
+ */
+async function absorb(
+  a: VFSNode,
+  b: VFSNode,
+  fileA: VFSFile,
+  fileB: VFSFile,
+  discard: 'a' | 'b',
+): Promise<void> {
+  const loser = discard === 'a' ? a : b;
+  const loserFile = discard === 'a' ? fileA : fileB;
+  const winner = discard === 'a' ? b : a;
+  const winnerFile = discard === 'a' ? fileB : fileA;
+
+  const taken = new Set([...(winnerFile.absorbed ?? []), ...(loserFile.absorbed ?? [])]);
+  if (loserFile.syncId) taken.add(loserFile.syncId);
+  winnerFile.absorbed = [...taken].sort();
+  await winner.store.write(winnerFile);
+
+  await loser.discard();
+}
+
 /** A pairing refusal in the shape every other conflict arrives in. */
 function pairingPayload(reason: ConflictReason, a: PairingSide, b: PairingSide): ConflictPayload {
   // `id` is the reason itself: there is at most one pairing refusal per pass, so
@@ -1055,6 +1172,7 @@ function pairingPayload(reason: ConflictReason, a: PairingSide, b: PairingSide):
 
 interface ConvergedConfig {
   text: string[];
+  absorbed: string[];
   changed: boolean;
 }
 
@@ -1062,9 +1180,14 @@ interface ConvergedConfig {
  * The config both files have to agree on, and whether they already do.
  *
  * `text` converges by **union**, so no peer loses a classification another one
- * added. Group identity is deliberately not here: `syncId` is decided by the
- * pairing guard and written in `close()`, because affiliation records a sync
- * that happened rather than one that was attempted.
+ * added. `absorbed` converges the same way and for a sharper reason: it is the
+ * record of a decision somebody made once, and the peers that need it are the
+ * ones that were not there — a straggler of the absorbed mesh meets whichever
+ * peer it meets, so every peer has to be able to answer for the mesh.
+ *
+ * Group identity is deliberately not here: `syncId` is decided by the pairing
+ * guard and written in `close()`, because affiliation records a sync that
+ * happened rather than one that was attempted.
  *
  * Computed without writing, because a `dryRun` has to answer the same question
  * without touching either folder. One implementation for both: a second copy is
@@ -1072,9 +1195,15 @@ interface ConvergedConfig {
  */
 function convergeConfig(fileA: VFSFile, fileB: VFSFile): ConvergedConfig {
   const text = [...new Set([...fileA.text, ...fileB.text])].sort();
+  const absorbed = [...new Set([...(fileA.absorbed ?? []), ...(fileB.absorbed ?? [])])].sort();
   return {
     text,
-    changed: fileA.text.join() !== text.join() || fileB.text.join() !== text.join(),
+    absorbed,
+    changed:
+      fileA.text.join() !== text.join() ||
+      fileB.text.join() !== text.join() ||
+      (fileA.absorbed ?? []).join() !== absorbed.join() ||
+      (fileB.absorbed ?? []).join() !== absorbed.join(),
   };
 }
 
@@ -1099,6 +1228,8 @@ function textPredicate(a: VFSNode, b: VFSNode, list: string[]): (path: string) =
 function applyConfig(fileA: VFSFile, fileB: VFSFile, config: ConvergedConfig): void {
   fileA.text = [...config.text];
   fileB.text = [...config.text];
+  fileA.absorbed = [...config.absorbed];
+  fileB.absorbed = [...config.absorbed];
 }
 
 /**

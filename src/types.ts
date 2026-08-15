@@ -316,6 +316,21 @@ export interface VFSFile {
    * refused rather than guessed at.
    */
   syncId: string | null;
+  /**
+   * `syncId` of every mesh this one has taken in, so the decision that took
+   * them in does not have to be made twice.
+   *
+   * A header field rather than a log row, because it has to outlive the log: a
+   * peer of the absorbed mesh can turn up months later, after the segment that
+   * would have named the adoption has rotated and been pruned. It converges by
+   * **union**, beside `text`, so one person's answer on one edge reaches every
+   * peer of the mesh at the pace of syncing — and a folder that finds its own
+   * `syncId` here discards its store and rejoins rather than asking again.
+   *
+   * Outside the digest, like everything else in the header: two peers that
+   * disagree about it still agree on `state`, and disagree for one pass.
+   */
+  absorbed?: string[];
   /** Identity of this node. Minted at init and never converges. */
   peerId: string;
   /** Digest of the live entries over the converging fields. */

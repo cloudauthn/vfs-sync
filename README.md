@@ -306,6 +306,15 @@ folder that has never synced takes the mesh's identities, two directories are th
 with the same bytes are one file). Anything else is two files claiming one name, and a person
 decides.
 
+**Two groups merge on one answer, and the folder that is not named rejoins as a newcomer.** A
+`foreign-mesh` answer names the group that survives; the other discards its `.vfs` — its group, log,
+tombstones and merge bases — and comes back as a folder that has never synced, with every byte of
+content untouched. That is what makes the question answerable: afterwards, the only identities
+rewritten belong to a folder nobody else was holding any. The decision is recorded and converges, so
+a peer of the losing group that was offline throughout rejoins without being asked again. What it
+costs is listed in [docs/api.md](./docs/api.md#what-the-folder-that-is-not-named-gives-up); the
+common case, adding a *device*, costs nothing at all.
+
 **A decision leaves the trace a merge leaves.** Answering mints a new version carrying *both*
 parents — otherwise the next peer to do the arithmetic reaches the engine's original answer and
 quietly undoes the person's.
@@ -324,10 +333,6 @@ so and is pumped instead, and the resulting tree, hashes and digest are identica
 
 ## Todos
 
-- **Two established meshes merging ask once per file.** Answering `foreign-mesh` authorises the
-  merge; it does not make the losing folder rejoin as a newcomer, so files each mesh created
-  independently collide by name and are put to a person. Adding a *device* is the common case and
-  costs nothing: a folder that has never synced takes the mesh's identities by path.
 - **`location` is never asked.** The same file renamed differently on each side settles
   deterministically and nothing is at risk, so it stays out of `pending`. It is in the catalogue in
   case a consumer wants to opt in; nobody has.

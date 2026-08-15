@@ -258,6 +258,44 @@ export class VFSNode {
     return minted;
   }
 
+  /**
+   * Gives up this folder's `.vfs` and rejoins as a folder that has never
+   * synced. **Every byte of content stays exactly where it is.**
+   *
+   * What `sync()` does to the folder that loses a `foreign-mesh` decision, and
+   * available on its own because a person who has decided which of two groups
+   * a folder belongs to should not have to stage a sync to say so.
+   *
+   * What is given up, and none of it is recoverable from the other side:
+   *
+   * - **tombstones**, so a file this folder deleted comes back if the mesh it
+   *   joins still holds it. A tombstone is the only record that a deletion was
+   *   deliberate;
+   * - **the log**, so ancestry cannot be proved for anything: the first
+   *   divergence on a path is a conflict rather than a propagation;
+   * - **the text-merge bases**, so the first text conflict on those paths
+   *   refuses with `no-base` and parks a copy. It recovers once both sides have
+   *   written;
+   * - **the conflict copies' bookkeeping**: the bytes stay as ordinary files
+   *   under their conflict names, and `conflicts()` stops listing them.
+   *
+   * What survives, because it is configuration rather than history: this node's
+   * `local.ignore`. Nobody else holds a copy, and dropping it would change what
+   * the folder synchronises without anyone saying so.
+   *
+   * The identity is minted fresh, like {@link VFSNode.reidentify} — a folder
+   * whose whole history is gone should not answer to the id every peer holds a
+   * mark against. The same caveat applies: `open({ id })` imposes the old one
+   * again on the next open.
+   */
+  async discard(): Promise<string> {
+    const file = await this.store.read();
+    const local = file.local.ignore ? { ignore: [...file.local.ignore] } : {};
+    const fresh = await this.store.discard({ local });
+    this.id = fresh.peerId;
+    return this.id;
+  }
+
   /** True when this content should go through the streaming path. */
   private streams(size: number): boolean {
     return size >= this.streamThreshold && canStream(this.adapter);

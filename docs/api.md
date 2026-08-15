@@ -54,7 +54,7 @@ The header carries two identities, and they answer different questions.
 | | Identifies | Born | Converges |
 | --- | --- | --- | --- |
 | `peerId` | **the node** | at init, a UUIDv4 | never |
-| `syncId` | **the group** | on the first sync | yes, on the smaller — after the guard |
+| `syncId` | **the group** | on the first sync | yes — a folder with none takes the other's, and two groups only merge when [somebody names the winner](#pairing) |
 
 `syncId` is an explicit `null` until the folder has synced with someone. That `null` carries
 information: it is what tells a folder that has never paired apart from one written by an engine
@@ -366,7 +366,7 @@ Returns:
 | --- | --- | --- |
 | `applied` | `boolean` | `false` when nothing was written: a dry run, or a conflict somebody declined. |
 | `changed` | `boolean` | `false` when the two were already identical. |
-| `configChanged` | `boolean` | `true` when the `text` config converged in this pass. |
+| `configChanged` | `boolean` | `true` when the shared header config — `text`, `absorbed` — converged in this pass. |
 | `conflicts` | `ConflictReport[]` | Everything that diverged. See [conflicts.md](./conflicts.md#reading-the-report). |
 | `pending` | `ConflictPayload[]` | The subset needing a person, in the shape `decide` and `ConflictError` use. Non-empty means **nothing was written**. |
 | `transferred` | `{ toA: number; toB: number }` | Files copied in each direction — predicted on a dry run. |
@@ -374,6 +374,7 @@ Returns:
 | `mergedPaths` | `string[]` | Which paths those were. |
 | `actions` | `{ toA: SyncAction[]; toB: SyncAction[] }` | Filesystem actions per peer, performed or predicted. |
 | `state` | `Hash \| null` | The digest both peers end on. |
+| `discarded` | `{ side: 'a' \| 'b'; syncId: string }?` | Set when one folder [gave up its store](#what-the-folder-that-is-not-named-gives-up) to join the other's group. `side` is as passed to `sync(a, b)`. |
 
 ```ts
 const { changed, conflicts, transferred, merged } = await sync(laptop, phone);
@@ -519,11 +520,11 @@ A pairing refusal arrives as [`ConflictError`](#conflicterror) like everything e
 entry count, log digest and whether either has ever synced. That is what lets a caller present
 *"1,240 files against 890"* instead of two uuids.
 
-The library detects, describes and stops. Note what is **not** being decided here — there is no "this
-folder wins" mode. Resolution stays per file and per version, with ancestry above the clock; the only
-question settled is whether to merge at all.
+The library detects, describes and stops. It does not decide — but when you decide, the answer names
+a winner. Resolution stays per file and per version everywhere else, with ancestry above the clock;
+this is the one question settled between whole folders.
 
-To authorise a merge, name one of the two reported `syncId`s:
+To merge two groups, name the `syncId` that **keeps its group**:
 
 ```ts
 await sync(a, b, { adopt: { syncId: error.a.syncId } });
@@ -531,8 +532,43 @@ await sync(a, b, { adopt: { syncId: error.a.syncId } });
 
 Specific on purpose. A blanket `true` would disarm the guard at that call site for ever, including a
 different collision months later — it is the same "prove you knew the prior state" idiom as
-`writeIf(path, data, tag)`. Once authorised the merge is the ordinary merge, and the smaller
-`syncId` survives.
+`writeIf(path, data, tag)`.
+
+### What the folder that is not named gives up
+
+It discards its `.vfs` and rejoins as a folder that has never synced. **Every file it holds
+survives**, and enters the winning group as an ordinary create. What it loses is everything it knew
+*about* those files:
+
+| Given up | What you see |
+| --- | --- |
+| tombstones | a file it deleted comes back, if the winning group still holds it |
+| the log | ancestry cannot be proved: the first divergence on a path is a conflict, not a propagation |
+| text-merge bases | the first text conflict on those paths refuses with `no-base` and parks a copy |
+| conflict copies' bookkeeping | the bytes stay under their conflict names; `conflicts()` stops listing them |
+| peer marks | the next sync with each peer re-reads its log from the start |
+
+Its `local.ignore` survives — that is configuration, not history, and nobody else holds a copy.
+
+This is the reason the answer can be answered at all: afterwards, the only side whose uuids were
+rewritten is one that had no history for anybody else to be holding. It is also why the two groups no
+longer produce a `path-collision` per file they both created — the joining side takes the group's
+identity for those paths.
+
+The pass reports it, and a `dryRun` reports it **instead of** planning a merge whose inputs it
+refused to create:
+
+```ts
+const preview = await sync(a, b, { dryRun: true, adopt: { syncId } });
+preview.discarded; // { side: 'b', syncId: 'the group b is giving up' }
+preview.applied;   // false — nothing was written, including .vfs
+```
+
+The decision travels in the winner's `absorbed`, which converges by union like `text`. A peer of the
+losing group that was offline throughout meets any peer of the winner, finds its own `syncId` there,
+and rejoins **without being asked again** — the answer is already forced, and asking would only offer
+the chance to contradict a decision the mesh has recorded. `node.discard()` performs the same thing on
+its own, for a caller that has decided outside a sync.
 
 **`peer-collision` is not authorisable.** Merging two nodes with one identity is not a decision
 anyone can make well: `peers` is keyed by `peerId`, so the two share a slot, each sync overwrites
@@ -554,6 +590,12 @@ reidentifies and collides again has learned which case they are in.
 sides are replicas of one mesh. Entries and log rows keep the old `peerId`, because that records who
 changed what. One visible cost: every peer that has met this node holds a mark keyed by the old id,
 so the next sync with each of them re-reads the whole log rather than the tail since an offset.
+
+The heavier operation beside it is `node.discard()`, which gives up `.vfs` altogether — the group,
+the log, the tombstones, the merge bases — and leaves a folder that has never synced, with every byte
+of content untouched. It is what a sync does to the folder that loses a `foreign-mesh` decision, and
+it is exported so that a caller who has decided outside a sync does not have to stage one. What it
+costs is [the table above](#what-the-folder-that-is-not-named-gives-up).
 
 ### Format versions
 
@@ -614,7 +656,7 @@ type ConflictAnswer =
   | { action: 'keep'; side: 'a' | 'b' }        // that version survives
   | { action: 'keep-both' }                    // winner in place, loser parked beside it
   | { action: 'replace'; content: Uint8Array } // neither; the caller's bytes
-  | { action: 'adopt'; side: 'a' | 'b' }       // both folders take that syncId
+  | { action: 'adopt'; side: 'a' | 'b' }       // that group survives; the other rejoins as new
   | { action: 'reidentify'; side: 'a' | 'b' }  // that peer keeps its id; the other mints one
   | { action: 'abort' };
 ```

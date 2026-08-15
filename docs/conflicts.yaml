@@ -85,6 +85,17 @@ version: &version
 
 foreign-mesh:
   when: the two folders carry different syncIds — separate meshes
+  note: >
+    The side named keeps its group; the other gives up its store — tombstones,
+    log, merge bases, peer marks — and rejoins as a folder that has never
+    synced. Every file it holds survives and enters the winning mesh as an
+    ordinary create; what it loses is everything it knew *about* those files, so
+    a deletion it made comes back if the mesh still holds the file.
+
+    That is what makes it answerable at all: after it, the only side whose uuids
+    are rewritten is one with no history for anybody else to be holding. The
+    decision is recorded in the winner's `absorbed`, converges by union like
+    `text`, and is not put to a straggler of the losing mesh a second time.
   payload:
     reason: foreign-mesh
     level: pairing
@@ -92,9 +103,9 @@ foreign-mesh:
     ctxA: *folder
     ctxB: *folder
   returns:
-    # Naming a side authorises *this* merge; it does not choose the outcome.
-    # The smaller syncId survives either way, so a mesh whose edges are
-    # authorised separately by different people still settles on one value.
+    # Naming a side chooses the outcome. It cannot be the smaller syncId, the
+    # way it was while this merely authorised the merge: an outcome that
+    # discards one folder's history is not one a rule nobody chose may pick.
     - { action: adopt, side: a | b }
     - { action: abort }
 

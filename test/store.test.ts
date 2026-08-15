@@ -69,6 +69,78 @@ describe('the control folder', () => {
   });
 });
 
+describe('discarding the store', () => {
+  /** A store with something in every corner of `.vfs`. */
+  async function furnished(adapter: MemoryAdapter): Promise<VFSStore> {
+    const store = new VFSStore(adapter, undefined, { rotateAt: 1 });
+    const file = await store.init({ peerId: 'device-a' });
+    file.syncId = 'g-old';
+    file.absorbed = ['g-older'];
+    await store.append([await row('u1', 100)], file);
+    await store.rotate(file); // closes commits-<ts> and writes vfs-<ts>.json
+    await store.append([await row('u2', 200)], file);
+    await store.putBase('h1', encoder.encode('an older version'));
+    return new VFSStore(adapter, undefined, { rotateAt: 1 }).write(file).then(() => store);
+  }
+
+  it('leaves a folder that reads as one that has never synced', async () => {
+    const adapter = new MemoryAdapter('device-a');
+    const store = await furnished(adapter);
+
+    const fresh = await store.discard();
+
+    expect(fresh.syncId).toBeNull();
+    expect(fresh.absorbed).toEqual([]);
+    expect(fresh.peerId).not.toBe('device-a');
+    expect(fresh.entries).toEqual([]);
+    expect(fresh.peers).toEqual({});
+    expect(fresh.log.rows).toBe(0);
+    expect(fresh.log.digest).toBe(ZERO_DIGEST);
+    expect(fresh.log.snapshot).toBeUndefined();
+    // Nothing of the mesh it left is still readable from here.
+    expect(await store.logRows()).toEqual([]);
+    expect(await store.readSnapshot()).toEqual([]);
+    expect(await store.getBase('h1')).toBeNull();
+    expect((await adapter.list('.vfs')).map((entry) => entry.name).sort()).toEqual(['vfs.json']);
+  });
+
+  /** Configuration, not history: nobody else holds a copy to restore it from. */
+  it('keeps this node local exclusion rules', async () => {
+    const adapter = new MemoryAdapter('device-a');
+    const store = await furnished(adapter);
+
+    const fresh = await store.discard({ local: { ignore: ['*.tmp'] } });
+
+    expect(fresh.local.ignore).toEqual(['*.tmp']);
+  });
+
+  /**
+   * The active segment is the only file read without the header naming it, so a
+   * header replaced while it is still there would hand the old mesh's rows to a
+   * folder claiming to have no history. Failing is the recoverable outcome: the
+   * folder still declares the mesh it is leaving, and the next pass discards it
+   * again.
+   */
+  it('refuses to replace the header while the old log is still on disk', async () => {
+    const adapter = new MemoryAdapter('device-a');
+    await furnished(adapter);
+    const stubborn = Object.create(adapter) as MemoryAdapter;
+    stubborn.delete = (path: string) =>
+      path === '.vfs/commits' ? Promise.reject(new Error('backend said no')) : adapter.delete(path);
+
+    await expect(new VFSStore(stubborn, undefined, { rotateAt: 1 }).discard()).rejects.toThrow(
+      /still there/,
+    );
+
+    // Still a member of the mesh it was leaving, with its log intact...
+    const after = await new VFSStore(adapter).read();
+    expect(after.syncId).toBe('g-old');
+    expect((await new VFSStore(adapter).logRows()).map((item) => item.uuid)).toEqual(['u2']);
+    // ...and the retry, against a backend that works, completes.
+    expect((await new VFSStore(adapter).discard()).syncId).toBeNull();
+  });
+});
+
 describe('appending to the log', () => {
   it('adds only what the segment does not already hold', async () => {
     const adapter = new MemoryAdapter('s');

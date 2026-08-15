@@ -12,7 +12,7 @@ import {
   normalizeFile,
   parseHeader,
 } from './vfs-file.js';
-import type { Hash, LogRow, VFSAdapter, VFSEntry, VFSFile, VFSHeader } from './types.js';
+import type { Hash, LocalState, LogRow, VFSAdapter, VFSEntry, VFSFile, VFSHeader } from './types.js';
 
 /** Name of the control folder that lives inside every synced folder. */
 export const CONTROL_DIR = '.vfs';
@@ -145,6 +145,58 @@ export class VFSStore {
         ...DEFAULT_TEXT_EXTENSIONS,
       ]),
     );
+  }
+
+  /**
+   * Gives up everything this folder knew about its content, and keeps the
+   * content. The working tree is not touched: only `.vfs` is.
+   *
+   * What a folder does when it loses a mesh (§5): it stops being one that has
+   * synced, so that it can rejoin as one that never did — which is the only
+   * state in which its identities may be rewritten, because nobody else is
+   * holding them. What that costs is stated where a person can read it, in the
+   * changelog and in `VFSNode.discard`.
+   *
+   * **The order is the recovery plan, and it is the opposite of the obvious
+   * one.** Deleting `vfs.json` first would leave a folder that reads as virgin —
+   * `init()` lays down a fresh header — while `commits` is still on disk, and
+   * `logRows()` would hand the old mesh's rows to a folder claiming to have no
+   * history. So the header is *replaced*, never absent, and it is replaced last:
+   * an interruption anywhere before that leaves a folder that still declares the
+   * mesh it is leaving, which the next pass discards again.
+   *
+   * The active segment is the one deletion that may not fail quietly, because
+   * it is the only file read without the header naming it. Everything else is
+   * garbage the fresh header does not point at.
+   */
+  async discard(options: { peerId?: string; local?: LocalState } = {}): Promise<VFSFile> {
+    const listing = (await this.adapter.list(this.root).catch(() => [])).filter(
+      (entry) => entry.kind === 'file',
+    );
+
+    await this.pruneBase(new Set());
+    for (const entry of listing) {
+      const orphan =
+        entry.name.startsWith('commits-') ||
+        (entry.name.startsWith('vfs-') && entry.name.endsWith('.json'));
+      if (orphan) await this.adapter.delete(entry.path).catch(() => undefined);
+    }
+
+    await this.adapter.delete(this.segmentPath()).catch(() => undefined);
+    if (await this.adapter.stat(this.segmentPath())) {
+      throw new Error(
+        `cannot discard ${this.adapter.name}: ${this.segmentPath()} is still there, and a folder that reads as new must not carry the log of the one it was`,
+      );
+    }
+
+    this.invalidate();
+    const fresh = emptyFile(options.peerId ?? randomId(), this.now(), [
+      ...DEFAULT_TEXT_EXTENSIONS,
+    ]);
+    // Node-local configuration, not history: nobody else holds a copy of it, and
+    // losing it would silently change which files this folder synchronises.
+    if (options.local) fresh.local = { ...options.local };
+    return this.write(fresh);
   }
 
   // ------------------------------------------------------------ commit log

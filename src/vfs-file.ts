@@ -103,6 +103,11 @@ export function encodeVFSFile(file: VFSFile): Uint8Array {
     // folder writes an explicit `null` for free — and that `null` is what tells
     // "never synced" apart from "written by an engine that had no syncId".
     ['syncId', file.syncId],
+    // Only once there is something in it: an empty list is the ordinary case
+    // and a key that says nothing is a key every reader has to skip.
+    ...(file.absorbed && file.absorbed.length > 0
+      ? ([['absorbed', file.absorbed]] as Array<[string, unknown]>)
+      : []),
     ['peerId', file.peerId],
     ['state', file.state],
     ['text', file.text],
@@ -212,6 +217,7 @@ export function decodeVFSFile(data: Uint8Array): VFSFile {
   file.peers ??= {};
   file.local ??= {};
   file.text ??= [];
+  file.absorbed ??= [];
   file.syncId ??= null;
   return file;
 }
@@ -228,6 +234,7 @@ export function parseHeader(data: Uint8Array): VFSHeader | null {
   header.peers ??= {};
   header.local ??= {};
   header.text ??= [];
+  header.absorbed ??= [];
   return headerOf(header);
 }
 
@@ -245,6 +252,7 @@ export function emptyFile(peerId: string, segment: number, text: string[]): VFSF
     // Affiliation records a sync that happened. A folder nobody has met yet
     // has none, and says so.
     syncId: null,
+    absorbed: [],
     peerId,
     state: '',
     text,

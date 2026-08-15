@@ -384,7 +384,7 @@ function decisionNote(conflict: ConflictPayload): string | undefined {
         : 'A file and a folder want this name.';
     }
     case 'foreign-mesh':
-      return 'These two folders have never been part of the same group.';
+      return 'These two folders have never been part of the same group. Whichever group you do not keep gives up its sync history — every file stays, but deletions it made may come back.';
     case 'peer-collision':
       return 'Both folders claim the same identity — one is a copy of the other.';
     case 'version-unreconcilable':
@@ -2218,9 +2218,21 @@ export class ExplorerModel {
     }
     if (allowed.includes('keep-both')) choices.push({ label: 'Keep both, side by side', action: 'keep-both' });
     if (allowed.includes('adopt')) {
+      // Not "merge them": the group that is not named gives up its sync history
+      // — its tombstones, its log and its merge bases — and rejoins as a new
+      // folder. Every file survives. A button that said "merge" would be
+      // describing a destructive action as an additive one.
       choices.push(
-        { label: `Merge them, into ${sides[0].label}'s group`, action: 'adopt', side: 'a' },
-        { label: `Merge them, into ${sides[1].label}'s group`, action: 'adopt', side: 'b' },
+        {
+          label: `Keep ${sides[0].label}'s group (${sides[1].label} rejoins as new)`,
+          action: 'adopt',
+          side: 'a',
+        },
+        {
+          label: `Keep ${sides[1].label}'s group (${sides[0].label} rejoins as new)`,
+          action: 'adopt',
+          side: 'b',
+        },
       );
     }
     if (allowed.includes('reidentify')) {

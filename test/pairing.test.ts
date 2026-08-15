@@ -72,6 +72,16 @@ async function pairedError(
   throw new Error('expected the guard to stop this pairing');
 }
 
+/** Every byte of a folder's `.vfs`, so "untouched" can be asserted literally. */
+async function control(p: { fs: MemoryAdapter }): Promise<Record<string, string>> {
+  const out: Record<string, string> = {};
+  for (const entry of await p.fs.list('.vfs')) {
+    if (entry.kind !== 'file') continue;
+    out[entry.name] = new TextDecoder().decode(await p.fs.read(entry.path));
+  }
+  return out;
+}
+
 describe('syncId', () => {
   it('is an explicit null until the first sync', async () => {
     const fs = new MemoryAdapter('a');
@@ -210,7 +220,7 @@ describe('the pairing guard', () => {
     expect(files(b)).not.toHaveProperty('y.txt');
   });
 
-  it('merges when the caller names one of the reported ids', async () => {
+  it('merges into the group the caller named, and the other gives up its store', async () => {
     const a = await peer('a');
     const b = await peer('b');
     const c = await peer('c');
@@ -221,13 +231,19 @@ describe('the pairing guard', () => {
     await sync(c.node, d.node);
 
     const error = await pairedError(b.node, c.node);
-    await sync(b.node, c.node, { adopt: { syncId: error.a.syncId as string } });
+    const kept = error.a.syncId as string;
+    const given = error.b.syncId as string;
+    const result = await sync(b.node, c.node, { adopt: { syncId: kept } });
 
     expect(files(b)['y.txt']).toBe('y');
-    // Authorised, then ordinary: the smaller of the two survives.
-    const survivor = [error.a.syncId, error.b.syncId].sort()[0];
-    expect((await b.node.file()).syncId).toBe(survivor);
-    expect((await c.node.file()).syncId).toBe(survivor);
+    // The name is the outcome now, not an authorisation: the named group
+    // survives whatever the two ids sort as, because the other one is the folder
+    // that is about to lose its history.
+    expect((await b.node.file()).syncId).toBe(kept);
+    expect((await c.node.file()).syncId).toBe(kept);
+    expect(result.discarded).toEqual({ side: 'b', syncId: given });
+    // ...and the winner remembers, so nobody is asked about that group again.
+    expect((await b.node.file()).absorbed).toEqual([given]);
   });
 
   it('refuses an authorisation for a different collision', async () => {
@@ -282,12 +298,13 @@ describe('answering the pairing question', () => {
     expect(asked).toEqual(['pairing:foreign-mesh']);
     expect(result.applied).toBe(true);
     expect(files(c)).toHaveProperty('x.txt');
-    // Naming a side authorises *this* merge; which id survives is not the
-    // caller's to choose — the smaller one does, so a mesh settles on one value
-    // however many edges get authorised separately.
+    // `side: 'a'` is the payload's ctxA — the first folder of the pass — and it
+    // is the one that keeps its group. The other rejoins as a newcomer.
     const groupC = (await c.node.file()).syncId;
+    expect(groupC).toBe(groupB);
     expect(groupC).toBe((await b.node.file()).syncId);
-    expect(groupC).toBe([groupB, stranger].sort()[0]);
+    expect(groupC).not.toBe(stranger);
+    expect(result.discarded).toEqual({ side: 'b', syncId: stranger });
   });
 
   /** The remedy that existed and could not be reached from a sync. */
@@ -345,6 +362,222 @@ describe('answering the pairing question', () => {
 
     expect((await b.node.file()).syncId).toBe((await c.node.file()).syncId);
     expect(files(b)).toHaveProperty('y.txt');
+  });
+});
+
+/**
+ * What answering `foreign-mesh` now does, and the reason it does it: a folder
+ * that has lost a mesh stops being one that has synced, which is the only state
+ * in which its uuids may be rewritten — nobody else is holding them. Everything
+ * below follows from that one sentence.
+ */
+describe('the folder that loses a mesh', () => {
+  /** Two groups, each with a file of its own and one they both created. */
+  async function twoMeshes(shared: { inFirst: string; inSecond: string }) {
+    const a = await peer('a');
+    const b = await peer('b');
+    const c = await peer('c');
+    const d = await peer('d');
+    await put(a, 'x.txt', 'x');
+    await put(a, 'shared.txt', shared.inFirst);
+    await put(c, 'y.txt', 'y');
+    await put(c, 'shared.txt', shared.inSecond);
+    await sync(a.node, b.node);
+    await sync(c.node, d.node);
+    return { a, b, c, d, first: (await b.node.file()).syncId as string };
+  }
+
+  /**
+   * The headline. Before, the loser kept its identities and a path both groups
+   * had created was two files claiming one name — a question nobody could
+   * answer when the bytes matched.
+   */
+  it('asks nothing per file: one answer merges two groups', async () => {
+    const { b, c, first } = await twoMeshes({ inFirst: 'same', inSecond: 'same' });
+
+    const asked: string[] = [];
+    const result = await sync(b.node, c.node, {
+      decide: (conflict) => {
+        asked.push(`${conflict.level}:${conflict.reason}`);
+        return { action: 'adopt', side: 'a' };
+      },
+    });
+
+    expect(asked).toEqual(['pairing:foreign-mesh']);
+    expect(result.pending).toEqual([]);
+    expect(files(b)).toEqual({ 'x.txt': 'x', 'y.txt': 'y', 'shared.txt': 'same' });
+    expect(files(c)).toEqual(files(b));
+    expect((await c.node.file()).syncId).toBe(first);
+  });
+
+  /**
+   * The same path with different bytes is still a question — but the *right*
+   * one. One file with two versions, which `keep`, `keep-both` and a text merge
+   * can all answer; not two files claiming one name, where the only vocabulary
+   * was which of them keeps it.
+   */
+  it('turns one name claimed by two groups into one file with two versions', async () => {
+    const { b, c } = await twoMeshes({ inFirst: 'from the first', inSecond: 'from the second' });
+
+    const asked: string[] = [];
+    await sync(b.node, c.node, {
+      decide: (conflict) => {
+        asked.push(`${conflict.level}:${conflict.reason}`);
+        return conflict.level === 'pairing' ? { action: 'adopt', side: 'a' } : { action: 'keep-both' };
+      },
+    });
+
+    expect(asked).toEqual(['pairing:foreign-mesh', 'entry:content']);
+    const live = await b.node.live();
+    expect(live.filter((entry) => entry.path === 'shared.txt')).toHaveLength(1);
+    // One file with two versions: the loser is parked beside it as a conflict
+    // copy, which is what `keep-both` means everywhere else in the library.
+    expect(live.filter((entry) => entry.conflictOf)).toHaveLength(1);
+    expect(Object.values(files(b))).toContain('from the second');
+  });
+
+  /**
+   * The invariant the whole design rests on, asserted rather than hoped for: an
+   * established peer's identity for a file never moves. Only the side with
+   * nothing to lose rewrites anything.
+   */
+  it('never moves a uuid on the side that keeps its group', async () => {
+    // The two versions differ on purpose: identical bytes pair by hash on their
+    // own, and a test that cannot tell the two mechanisms apart proves neither.
+    const { b, c, first } = await twoMeshes({ inFirst: 'from the first', inSecond: 'from the second' });
+    const before = new Map((await b.node.live()).map((entry) => [entry.path, entry.uuid]));
+    const strangerShared = (await c.node.live()).find((entry) => entry.path === 'shared.txt')?.uuid;
+
+    await sync(b.node, c.node, {
+      adopt: { syncId: first },
+      decide: () => ({ action: 'keep', side: 'a' }),
+    });
+
+    for (const entry of await b.node.live()) {
+      const held = before.get(entry.path);
+      if (held) expect(entry.uuid).toBe(held);
+    }
+    // ...and the joining side took the mesh's identity for the path it shared,
+    // rather than turning up beside it as a second file claiming the name.
+    const after = (await c.node.live()).find((entry) => entry.path === 'shared.txt')?.uuid;
+    expect(after).toBe(before.get('shared.txt'));
+    expect(after).not.toBe(strangerShared);
+  });
+
+  it('keeps every byte the loser had, including what the winning group never saw', async () => {
+    const { b, c, first } = await twoMeshes({ inFirst: 'same', inSecond: 'same' });
+    await put(c, 'only-here.txt', 'never seen by the other group');
+
+    await sync(b.node, c.node, { adopt: { syncId: first } });
+
+    expect(files(c)['y.txt']).toBe('y');
+    expect(files(c)['only-here.txt']).toBe('never seen by the other group');
+    expect(files(b)['only-here.txt']).toBe('never seen by the other group');
+  });
+
+  /**
+   * The sharp edge of the design, deliberately: the decision travels, so a peer
+   * that was offline when it was taken is not asked to take it again — an answer
+   * it could only give one way without undoing what the mesh has recorded.
+   */
+  it('lets a straggler of the losing group join without asking again', async () => {
+    const { b, c, d, first } = await twoMeshes({ inFirst: 'same', inSecond: 'same' });
+    await sync(b.node, c.node, { adopt: { syncId: first } });
+
+    // D has been offline throughout and still carries the group that lost.
+    const result = await sync(b.node, d.node, {
+      decide: () => {
+        throw new Error('nobody should be asked twice about the same decision');
+      },
+    });
+
+    expect(result.applied).toBe(true);
+    expect(result.discarded?.side).toBe('b');
+    expect((await d.node.file()).syncId).toBe(first);
+    expect(files(d)['x.txt']).toBe('x');
+  });
+
+  /** A group that had itself taken one in must not strand *that* group's peers. */
+  it('carries the record forward when a group that absorbed one is absorbed', async () => {
+    const { b, c, d, first } = await twoMeshes({ inFirst: 'same', inSecond: 'same' });
+    const second = (await c.node.file()).syncId as string;
+    await sync(b.node, c.node, { adopt: { syncId: first } });
+
+    // A third group takes in the first, which by now carries the second.
+    const e = await peer('e');
+    const f = await peer('f');
+    await put(e, 'z.txt', 'z');
+    await sync(e.node, f.node);
+    const third = (await e.node.file()).syncId as string;
+    await sync(e.node, b.node, { adopt: { syncId: third } });
+    // The record travels by syncing, like `text` does — so F learns what E took
+    // in on the next ordinary pass, and only then can answer for it.
+    await sync(e.node, f.node);
+
+    // D still carries the second group, which nobody in the third has ever met.
+    const result = await sync(f.node, d.node, {
+      decide: () => {
+        throw new Error('the chain should have answered this');
+      },
+    });
+
+    expect(result.applied).toBe(true);
+    expect((await d.node.file()).syncId).toBe(third);
+    expect((await f.node.file()).absorbed).toEqual([first, second].sort());
+  });
+
+  it('reports the discard through a dry run without performing it', async () => {
+    const { b, c, first } = await twoMeshes({ inFirst: 'same', inSecond: 'same' });
+    const second = (await c.node.file()).syncId as string;
+    const before = { b: await control(b), c: await control(c) };
+
+    const preview = await sync(b.node, c.node, {
+      dryRun: true,
+      adopt: { syncId: first },
+    });
+
+    expect(preview.applied).toBe(false);
+    expect(preview.discarded).toEqual({ side: 'b', syncId: second });
+    // Byte for byte, both control folders: a dry run that rewrote a header
+    // identically would still be a write.
+    expect(await control(b)).toEqual(before.b);
+    expect(await control(c)).toEqual(before.c);
+  });
+
+  /**
+   * The version check comes first for a reason that only matters now: `.vfs` is
+   * the one copy of a folder's history, and a folder this engine cannot read
+   * might still be readable by the engine that wrote it.
+   */
+  it('never discards a folder whose format it cannot read', async () => {
+    const fs = new MemoryAdapter('future', { clock: () => tick() });
+    const raw = { ...v2File('future', 'store-1', true), version: CURRENT_VERSION + 1 };
+    await fs.write('.vfs/vfs.json', encoder.encode(JSON.stringify(raw)));
+    const ahead = await VFSNode.open(fs, { id: 'future', now: () => tick() });
+    const here = await peer('here');
+    await put(here, 'x.txt', 'x');
+    await sync(here.node, (await peer('mate')).node);
+    const group = (await here.node.file()).syncId as string;
+    const before = await control(here);
+
+    await expect(
+      sync(here.node, ahead, { adopt: { syncId: group }, decide: () => ({ action: 'adopt', side: 'a' }) }),
+    ).rejects.toThrow(/version/);
+
+    expect(await control(here)).toEqual(before);
+    expect(decodeVFSFile(await fs.read('.vfs/vfs.json')).version).toBe(CURRENT_VERSION + 1);
+  });
+
+  /** Configuration, not history — and nobody else holds a copy of it. */
+  it('keeps the losing folder local exclusion rules', async () => {
+    const { b, c, first } = await twoMeshes({ inFirst: 'same', inSecond: 'same' });
+    await c.node.setLocalIgnore(['*.tmp']);
+    await put(c, 'scratch.tmp', 'not for the mesh');
+
+    await sync(b.node, c.node, { adopt: { syncId: first } });
+
+    expect((await c.node.file()).local.ignore).toEqual(['*.tmp']);
+    expect(files(b)).not.toHaveProperty('scratch.tmp');
   });
 });
 

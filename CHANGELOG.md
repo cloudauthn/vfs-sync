@@ -34,8 +34,9 @@ renamed a directory without its empty subfolders.
   demand. Nothing about it is stored and nothing travels. See
   [Holding the entry without the bytes](./docs/recipes.md#holding-the-entry-without-the-bytes).
 - **A pairing guard.** `sync()` now refuses to merge two folders that belong to different meshes, or
-  that claim the same peer identity, throwing a `PairingError` before anything is written. Authorise
-  a merge with `{ adopt: { syncId } }`. See [Pairing](./docs/api.md#pairing).
+  that claim the same peer identity, stopping before anything is written — as a `ConflictError` with
+  one `level: 'pairing'` payload, like every other conflict. Merge two groups by naming the one that
+  survives, `{ adopt: { syncId } }`. See [Pairing](./docs/api.md#pairing).
 - **A format-change registry**: `CURRENT_VERSION`, `FORMAT_CHANGES`, `migrateFile()`, `readable()`.
 - `syncMesh` no longer loses the whole pass when one edge throws: each `MeshResult` carries `result`
   **or** `error`, and every other edge still runs.
@@ -43,7 +44,41 @@ renamed a directory without its empty subfolders.
 
 ### Changed — breaking
 
-All of these are typed, so `tsc` points at every call site. None of them changes behaviour.
+**Answering `foreign-mesh` now names the winner, and the other folder rejoins as a newcomer.** Same
+shape, same `{ action: 'adopt', side }`, same `{ adopt: { syncId } }` — different outcome, so a
+caller that passes what it passed before gets something else. Previously the answer merely authorised
+the merge and the smaller `syncId` survived either way; now the group you name is the one that
+survives, and the folder on the other side discards its `.vfs` and joins as a folder that has never
+synced.
+
+Every byte of content survives on both sides. What the losing folder gives up is everything it knew
+*about* its files, and three consequences are worth reading before you ship this:
+
+- **deletions it made come back**, if the winning group still holds the file — a tombstone is the
+  only record that a deletion was deliberate;
+- **conflict copies parked on it stop being pending**: the bytes stay as ordinary files under their
+  conflict names, and `node.conflicts()` no longer lists them;
+- **text-merge bases are gone**, so the first text conflict on those paths refuses with `no-base` and
+  parks a copy instead of merging. It recovers once both sides have written.
+
+Its `local.ignore` survives — that is configuration, not history. The full list is in
+[docs/api.md](./docs/api.md#what-the-folder-that-is-not-named-gives-up).
+
+What this buys: two groups that both created `notes.txt` no longer produce a question per file. The
+joining side takes the group's identity by path, so identical bytes settle silently and different
+bytes arrive as one file with two versions — which `keep`, `keep-both` and the text merge can all
+answer — instead of two files claiming one name, where they could not.
+
+The decision travels in a new header field, `absorbed`, which converges by union like `text`. A peer
+of the losing group that was offline when the answer was given rejoins **without being asked again**,
+whenever it turns up, with nobody present. That is deliberate: the answer is already forced, since
+adopting the other way would undo a decision the mesh has recorded.
+
+New alongside it: `SyncResult.discarded` reports what happened (and a `dryRun` reports it *instead of*
+planning a merge whose inputs it refused to create), and `node.discard()` performs the same thing on
+its own for a caller that has decided outside a sync.
+
+The renames below are typed, so `tsc` points at every call site. None of them changes behaviour.
 
 | Before | After |
 | --- | --- |
